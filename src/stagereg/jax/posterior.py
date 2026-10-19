@@ -141,7 +141,11 @@ class TraceablePosterior(Protocol):
     """
 
     def _traced(self) -> TracedPosterior:
-        """Return the posterior taken apart for compiled code."""
+        """Return the posterior taken apart for compiled code.
+
+        Returns:
+            Its class and mean function, static, and its arrays, traced.
+        """
         ...
 
 

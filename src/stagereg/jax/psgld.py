@@ -89,7 +89,11 @@ class RetainedSamplesPosterior:
         )
 
     def _traced(self) -> TracedPosterior:
-        """Return the posterior taken apart for compiled code."""
+        """Return the posterior taken apart for compiled code.
+
+        Returns:
+            Its class and mean function, static, and its arrays, traced.
+        """
         return TracedPosterior(
             RetainedSamplesPosterior, self.mean_function, {"samples": self.samples}
         )
@@ -136,7 +140,12 @@ class _BufferedPosterior(RetainedSamplesPosterior):
         return self._retained
 
     def _traced(self) -> TracedPosterior:
-        """Return every slot of the buffer, with the mask of the retained ones."""
+        """Return the posterior taken apart for compiled code.
+
+        Returns:
+            Every slot of the buffer, with the mask of the retained ones, so
+            compiled code keeps one shape as samples accumulate.
+        """
         return TracedPosterior(
             RetainedSamplesPosterior,
             self.mean_function,

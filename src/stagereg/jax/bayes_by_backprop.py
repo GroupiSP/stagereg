@@ -89,7 +89,11 @@ class MeanFieldGaussianPosterior:
         return draw_unlimited(draw, num_samples)
 
     def _traced(self) -> TracedPosterior:
-        """Return the posterior taken apart for compiled code."""
+        """Return the posterior taken apart for compiled code.
+
+        Returns:
+            Its class and mean function, static, and its arrays, traced.
+        """
         return TracedPosterior(
             type(self), self.mean_function, {"means": self.means, "stds": self.stds}
         )

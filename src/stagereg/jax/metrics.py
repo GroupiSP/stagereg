@@ -10,6 +10,7 @@ from statistics import NormalDist
 from typing import Any, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from numpy.typing import NDArray
@@ -298,17 +299,44 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
     coordinate_extractor: CoordinateExtractor | None,
     reference_samples_extractor: ReferenceSamplesExtractor | None,
 ) -> EpochPredictionData:
-    """Materialize the requested fields of one scalar-event prediction."""
-    mean, target_values = _materialize_mean_and_targets(prediction, targets)
+    """Materialize the requested fields of one scalar-event prediction.
+
+    The mean, variance, predictive samples and log-likelihood are computed by one
+    compiled call and copied to the host together.
+    """
     fields = requirements.fields
+    sample_count = (
+        requirements.predictive_sample_count if fields.predictive_samples else None
+    )
+    # A subclass not registered as a pytree itself cannot cross a jit boundary.
+    compute = (
+        _compiled_device_fields
+        if not jax.tree_util.treedef_is_leaf(jax.tree.structure(prediction))
+        else _device_fields
+    )
+    device = jax.device_get(
+        compute(
+            prediction,
+            jnp.asarray(targets) if fields.log_likelihood else None,
+            key,
+            variance=fields.variance,
+            sample_count=sample_count,
+        )
+    )
+    batch_shape = prediction.batch_shape
+    mean, target_values = _host_mean_and_targets(device["mean"], targets, batch_shape)
     return EpochPredictionData(
         targets=target_values,
         mean=mean,
-        variance=_materialize_variance(prediction, required=fields.variance),
-        predictive_samples=_materialize_predictive_samples(
-            prediction,
-            requirements=requirements,
-            key=key,
+        variance=_host_per_unit(device.get("variance"), batch_shape),
+        predictive_samples=(
+            None
+            if sample_count is None
+            else _samples_to_rows(
+                device["predictive_samples"],
+                prediction_shape=batch_shape,
+                name="predictive_samples",
+            )
         ),
         reference_samples=_materialize_reference_samples(
             reference_samples_extractor,
@@ -326,10 +354,47 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
             required=fields.coordinate,
         ),
         evaluation_grid=_required_evaluation_grid(requirements),
-        log_likelihood=_materialize_log_likelihood(
-            prediction, targets, required=fields.log_likelihood
-        ),
+        log_likelihood=_host_per_unit(device.get("log_likelihood"), batch_shape),
     )
+
+
+def _device_fields(
+    prediction: PredictiveDistribution,
+    targets: jax.Array | None,
+    key: jax.Array,
+    *,
+    variance: bool,
+    sample_count: int | None,
+) -> dict[str, jax.Array]:
+    """Compute a prediction's requested device fields.
+
+    Args:
+        prediction: The predictive distribution.
+        targets: The targets to score the log-density of, or ``None`` when
+            the log-likelihood is not requested.
+        key: The metric key; predictive samples use ``fold_in(key, 0)``.
+        variance: Whether to compute the predictive variance.
+        sample_count: The number of predictive samples, or ``None`` for none.
+
+    Returns:
+        The mean, and each requested field under its ``EpochPredictionData``
+        name.
+    """
+    computed = {"mean": prediction.mean()}
+    if variance:
+        computed["variance"] = prediction.variance()
+    if sample_count is not None:
+        computed["predictive_samples"] = prediction.sample(
+            jax.random.fold_in(key, 0), sample_shape=(sample_count,)
+        )
+    if targets is not None:
+        computed["log_likelihood"] = prediction.log_prob(targets)
+    return computed
+
+
+_compiled_device_fields = jax.jit(
+    _device_fields, static_argnames=("variance", "sample_count")
+)
 
 
 def _require_targets(batch: Batch) -> Any:
@@ -348,53 +413,25 @@ def _require_scalar_gaussian(prediction: object) -> Gaussian:
     return prediction
 
 
-def _materialize_mean_and_targets(
-    prediction: PredictiveDistribution,
-    targets: Any,
+def _host_mean_and_targets(
+    mean: Any, targets: Any, batch_shape: tuple[int, ...]
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Materialize shape-compatible predictive means and targets."""
-    mean = np.broadcast_to(
-        np.asarray(jax.device_get(prediction.mean()), dtype=np.float64),
-        prediction.batch_shape,
-    )
+    """Return shape-compatible host predictive means and targets, flattened."""
+    host_mean = np.broadcast_to(np.asarray(mean, dtype=np.float64), batch_shape)
     target_values = np.asarray(jax.device_get(targets), dtype=np.float64)
-    if mean.shape != target_values.shape:
+    if host_mean.shape != target_values.shape:
         raise ValueError("prediction mean and targets must have matching shapes.")
-    return mean.reshape(-1), target_values.reshape(-1)
+    return host_mean.reshape(-1), target_values.reshape(-1)
 
 
-def _materialize_variance(
-    prediction: PredictiveDistribution,
-    *,
-    required: bool,
+def _host_per_unit(
+    values: Any, batch_shape: tuple[int, ...]
 ) -> NDArray[np.float64] | None:
-    """Materialize broadcast predictive variance when requested."""
-    if not required:
+    """Broadcast host values to the prediction's shape and flatten them."""
+    if values is None:
         return None
-    return np.broadcast_to(
-        np.asarray(jax.device_get(prediction.variance()), dtype=np.float64),
-        prediction.batch_shape,
-    ).reshape(-1)
-
-
-def _materialize_predictive_samples(
-    prediction: PredictiveDistribution,
-    *,
-    requirements: PredictionRequirements,
-    key: jax.Array,
-) -> NDArray[np.float64] | None:
-    """Materialize predictive samples when requested."""
-    if not requirements.fields.predictive_samples:
-        return None
-    assert requirements.predictive_sample_count is not None
-    samples = prediction.sample(
-        jax.random.fold_in(key, 0),
-        sample_shape=(requirements.predictive_sample_count,),
-    )
-    return _samples_to_rows(
-        samples,
-        prediction_shape=prediction.batch_shape,
-        name="predictive_samples",
+    return np.broadcast_to(np.asarray(values, dtype=np.float64), batch_shape).reshape(
+        -1
     )
 
 
@@ -420,21 +457,6 @@ def _materialize_reference_samples(
             "reference samples must have shape (n_scoring_units, n_samples)."
         )
     return samples
-
-
-def _materialize_log_likelihood(
-    prediction: PredictiveDistribution,
-    targets: Any,
-    *,
-    required: bool,
-) -> NDArray[np.float64] | None:
-    """Materialize each target's exact predictive log-density when requested."""
-    if not required:
-        return None
-    return np.broadcast_to(
-        np.asarray(jax.device_get(prediction.log_prob(targets)), dtype=np.float64),
-        prediction.batch_shape,
-    ).reshape(-1)
 
 
 def _materialize_coordinate(

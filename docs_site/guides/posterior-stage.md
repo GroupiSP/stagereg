@@ -127,31 +127,46 @@ without an evaluation grid. To score other metrics, give the options a
 
 ## Predicting with the posterior
 
-The trained posterior is registered as `state.model_components["posterior"]`.
-It is consumed only through draws: `sample_means` returns each draw's mean at
-the inputs, shaped `[S, *batch]`. Combined with the frozen variance model's
-aleatoric variance, they form the posterior predictive, continuing the run
-above:
+Once trained, or restored, the stage predicts with its posterior:
+[`predict`][stagereg.jax.PosteriorStage.predict] returns the
+[`PosteriorPredictive`][stagereg.jax.PosteriorPredictive] at the inputs, the
+mixture over the posterior's draws under the key, each with the frozen
+aleatoric variance. It takes `options.num_draws` draws of an unlimited
+posterior, such as Bayes by Backprop's, and all draws of a finite one, such as
+pSGLD's. Continuing the run above:
 
 ```{.python continuation}
-posterior = state.model_components["posterior"]
-draws = posterior.sample_means(inputs, jax.random.key(1), 64)
-assert draws.shape == (64, 8, 1)
+predictive = posterior_stage.predict(inputs, jax.random.key(1))
+assert predictive.draws.shape == (16, 8, 1)
 
-predictive = PosteriorPredictive(
-    draws=draws, aleatoric_variance=variance_model(inputs).mean()
-)
 nll = -predictive.log_prob(targets).mean()
 summary = predictive.moment_matched()
 assert bool(jnp.all(summary.epistemic_variance >= 0.0))
 ```
 
-An unlimited posterior, such as Bayes by Backprop's, needs the number of draws;
-a finite one, such as pSGLD's, refuses it and always uses all its draws, so call
-`sample_means(inputs, key)` without it. Score with the posterior predictive
+Every built-in posterior is a JAX pytree, so `predict` draws the means,
+evaluates the aleatoric variance and forms the predictive in one compiled
+call, compiled once per input shape. Score with the posterior predictive
 itself: it is exact for the draws taken and may be skewed or multimodal. The
 moment-matched predictive is for reporting the variance split or drawing a
 band.
+
+The trained posterior is also registered as
+`state.model_components["posterior"]`, and is consumed only through draws:
+`sample_means` returns each draw's mean at the inputs, shaped `[S, *batch]`.
+An unlimited posterior needs the number of draws; a finite one refuses it and
+always uses all its draws, so call `sample_means(inputs, key)` without it.
+Combined with the frozen variance model's aleatoric variance, the draws form
+the same posterior predictive by hand:
+
+```{.python continuation}
+posterior = state.model_components["posterior"]
+draws = posterior.sample_means(inputs, jax.random.key(1), 16)
+by_hand = PosteriorPredictive(
+    draws=draws, aleatoric_variance=variance_model(inputs).mean()
+)
+assert bool(jnp.allclose(by_hand.mean(), predictive.mean(), atol=1e-5))
+```
 
 ## Inferring a subnetwork
 
@@ -336,6 +351,12 @@ pSGLD and MC-Dropout:
   other metric. Undeclared keys are ignored, and `prepare` refuses a key whose
   tag the stage already records, such as `loss`. Bayes by Backprop, pSGLD and
   MC-Dropout declare none.
+- Register the method's posterior as a JAX pytree, with the problem's
+  `mean_function` as static data, as the built-in posteriors are. Validation
+  and [`predict`][stagereg.jax.PosteriorStage.predict] then form its posterior
+  predictive in one compiled call per batch. Any other posterior works too:
+  the stage calls its `sample_means` from Python, which is slower unless
+  `sample_means` is compiled itself.
 
 ## The XSin example
 

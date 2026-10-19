@@ -50,7 +50,9 @@ from stagereg.core.types import (
 )
 from stagereg.jax import (
     BayesByBackprop,
+    MCDropout,
     MetricSuite,
+    PosteriorPredictive,
     PosteriorPredictivePredictor,
     PreconditionedSGLD,
 )
@@ -1300,3 +1302,146 @@ def test_a_dropout_networks_masks_come_from_the_key(
     again = jax.jit(problem.mean_function)(parameters, probe.probe_inputs, key)
 
     assert jnp.allclose(first, again)
+
+
+_COMPILED_METHODS: dict[str, tuple[Callable[[], InferenceMethod], Any]] = {
+    "bayes by backprop": (
+        lambda: BayesByBackprop(optimizer=optax.adam(0.01), initial_std=0.05),
+        None,
+    ),
+    "psgld": (lambda: PreconditionedSGLD(step_size=1e-3), None),
+    "mc dropout": (
+        lambda: MCDropout(optimizer=optax.adam(0.01)),
+        lambda: DropoutLinearModel(rngs=nnx.Rngs(5)),
+    ),
+}
+
+
+def _compiled_stage(method_name: str, **options: Any) -> PosteriorStage:
+    make_method, make_model = _COMPILED_METHODS[method_name]
+    return PosteriorStage(
+        inference_method=make_method(),
+        train_loader=regression_loader,
+        dataset_size=DATASET_SIZE,
+        options=PosteriorStageOptions(**{"epochs": 4, "num_draws": 4, **options}),
+        model=None if make_model is None else make_model(),
+    )
+
+
+@pytest.mark.parametrize("method_name", sorted(_COMPILED_METHODS))
+def test_posterior_predictive_validation_compiles_nothing_after_warmup(
+    shared_variance_ready_run: VarianceReadyRun,
+    compile_counter: Callable[[], Any],
+    method_name: str,
+) -> None:
+    state = _isolated(shared_variance_ready_run).state
+    with compile_counter() as counter:
+        stage = _compiled_stage(
+            method_name, validation_loader=regression_loader, event_sinks=(counter,)
+        )
+        stage.prepare(state)
+        stage.train(state)
+
+    assert counter.during_warmup("posterior") > 0
+    assert counter.after_warmup("posterior") == 0
+    assert len(state.metric_history["posterior/validation/nll"]) == 4
+
+
+@dataclass
+class TrainedStage:
+    """A posterior stage trained, without validation, on a variance-ready run."""
+
+    stage: PosteriorStage
+    run: VarianceReadyRun
+
+
+@pytest.fixture(scope="module")
+def trained_stages(variance_ready_run: MakeVarianceReadyRun) -> dict[str, TrainedStage]:
+    """Each method's trained posterior stage; never mutate them."""
+    trained = {}
+    for name in _COMPILED_METHODS:
+        run = variance_ready_run()
+        stage = _compiled_stage(name)
+        stage.prepare(run.state)
+        stage.train(run.state)
+        trained[name] = TrainedStage(stage, run)
+    return trained
+
+
+@pytest.mark.parametrize("method_name", sorted(_COMPILED_METHODS))
+def test_a_trained_posterior_predicts_through_one_compiled_call(
+    trained_stages: dict[str, TrainedStage],
+    compile_counter: Callable[[], Any],
+    method_name: str,
+) -> None:
+    stage = trained_stages[method_name].stage
+    # An input shape no other test predicts at, so the first call compiles.
+    inputs = jnp.linspace(-1.0, 1.0, 13)[:, None]
+    shifted = inputs + 0.5
+    key, other_key = jax.random.key(3), jax.random.key(4)
+
+    with compile_counter() as first:
+        predictive = stage.predict(inputs, key)
+    with compile_counter() as again:
+        repeated = stage.predict(shifted, other_key)
+
+    assert isinstance(predictive, PosteriorPredictive)
+    assert isinstance(repeated, PosteriorPredictive)
+    assert first.total == 1
+    assert again.total == 0
+
+
+@pytest.mark.parametrize("method_name", sorted(_COMPILED_METHODS))
+def test_a_trained_posteriors_prediction_is_its_posterior_predictive(
+    trained_stages: dict[str, TrainedStage], method_name: str
+) -> None:
+    trained = trained_stages[method_name]
+    posterior = trained.run.state.model_components["posterior"]
+    inputs = jnp.linspace(-1.5, 1.5, 9)[:, None]
+    targets = 2.0 * inputs
+    key = jax.random.key(11)
+
+    predictive = trained.stage.predict(inputs, key)
+    expected = PosteriorPredictive(
+        draws=posterior.sample_means(
+            inputs, key, None if posterior.num_draws is not None else 4
+        ),
+        aleatoric_variance=trained.run.variance_model(inputs).mean(),
+    )
+
+    np.testing.assert_allclose(predictive.mean(), expected.mean(), rtol=1e-5)
+    np.testing.assert_allclose(predictive.variance(), expected.variance(), rtol=1e-5)
+    np.testing.assert_allclose(
+        predictive.log_prob(targets), expected.log_prob(targets), rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize("method_name", sorted(_COMPILED_METHODS))
+def test_a_restored_posterior_stage_predicts_as_the_trained_one(
+    variance_ready_run: MakeVarianceReadyRun,
+    make_stages: MakeStages,
+    method_name: str,
+) -> None:
+    store = RecordingStore()
+    run = variance_ready_run(checkpoint_store=store)
+    trained = _compiled_stage(method_name, checkpoint_store=store)
+    trained.prepare(run.state)
+    trained.train(run.state)
+    restored_state = restore_mean_and_variance(make_stages(seed=7), store)
+    restored = _compiled_stage(method_name)
+    restored.restore(restored_state, store.load("posterior/best"))
+    inputs = jnp.linspace(-1.0, 1.0, 6)[:, None]
+    key = jax.random.key(2)
+
+    expected = trained.predict(inputs, key)
+    actual = restored.predict(inputs, key)
+
+    np.testing.assert_allclose(actual.mean(), expected.mean(), rtol=1e-6)
+    np.testing.assert_allclose(actual.variance(), expected.variance(), rtol=1e-6)
+
+
+def test_an_untrained_posterior_stage_refuses_to_predict() -> None:
+    stage = _compiled_stage("psgld")
+
+    with pytest.raises(ValueError, match="no posterior"):
+        stage.predict(jnp.zeros((3, 1)), jax.random.key(0))

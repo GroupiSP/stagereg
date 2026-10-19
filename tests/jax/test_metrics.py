@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -620,3 +623,57 @@ def test_compiled_resolver_reads_the_live_model_state_at_each_call() -> None:
     after = resolve(batch, jax.random.key(0)).mean
 
     assert not np.allclose(before, after)
+
+
+class FixedPredictionModel(nnx.Module, pytree=False):
+    """Returns one prediction, built beforehand, whatever the inputs."""
+
+    def __init__(self, prediction: object) -> None:
+        self.prediction = prediction
+
+    def __call__(self, inputs: jax.Array) -> object:
+        del inputs
+        return self.prediction
+
+
+_DEVICE_FIELDS = PredictionRequirements(
+    fields=MetricRequirements(
+        variance=True, predictive_samples=True, log_likelihood=True
+    ),
+    predictive_sample_count=16,
+)
+
+
+@pytest.mark.parametrize(
+    ("predictor", "prediction"),
+    [
+        (
+            GaussianPredictor(),
+            Gaussian(loc=jnp.linspace(0.0, 1.0, 11), scale=jnp.full(11, 0.5)),
+        ),
+        (
+            PosteriorPredictivePredictor(),
+            PosteriorPredictive(
+                draws=jnp.linspace(0.0, 1.0, 33).reshape(3, 11),
+                aleatoric_variance=jnp.full(11, 0.25),
+                draw_mask=jnp.array([True, False, True]),
+            ),
+        ),
+    ],
+    ids=["gaussian", "posterior predictive"],
+)
+def test_a_predictor_materializes_a_prediction_in_one_compiled_call(
+    compile_counter: Callable[[], Any], predictor: object, prediction: object
+) -> None:
+    batch = Batch(inputs=jnp.zeros((11, 1)), targets=jnp.linspace(0.0, 2.0, 11))
+    model = FixedPredictionModel(prediction)
+    key = metric_key(jax.random.key(0))
+
+    with compile_counter() as counter:
+        data = predictor(model, batch, _DEVICE_FIELDS, key)  # type: ignore[operator]
+
+    assert counter.total == 1
+    assert data.variance is not None and data.variance.shape == (11,)
+    assert data.log_likelihood is not None and data.log_likelihood.shape == (11,)
+    assert data.predictive_samples is not None
+    assert data.predictive_samples.shape == (11, 16)

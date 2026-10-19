@@ -6,13 +6,17 @@ This module binds
 linear head, following the same Tier 2 (JAX backend) placement as
 [`stagereg.jax.state`][stageregjaxstate] and
 [`stagereg.jax.evaluation`][stageregjaxevaluation].
+
+Every distribution here is a JAX pytree whose leaves are its array fields, so it
+can be passed into and returned from jitted functions.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from statistics import NormalDist
+from typing import Any, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +27,45 @@ from flax import nnx
 # Halvings of the quantile bracket; enough to reach float32 resolution.
 _BISECTION_STEPS = 64
 
+_Distribution = TypeVar("_Distribution")
 
+
+def _register_pytree(cls: type[_Distribution]) -> type[_Distribution]:
+    """Register a frozen distribution dataclass as a JAX pytree.
+
+    Every dataclass field is a child array; none is static (ADR 0012).
+    Unflattening bypasses ``__init__`` and ``__post_init__``, because JAX
+    rebuilds pytrees with placeholder leaves (tracers, ``None``, axis specs)
+    that validation must not reject.
+
+    Args:
+        cls: The frozen dataclass to register.
+
+    Returns:
+        ``cls`` itself, so the function works as a class decorator.
+    """
+    names = tuple(item.name for item in fields(cls))  # type: ignore[arg-type]
+
+    def flatten(
+        distribution: _Distribution,
+    ) -> tuple[tuple[tuple[jax.tree_util.GetAttrKey, Any], ...], None]:
+        children = tuple(
+            (jax.tree_util.GetAttrKey(name), getattr(distribution, name))
+            for name in names
+        )
+        return children, None
+
+    def unflatten(_: None, children: Any) -> _Distribution:
+        distribution = object.__new__(cls)
+        for name, child in zip(names, children, strict=True):
+            object.__setattr__(distribution, name, child)
+        return distribution
+
+    jax.tree_util.register_pytree_with_keys(cls, flatten, unflatten)
+    return cls
+
+
+@_register_pytree
 @dataclass(frozen=True)
 class Gaussian:
     """A JAX-backed Gaussian predictive distribution parametrized by scale.
@@ -86,6 +128,7 @@ class Gaussian:
         return jnp.square(self.scale)
 
 
+@_register_pytree
 @dataclass(frozen=True)
 class Gamma:
     """A JAX-backed Gamma distribution parametrized by shape and rate.
@@ -150,6 +193,7 @@ class Gamma:
         return self.concentration / jnp.square(self.rate)
 
 
+@_register_pytree
 @dataclass(frozen=True)
 class MomentMatchedPredictive:
     """The Gaussian with a posterior predictive's mean and variance.
@@ -223,6 +267,7 @@ class MomentMatchedPredictive:
         return self.aleatoric_variance + self.epistemic_variance
 
 
+@_register_pytree
 @dataclass(frozen=True)
 class PosteriorPredictive:
     """The posterior predictive: an equally weighted mixture of Gaussians over draws.

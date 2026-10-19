@@ -55,6 +55,36 @@ assert prediction.mean().shape == (8, 1)
 assert bool(jnp.all(prediction.variance() > 0.0))
 ```
 
+### Distributions inside jitted code
+
+The JAX backend's distributions ([`Gaussian`][stagereg.jax.Gaussian],
+[`Gamma`][stagereg.jax.Gamma],
+[`PosteriorPredictive`][stagereg.jax.PosteriorPredictive] and
+[`MomentMatchedPredictive`][stagereg.jax.MomentMatchedPredictive]) are JAX
+pytrees whose leaves are their parameter arrays. A distribution can therefore be
+passed into, and returned from, a `jax.jit` function without unpacking its
+fields by hand:
+
+```python
+import jax
+import jax.numpy as jnp
+
+from stagereg.jax import Gaussian
+
+
+@jax.jit
+def widen(distribution):
+    return Gaussian(loc=distribution.loc, scale=2.0 * distribution.scale)
+
+
+wider = widen(Gaussian(loc=jnp.zeros(3), scale=jnp.ones(3)))
+
+assert bool(jnp.all(wider.variance() == 4.0))
+```
+
+A [`Batch`][stagereg.core.Batch] is not a pytree: pass its `inputs` and
+`targets` to jitted code directly.
+
 ## Scoring the distribution: negative log-likelihood
 
 [`NegativeLogLikelihoodLoss`][stagereg.core.NegativeLogLikelihoodLoss] is the

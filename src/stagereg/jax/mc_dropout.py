@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any
 
 import jax
@@ -22,17 +21,13 @@ import optax
 from stagereg.core.types import Batch, PyTree
 from stagereg.jax.posterior import (
     PosteriorProblem,
+    TracedPosterior,
     default_optimizer,
     draw_unlimited,
     require_inferred_tree,
 )
 
 
-@partial(
-    jax.tree_util.register_dataclass,
-    data_fields=["parameters"],
-    meta_fields=["mean_function"],
-)
 @dataclass(frozen=True)
 class MCDropoutPosterior:
     """The fine-tuned network under random dropout masks.
@@ -41,11 +36,6 @@ class MCDropoutPosterior:
     ``jax.random.fold_in(key, s)``, which selects its dropout masks. It is the
     same function at every input only if no mask varies across batch rows;
     see [`MCDropout`][stagereg.jax.MCDropout].
-
-    It is a JAX pytree whose child is ``parameters`` and whose
-    ``mean_function`` is static, compared by identity, so it passes into
-    jitted code whole, as [`PosteriorStage.predict`][stagereg.jax.PosteriorStage.predict]
-    passes it.
 
     Attributes:
         mean_function: Maps ``(parameters, inputs, key)`` to the posterior
@@ -87,6 +77,12 @@ class MCDropoutPosterior:
             )
 
         return draw_unlimited(draw, num_samples)
+
+    def _traced(self) -> TracedPosterior:
+        """Return the posterior taken apart for compiled code."""
+        return TracedPosterior(
+            type(self), self.mean_function, {"parameters": self.parameters}
+        )
 
 
 @dataclass

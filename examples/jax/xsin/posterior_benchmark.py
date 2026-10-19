@@ -172,22 +172,16 @@ def xsin_bayes_by_backprop(config: XSinConfig) -> BayesByBackprop:
 def xsin_psgld(config: XSinConfig) -> PreconditionedSGLD:
     """Build the pSGLD inference method of the XSin example.
 
-    Its sample buffer is sized to the samples the run retains, so it never
-    grows and validation compiles nothing after the first epoch.
-
     Args:
         config: Benchmark configuration.
 
     Returns:
         A fresh, uninitialized inference method.
     """
-    steps = config.posterior_epochs * -(-config.train_size // config.batch_size)
-    retained = max(steps - config.psgld_burn_in, 0) // config.psgld_thinning
     return PreconditionedSGLD(
         step_size=config.psgld_step_size,
         burn_in=config.psgld_burn_in,
         thinning=config.psgld_thinning,
-        capacity=max(retained, 1),
     )
 
 

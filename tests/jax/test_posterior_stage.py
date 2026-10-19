@@ -1445,3 +1445,30 @@ def test_an_untrained_posterior_stage_refuses_to_predict() -> None:
 
     with pytest.raises(ValueError, match="no posterior"):
         stage.predict(jnp.zeros((3, 1)), jax.random.key(0))
+
+
+class _StaticPosteriorHolder(nnx.Module):
+    """Holds a posterior as static data, as NNX modules held them before #125."""
+
+    def __init__(self, posterior: Any) -> None:
+        self.posterior = nnx.static(posterior)
+
+    def __call__(self, inputs: jax.Array, key: jax.Array) -> jax.Array:
+        num_samples = None if self.posterior.num_draws is not None else 4
+        return self.posterior.sample_means(inputs, key, num_samples)
+
+
+@pytest.mark.parametrize("method_name", sorted(_COMPILED_METHODS))
+def test_a_built_in_posterior_can_be_held_as_static_data_in_an_nnx_module(
+    trained_stages: dict[str, TrainedStage], method_name: str
+) -> None:
+    posterior = trained_stages[method_name].run.state.model_components["posterior"]
+    inputs = jnp.linspace(-1.0, 1.0, 5)[:, None]
+    key = jax.random.key(1)
+
+    holder = _StaticPosteriorHolder(posterior)
+
+    num_samples = None if posterior.num_draws is not None else 4
+    np.testing.assert_array_equal(
+        holder(inputs, key), posterior.sample_means(inputs, key, num_samples)
+    )

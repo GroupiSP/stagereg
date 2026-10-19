@@ -164,6 +164,13 @@ def run_supervised(
     best model, load the checkpoint from ``checkpoint_store`` and pass it to
     [`restore_checkpoint`][stagereg.jax.restore_checkpoint].
 
+    The training step is compiled once with ``model`` and ``optimizer`` bound
+    to it. It updates their variables in place and sees changes made to them
+    between steps, but their module structure and plain Python attributes
+    are fixed for the run: an attribute set inside the step, e.g. by the
+    loss, is not written back to ``model``, as it would be by
+    [`make_train_step`][stagereg.jax.make_train_step].
+
     Args:
         model: The NNX module to train, mutated in place.
         optimizer: The NNX optimizer used to update ``model``, mutated

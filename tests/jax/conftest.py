@@ -25,6 +25,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import numpy as np
 import pytest
 
 _EXAMPLES_DIR = Path(__file__).parents[2] / "examples" / "jax"
@@ -90,6 +91,25 @@ def cmapss_run() -> ModuleType:
     ):
         pytest.importorskip(dependency)
     return _load_example_module(_CMAPSS_DIR, "cmapss_run", "run.py")
+
+
+@pytest.fixture
+def offline_fd001(cmapss_run: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serve synthetic FD001 splits in place of the cached NASA archive."""
+    from cmapss_trajectories import build_random_trajectories
+
+    rng = np.random.default_rng(7)
+    sensor_names = cmapss_run._SENSOR_NAMES
+    train_data = build_random_trajectories(
+        rng, unit_ids=range(1, 11), n_cycles=60, feature_columns=sensor_names
+    )
+    test_data = build_random_trajectories(
+        rng, unit_ids=range(1, 6), n_cycles=45, feature_columns=sensor_names
+    )
+    test_rul = rng.uniform(low=1.0, high=100.0, size=5)
+    monkeypatch.setattr(cmapss_run, "load_fd001_data", lambda: train_data)
+    monkeypatch.setattr(cmapss_run, "load_fd001_test_data", lambda: test_data)
+    monkeypatch.setattr(cmapss_run, "load_fd001_test_rul", lambda: test_rul)
 
 
 @pytest.fixture(scope="session")

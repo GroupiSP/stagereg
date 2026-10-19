@@ -402,21 +402,7 @@ class PosteriorPredictive:
         """
         if not 0.0 < probability < 1.0:
             raise ValueError("probability must be strictly between 0 and 1.")
-        loc, scale = self._components()
-        component = loc + NormalDist().inv_cdf(probability) * scale
-        lower = jnp.min(component, axis=0)
-        upper = jnp.max(component, axis=0)
-
-        def bisect(
-            _: int, bracket: tuple[jax.Array, jax.Array]
-        ) -> tuple[jax.Array, jax.Array]:
-            low, high = bracket
-            middle = 0.5 * (low + high)
-            below = self.cdf(middle) < probability
-            return jnp.where(below, middle, low), jnp.where(below, high, middle)
-
-        lower, upper = jax.lax.fori_loop(0, _BISECTION_STEPS, bisect, (lower, upper))
-        return 0.5 * (lower + upper)
+        return _mixture_quantile(self, probability, NormalDist().inv_cdf(probability))
 
     def moment_matched(self) -> MomentMatchedPredictive:
         """Summarize the mixture by the Gaussian with its mean and variance.
@@ -437,6 +423,40 @@ class PosteriorPredictive:
                 jnp.var(self.draws, axis=0), self.batch_shape
             ),
         )
+
+
+@jax.jit
+def _mixture_quantile(
+    predictive: PosteriorPredictive, probability: jax.Array, standard: jax.Array
+) -> jax.Array:
+    """Invert the mixture CDF at ``probability`` by bisection, compiled once per shape.
+
+    The draws' Gaussian quantiles bracket the mixture quantile, and the bracket is
+    then halved ``_BISECTION_STEPS`` times. ``probability`` and its standard normal
+    quantile ``standard`` are traced, so every probability level shares one compile.
+
+    Args:
+        predictive: The mixture to invert.
+        probability: The cumulative probability, strictly between 0 and 1.
+        standard: The standard normal quantile at ``probability``.
+
+    Returns:
+        The quantile, shaped like the mixture's ``batch_shape``.
+    """
+    loc, scale = predictive._components()
+    component = loc + standard * scale
+    bracket = (jnp.min(component, axis=0), jnp.max(component, axis=0))
+
+    def bisect(
+        _: int, bracket: tuple[jax.Array, jax.Array]
+    ) -> tuple[jax.Array, jax.Array]:
+        low, high = bracket
+        middle = 0.5 * (low + high)
+        below = predictive.cdf(middle) < probability
+        return jnp.where(below, middle, low), jnp.where(below, high, middle)
+
+    lower, upper = jax.lax.fori_loop(0, _BISECTION_STEPS, bisect, bracket)
+    return 0.5 * (lower + upper)
 
 
 class GaussianHead(nnx.Module):

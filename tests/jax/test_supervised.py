@@ -259,6 +259,65 @@ def test_make_train_step_evaluates_batch_metrics_in_inference_mode(
     assert output["training_flag"] == pytest.approx(0.0)
 
 
+class TiedLinearModel(nnx.Module):
+    """Two attributes sharing one linear layer, so the module graph aliases."""
+
+    def __init__(self, *, rngs: nnx.Rngs) -> None:
+        self.first = nnx.Linear(1, 1, rngs=rngs)
+        self.second = self.first
+
+    def __call__(self, inputs: jax.Array) -> jax.Array:
+        return self.second(self.first(inputs))
+
+
+@pytest.mark.parametrize("tied", [False, True], ids=["plain", "shared-submodule"])
+def test_run_supervised_trains_like_calling_make_train_step_per_batch(
+    linear_model: type[Any],
+    squared_error: SupervisedLoss,
+    constant_loader: LoaderFactory,
+    tied: bool,
+) -> None:
+    model_class = TiedLinearModel if tied else linear_model
+
+    def components() -> tuple[Any, nnx.Optimizer]:
+        model = model_class(rngs=nnx.Rngs(0))
+        return model, create_optimizer(model, optax.adam(0.1))
+
+    model, optimizer = components()
+    state = initialize_training_state(model, optimizer, rng_key=jax.random.key(1))
+    run_supervised(
+        model=model,
+        optimizer=optimizer,
+        train_loader=constant_loader,
+        loss=squared_error,
+        state=state,
+        epochs=3,
+    )
+
+    expected_model, expected_optimizer = components()
+    train_step = make_train_step(squared_error)
+    key = jax.random.key(1)
+    for epoch in range(3):
+        for batch in constant_loader(split="train", epoch=epoch):
+            key, batch_key = split_key(key)
+            train_step(
+                expected_model,
+                expected_optimizer,
+                batch.inputs,
+                batch.targets,
+                batch.sample_weight,
+                batch_key,
+            )
+
+    assert jax.tree.all(
+        jax.tree.map(
+            np.array_equal,
+            nnx.state((model, optimizer)),
+            nnx.state((expected_model, expected_optimizer)),
+        )
+    )
+
+
 def test_evaluate_loader_without_registered_metrics_returns_loss_mapping(
     make_components: MakeComponents,
     squared_error: SupervisedLoss,

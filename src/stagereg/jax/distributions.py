@@ -323,8 +323,7 @@ class PosteriorPredictive:
         return jnp.sum(self.draw_mask)
 
     def _included(self, values: jax.Array, fill: float) -> jax.Array:
-        """Replace the values of excluded draw slots, on the leading axis, by
-        ``fill``."""
+        """Replace the values of excluded draw slots by ``fill``."""
         if self.draw_mask is None:
             return values
         mask = jnp.reshape(self.draw_mask, (-1,) + (1,) * (jnp.ndim(values) - 1))
@@ -444,21 +443,7 @@ class PosteriorPredictive:
         """
         if not 0.0 < probability < 1.0:
             raise ValueError("probability must be strictly between 0 and 1.")
-        loc, scale = self._components()
-        component = loc + NormalDist().inv_cdf(probability) * scale
-        lower = jnp.min(self._included(component, jnp.inf), axis=0)
-        upper = jnp.max(self._included(component, -jnp.inf), axis=0)
-
-        def bisect(
-            _: int, bracket: tuple[jax.Array, jax.Array]
-        ) -> tuple[jax.Array, jax.Array]:
-            low, high = bracket
-            middle = 0.5 * (low + high)
-            below = self.cdf(middle) < probability
-            return jnp.where(below, middle, low), jnp.where(below, high, middle)
-
-        lower, upper = jax.lax.fori_loop(0, _BISECTION_STEPS, bisect, (lower, upper))
-        return 0.5 * (lower + upper)
+        return _mixture_quantile(self, probability, NormalDist().inv_cdf(probability))
 
     def moment_matched(self) -> MomentMatchedPredictive:
         """Summarize the mixture by the Gaussian with its mean and variance.
@@ -481,12 +466,48 @@ class PosteriorPredictive:
         )
 
     def _epistemic_variance(self) -> jax.Array:
-        """Return the variance of the included draws' means, shaped like
-        ``draws[0]``."""
+        """Return the variance of the included draws' means."""
         if self.draw_mask is None:
             return jnp.var(self.draws, axis=0)
         deviation = self._included(self.draws - self._draw_mean(), 0.0)
         return jnp.sum(jnp.square(deviation), axis=0) / self._included_count()
+
+
+@jax.jit
+def _mixture_quantile(
+    predictive: PosteriorPredictive, probability: jax.Array, standard: jax.Array
+) -> jax.Array:
+    """Invert the mixture CDF at ``probability`` by bisection, compiled once per shape.
+
+    The draws' Gaussian quantiles bracket the mixture quantile, and the bracket is
+    then halved ``_BISECTION_STEPS`` times. ``probability`` and its standard normal
+    quantile ``standard`` are traced, so every probability level shares one compile.
+
+    Args:
+        predictive: The mixture to invert.
+        probability: The cumulative probability, strictly between 0 and 1.
+        standard: The standard normal quantile at ``probability``.
+
+    Returns:
+        The quantile, shaped like the mixture's ``batch_shape``.
+    """
+    loc, scale = predictive._components()
+    component = loc + standard * scale
+    bracket = (
+        jnp.min(predictive._included(component, jnp.inf), axis=0),
+        jnp.max(predictive._included(component, -jnp.inf), axis=0),
+    )
+
+    def bisect(
+        _: int, bracket: tuple[jax.Array, jax.Array]
+    ) -> tuple[jax.Array, jax.Array]:
+        low, high = bracket
+        middle = 0.5 * (low + high)
+        below = predictive.cdf(middle) < probability
+        return jnp.where(below, middle, low), jnp.where(below, high, middle)
+
+    lower, upper = jax.lax.fori_loop(0, _BISECTION_STEPS, bisect, bracket)
+    return 0.5 * (lower + upper)
 
 
 class GaussianHead(nnx.Module):

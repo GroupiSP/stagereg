@@ -339,6 +339,26 @@ def test_posterior_predictive_keeps_the_draw_axis_out_of_broadcasting() -> None:
         np.testing.assert_allclose(value, expected, rtol=1e-6)
 
 
+def test_posterior_predictive_quantile_compiles_once_per_shape(
+    compile_counter: Any,
+) -> None:
+    rng = np.random.default_rng(0)
+
+    def mixture() -> PosteriorPredictive:
+        return PosteriorPredictive(
+            draws=jnp.asarray(rng.normal(size=(5, 4)), jnp.float32),
+            aleatoric_variance=jnp.asarray(rng.uniform(0.5, 2.0, 4), jnp.float32),
+        )
+
+    first, *others = [mixture() for _ in range(4)]
+    first.quantile(0.1).block_until_ready()
+    with compile_counter() as repeated:
+        for mixture_, probability in zip(others, (0.1, 0.5, 0.9), strict=True):
+            mixture_.quantile(probability).block_until_ready()
+
+    assert repeated.total == 0
+
+
 @pytest.mark.parametrize("draws", [jnp.array(1.0), jnp.zeros((0, 3))])
 def test_posterior_predictive_requires_a_non_empty_draw_axis(draws: jax.Array) -> None:
     with pytest.raises(ValueError, match="draw axis"):

@@ -121,6 +121,77 @@ def test_sample_crps_requires_predictive_samples() -> None:
         SampleContinuousRankedProbabilityScore()(data)
 
 
+# Small integers make samples, targets and grid points collide, which is where
+# the ``samples <= grid`` and ``grid >= target`` conventions matter.
+_crps_values = st.one_of(
+    st.integers(-5, 5).map(float),
+    st.floats(-1e3, 1e3, allow_nan=False, allow_infinity=False),
+)
+
+
+@st.composite
+def _scoring_units(draw: st.DrawFn) -> tuple[np.ndarray, np.ndarray]:
+    """Draw ``(units,)`` targets and ``(units, S)`` predictive samples."""
+    units = draw(st.integers(1, 6))
+    sample_count = draw(st.integers(1, 8))
+    targets = draw(st.lists(_crps_values, min_size=units, max_size=units))
+    samples = draw(
+        st.lists(
+            _crps_values,
+            min_size=units * sample_count,
+            max_size=units * sample_count,
+        )
+    )
+    return np.asarray(targets), np.reshape(samples, (units, sample_count))
+
+
+_grids = st.lists(_crps_values, min_size=2, max_size=12, unique=True).map(
+    lambda values: EvaluationGrid(np.sort(values))
+)
+
+
+@given(units=_scoring_units(), grid=_grids)
+def test_point_crps_matches_a_loop_over_scoring_units(
+    units: tuple[np.ndarray, np.ndarray], grid: EvaluationGrid
+) -> None:
+    targets, samples = units
+    data = EpochPredictionData(
+        targets=targets,
+        mean=np.mean(samples, axis=1),
+        predictive_samples=samples,
+        evaluation_grid=grid,
+    )
+
+    expected = np.mean(
+        [
+            point_crps(target, row, grid.values)
+            for target, row in zip(targets, samples, strict=True)
+        ]
+    )
+    assert PointContinuousRankedProbabilityScore()(data) == pytest.approx(
+        expected, rel=1e-9, abs=1e-9
+    )
+
+
+@given(units=_scoring_units())
+def test_sample_crps_matches_a_loop_over_scoring_units(
+    units: tuple[np.ndarray, np.ndarray],
+) -> None:
+    targets, samples = units
+    data = EpochPredictionData(
+        targets=targets,
+        mean=np.mean(samples, axis=1),
+        predictive_samples=samples,
+    )
+
+    expected = np.mean(
+        [sample_crps(target, row) for target, row in zip(targets, samples, strict=True)]
+    )
+    assert SampleContinuousRankedProbabilityScore()(data) == pytest.approx(
+        expected, rel=1e-9, abs=1e-9
+    )
+
+
 def test_conditional_crps_scores_paired_distributions_before_averaging() -> None:
     grid = EvaluationGrid(np.linspace(-2.0, 4.0, 61))
     reference = np.array([[-1.0, 0.0, 1.0], [1.0, 2.0, 3.0]])

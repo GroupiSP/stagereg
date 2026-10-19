@@ -679,8 +679,8 @@ def _merge_grid(parts: Sequence[EpochPredictionData]) -> EvaluationGrid | None:
 
 def initialize_batch_metric_values(
     metrics: Sequence[BatchMetricSpec],
-) -> dict[str, list[float]]:
-    """Create per-metric host-side accumulation buffers."""
+) -> dict[str, list[Any]]:
+    """Create per-metric accumulation buffers for raw step outputs."""
     return {spec.name: [] for spec in metrics}
 
 
@@ -688,23 +688,39 @@ def collect_step_metrics(
     step_output: Mapping[str, Any],
     *,
     metrics: Sequence[BatchMetricSpec],
-    losses: list[float] | None,
-    batch_metric_values: dict[str, list[float]],
+    losses: list[Any] | None,
+    batch_metric_values: dict[str, list[Any]],
     context: str,
 ) -> None:
-    """Append one step's loss and registered batch metrics.
+    """Append one step's loss and registered batch metrics as they are.
 
-    Passing ``losses=None`` collects only the registered batch metrics, for
-    steps that compute no loss at all.
+    The values are not read on the host, so device arrays stay on the device
+    and the next step can be dispatched without waiting for this one;
+    ``step_outputs_to_host`` moves
+    them once the epoch ends. Passing ``losses=None`` collects only the
+    registered batch metrics, for steps that compute no loss at all.
     """
     if losses is not None:
-        losses.append(float(step_output["loss"]))
+        losses.append(step_output["loss"])
     for spec in metrics:
         if spec.name not in step_output:
             raise ValueError(
                 f"{context} did not produce registered metric {spec.name!r}."
             )
-        batch_metric_values[spec.name].append(float(step_output[spec.name]))
+        batch_metric_values[spec.name].append(step_output[spec.name])
+
+
+def step_outputs_to_host[T](values: T) -> T:
+    """Move accumulated step outputs to the host in one transfer.
+
+    Args:
+        values: A pytree whose leaves are scalar step outputs, either device
+            arrays or Python numbers.
+
+    Returns:
+        ``values`` with every leaf replaced by a Python float.
+    """
+    return jax.tree.map(float, jax.device_get(values))
 
 
 def maybe_collect_epoch_prediction_data(
@@ -731,16 +747,23 @@ def maybe_collect_epoch_prediction_data(
 def reduce_metric_suite(
     *,
     suite: MetricSuite,
-    losses: Sequence[float] | None,
-    batch_metric_values: Mapping[str, Sequence[float]],
+    losses: Sequence[Any] | None,
+    batch_metric_values: Mapping[str, Sequence[Any]],
     epoch_metric_parts: Sequence[EpochPredictionData] | None,
 ) -> dict[str, float]:
     """Reduce accumulated batch and typed epoch metrics into one mapping.
 
-    Passing ``losses=None`` omits the ``"loss"`` key entirely, for
-    evaluations that compute no loss. This is distinct from an empty
-    sequence, which means a loss was requested but no batch produced one.
+    ``losses`` and ``batch_metric_values`` may hold raw step outputs; they
+    are moved to the host together before reducing, so each
+    [`BatchMetricSpec.reduce`][stagereg.jax.BatchMetricSpec] still
+    receives Python floats. Passing ``losses=None`` omits the ``"loss"`` key
+    entirely, for evaluations that compute no loss. This is distinct from an
+    empty sequence, which means a loss was requested but no batch produced
+    one.
     """
+    losses, batch_metric_values = step_outputs_to_host(
+        (losses, dict(batch_metric_values))
+    )
     reduced: dict[str, float] = {}
     if losses is not None:
         reduced["loss"] = _finite_float("loss", _metric_mean(losses))

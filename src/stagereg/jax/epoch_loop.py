@@ -31,6 +31,7 @@ from stagereg.jax.metrics import (
     initialize_batch_metric_values,
     metric_key,
     reduce_metric_suite,
+    step_outputs_to_host,
 )
 from stagereg.jax.rng import split_key
 from stagereg.jax.state import freeze_training_state
@@ -335,10 +336,12 @@ def _run_training_epoch(
         ValueError: If a step does not produce a diagnostic, or a diagnostic's
             epoch mean is not finite.
     """
-    losses: list[float] = []
+    # Step outputs stay on the device until the epoch ends, so no batch waits
+    # for the previous step to finish before being dispatched.
+    losses: list[Any] = []
     batch_metric_values = initialize_batch_metric_values(metrics.batch)
     epoch_metric_parts: list[EpochPredictionData] | None = [] if metrics.epoch else None
-    diagnostic_values: dict[str, list[float]] = {name: [] for name in diagnostics}
+    diagnostic_values: dict[str, list[Any]] = {name: [] for name in diagnostics}
 
     for batch in train_loader(split="train", epoch=epoch):
         state.rng_state, batch_key = split_key(state.rng_state)
@@ -355,8 +358,11 @@ def _run_training_epoch(
         for name, values in diagnostic_values.items():
             if name not in output:
                 raise ValueError(f"train step did not produce diagnostic {name!r}.")
-            values.append(float(output[name]))
+            values.append(output[name])
 
+    losses, batch_metric_values, diagnostic_values = step_outputs_to_host(
+        (losses, batch_metric_values, diagnostic_values)
+    )
     reduced = reduce_metric_suite(
         suite=metrics,
         losses=losses,

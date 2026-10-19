@@ -378,6 +378,95 @@ def test_posterior_predictive_quantile_rejects_probabilities_outside_unit_interv
 
 
 @st.composite
+def padded_posterior_predictives(
+    draw: st.DrawFn,
+) -> tuple[PosteriorPredictive, PosteriorPredictive]:
+    """Draw a mixture and the same mixture padded with excluded draw slots."""
+    means, variance = draw(posterior_predictives())
+    padding = draw(
+        arrays(np.float32, (draw(st.integers(1, 4)), means.shape[1]), elements=_FINITE)
+    )
+    padded = np.concatenate([means, padding])
+    order = np.asarray(draw(st.permutations(range(len(padded)))))
+    mask = order < len(means)
+    exact = PosteriorPredictive(
+        draws=jnp.asarray(padded[order][mask]), aleatoric_variance=jnp.asarray(variance)
+    )
+    masked = PosteriorPredictive(
+        draws=jnp.asarray(padded[order]),
+        aleatoric_variance=jnp.asarray(variance),
+        draw_mask=jnp.asarray(mask),
+    )
+    return masked, exact
+
+
+@settings(deadline=None, max_examples=25)
+@given(mixtures=padded_posterior_predictives(), targets=_FINITE)
+def test_a_draw_mask_excludes_its_slots_from_the_mixture(
+    mixtures: tuple[PosteriorPredictive, PosteriorPredictive], targets: float
+) -> None:
+    masked, exact = mixtures
+
+    for name in ("mean", "variance"):
+        np.testing.assert_allclose(
+            getattr(masked, name)(), getattr(exact, name)(), rtol=1e-5, atol=1e-5
+        )
+    for name in ("log_prob", "cdf"):
+        np.testing.assert_allclose(
+            getattr(masked, name)(jnp.float32(targets)),
+            getattr(exact, name)(jnp.float32(targets)),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+    np.testing.assert_allclose(
+        masked.quantile(0.3), exact.quantile(0.3), rtol=1e-4, atol=1e-4
+    )
+
+
+@settings(deadline=None, max_examples=15)
+@given(components=posterior_predictives(), seed=st.integers(0, 2**31 - 1))
+def test_a_mixture_padded_after_its_draws_samples_like_the_unpadded_one(
+    components: tuple[np.ndarray, np.ndarray], seed: int
+) -> None:
+    means, variance = components
+    padded = np.concatenate([means, np.full_like(means, 1e6)])
+    mask = np.arange(len(padded)) < len(means)
+    exact = PosteriorPredictive(
+        draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variance)
+    )
+    masked = PosteriorPredictive(
+        draws=jnp.asarray(padded),
+        aleatoric_variance=jnp.asarray(variance),
+        draw_mask=jnp.asarray(mask),
+    )
+    key = jax.random.key(seed)
+
+    np.testing.assert_array_equal(masked.sample(key, (16,)), exact.sample(key, (16,)))
+
+
+def test_a_masked_mixture_passes_through_a_jitted_function_unchanged() -> None:
+    masked = PosteriorPredictive(
+        draws=jnp.arange(6.0).reshape(3, 2),
+        aleatoric_variance=jnp.ones(2),
+        draw_mask=jnp.array([True, False, True]),
+    )
+
+    passed = jax.jit(lambda mixture: mixture)(masked)
+
+    np.testing.assert_array_equal(passed.draw_mask, masked.draw_mask)
+    np.testing.assert_allclose(jax.jit(PosteriorPredictive.mean)(masked), [2.0, 3.0])
+
+
+def test_a_draw_mask_must_have_one_entry_per_draw() -> None:
+    with pytest.raises(ValueError, match="draw_mask"):
+        PosteriorPredictive(
+            draws=jnp.zeros((3, 2)),
+            aleatoric_variance=jnp.ones(2),
+            draw_mask=jnp.array([True, False]),
+        )
+
+
+@st.composite
 def distributions(draw: st.DrawFn) -> Any:
     """Draw any of the JAX backend's distributions, with array-valued fields."""
     batch = draw(st.integers(1, 4))

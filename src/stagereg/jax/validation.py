@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 import jax
@@ -10,11 +9,7 @@ from flax import nnx
 
 from stagereg.core.protocols import LoaderFactory
 from stagereg.core.types import TrainingState, ValidationResult
-from stagereg.jax.evaluation import (
-    SupervisedLoss,
-    _build_evaluation_step,
-    _evaluate_with_step,
-)
+from stagereg.jax.evaluation import PreparedEvaluation, SupervisedLoss
 from stagereg.jax.metrics import MetricSuite
 
 
@@ -40,14 +35,12 @@ class HeldOutValidation:
     loss: SupervisedLoss
     metrics: MetricSuite = field(default_factory=MetricSuite)
     metadata: dict[str, object] = field(default_factory=dict)
-    _evaluation_step: Callable[..., Mapping[str, jax.Array]] = field(
-        init=False, repr=False, compare=False
-    )
+    _evaluation: PreparedEvaluation = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Build the evaluation step every epoch reuses."""
         object.__setattr__(
-            self, "_evaluation_step", _build_evaluation_step(self.metrics, self.loss)
+            self, "_evaluation", PreparedEvaluation.of(self.metrics, self.loss)
         )
 
     def __call__(self, state: TrainingState, *, epoch: int) -> ValidationResult:
@@ -68,12 +61,9 @@ class HeldOutValidation:
         """
         if not isinstance(state.rng_state, jax.Array):
             raise TypeError("state.rng_state must be a JAX random key.")
-        metrics, state.rng_state = _evaluate_with_step(
+        metrics, state.rng_state = self._evaluation(
             self.model,
             self.loader(split="validation", epoch=epoch),
             key=state.rng_state,
-            metrics=self.metrics,
-            evaluation_step=self._evaluation_step,
-            has_loss=True,
         )
         return ValidationResult(passed=True, metrics=metrics, message=None)

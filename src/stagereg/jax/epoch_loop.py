@@ -27,6 +27,7 @@ from stagereg.core.tracking import Decision, EventSink, TrainingEvent
 from stagereg.core.types import Batch, StageResult, TrainingState
 from stagereg.jax.metrics import (
     MetricSuite,
+    StepScalar,
     collect_step_metrics,
     initialize_batch_metric_values,
     metric_key,
@@ -338,10 +339,10 @@ def _run_training_epoch(
     """
     # Step outputs stay on the device until the epoch ends, so no batch waits
     # for the previous step to finish before being dispatched.
-    losses: list[Any] = []
+    losses: list[StepScalar] = []
     batch_metric_values = initialize_batch_metric_values(metrics.batch)
     epoch_metric_parts: list[EpochPredictionData] | None = [] if metrics.epoch else None
-    diagnostic_values: dict[str, list[Any]] = {name: [] for name in diagnostics}
+    diagnostic_values: dict[str, list[StepScalar]] = {name: [] for name in diagnostics}
 
     for batch in train_loader(split="train", epoch=epoch):
         state.rng_state, batch_key = split_key(state.rng_state)

@@ -3,6 +3,57 @@
 All notable changes to `stagereg` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-10-19
+
+Performance release for the Tier 1 reference workloads (#120): training,
+validation and posterior prediction compile once and stay on the device.
+
+### Breaking changes
+
+- `run_supervised` binds the model and optimizer to its compiled training step
+  once. Updates to their variables between steps are still seen, but the
+  module structure and plain Python attributes are fixed when the run starts:
+  an attribute set inside the step is not written back. `make_train_step` is
+  unchanged (#130).
+- Training epoch metrics run the model's forward pass compiled, so the model's
+  output must be a JAX pytree; a custom distribution type must be registered
+  with `jax.tree_util` (#129).
+
+### Added
+
+- `PosteriorStage.predict(inputs, key)`: the posterior predictive of a trained
+  or restored posterior stage. A built-in posterior is predicted in one
+  compiled call, compiled once per input shape (ADR 0013, #125).
+- `PosteriorPredictive.draw_mask`: an optional boolean mask over the draw
+  slots; every statistic is then the equally weighted mixture over the
+  included draws alone. A concrete mask that includes no draw is refused.
+- `PosteriorProblem.epochs`: the number of epochs the stage trains for, set by
+  `PosteriorStage`, so a method can plan its work. Optional for hand-built
+  problems.
+- `PreconditionedSGLD.capacity`: the number of slots first reserved for
+  retained samples. By default, `None`, the buffer is sized from the planned
+  run when the first sample is retained and doubles if the run retains more
+  (#123).
+- The distributions `Gaussian`, `Gamma`, `MomentMatchedPredictive` and
+  `PosteriorPredictive` are JAX pytrees, so they pass into and out of jitted
+  functions. `Batch` is not (ADR 0012, #124).
+
+### Changed
+
+- Faster, with no change in results:
+  - `HeldOutValidation` compiles its evaluation step once per strategy (#122).
+  - Step losses, batch metrics and diagnostics stay on the device within an
+    epoch and reach the host once per epoch (#127).
+  - `PointContinuousRankedProbabilityScore` and
+    `SampleContinuousRankedProbabilityScore` are vectorised across scoring
+    units (#128).
+  - `PosteriorPredictive.quantile` compiles once per mixture shape (#126).
+  - `PreconditionedSGLD` keeps its retained samples in a preallocated buffer
+    instead of restacking them every epoch, so posterior validation compiles
+    nothing after the first epoch (#94, #123).
+  - The XSin posterior example trains its supervised stages once for all
+    posterior methods (#132).
+
 ## [0.2.0] - 2026-10-15
 
 ### Breaking changes

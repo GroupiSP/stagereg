@@ -7,7 +7,7 @@ sight, which is how the posterior stage will drive an inference method's
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -22,7 +22,7 @@ from stagereg.core.metric_registry import EpochPredictionData, RootMeanSquaredEr
 from stagereg.core.naming import Split
 from stagereg.core.types import Batch, TrainingState
 from stagereg.jax.epoch_loop import StateSnapshot, run_epoch_loop
-from stagereg.jax.metrics import MetricSuite
+from stagereg.jax.metrics import BatchMetricSpec, MetricSuite
 
 
 class ScriptedStep:
@@ -183,3 +183,80 @@ def test_epoch_metrics_without_a_prediction_collector_are_refused() -> None:
 
 def _unused(*args: object) -> EpochPredictionData:
     raise AssertionError("the suite predictor is not used by the loop.")
+
+
+class _HostReadLog:
+    """Records each batch the loop draws and each host read of a step output."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, int]] = []
+
+    def loader(self, n_batches: int):
+        def loader(*, split: str, epoch: int) -> Iterator[Batch]:
+            del split
+            for index in range(n_batches):
+                self.events.append(("batch", epoch))
+                yield Batch(inputs=jnp.array([[float(index)]]))
+
+        return loader
+
+
+class _RecordedValue:
+    """A step output value that logs every time the host reads it."""
+
+    def __init__(self, value: float, epoch: int, log: _HostReadLog) -> None:
+        self._value = value
+        self._epoch = epoch
+        self._log = log
+
+    def __float__(self) -> float:
+        self._log.events.append(("read", self._epoch))
+        return self._value
+
+    def __array__(self, dtype: object = None, copy: object = None) -> np.ndarray:
+        del copy
+        self._log.events.append(("read", self._epoch))
+        return np.asarray(self._value, dtype=dtype)
+
+
+def test_step_outputs_are_read_on_the_host_only_after_the_epoch_ends() -> None:
+    log = _HostReadLog()
+    epochs, n_batches = 2, 3
+    epoch_of_step = iter([e for e in range(epochs) for _ in range(n_batches)])
+
+    def step(batch: Batch, key: jax.Array, /) -> Mapping[str, object]:
+        del key
+        epoch = next(epoch_of_step)
+        value = float(batch.inputs[0, 0])
+        return {
+            "loss": _RecordedValue(value, epoch, log),
+            "mae": _RecordedValue(2 * value, epoch, log),
+            "step_size": _RecordedValue(3 * value, epoch, log),
+        }
+
+    state = _state()
+    run_epoch_loop(
+        step=step,
+        snapshot_state=_no_snapshot,
+        train_loader=log.loader(n_batches),
+        state=state,
+        epochs=epochs,
+        stage="posterior",
+        metrics=MetricSuite(
+            batch=(BatchMetricSpec(name="mae", metric=_unused_batch_metric),)
+        ),
+        diagnostics=("step_size",),
+    )
+
+    for epoch in range(epochs):
+        kinds = [kind for kind, e in log.events if e == epoch]
+        reads = len(kinds) - n_batches
+        assert reads > 0
+        assert kinds == ["batch"] * n_batches + ["read"] * reads
+    assert state.metric_history["posterior/train/loss"] == [1.0, 1.0]
+    assert state.metric_history["posterior/train/mae"] == [2.0, 2.0]
+    assert state.metric_history["posterior/train/step_size"] == [3.0, 3.0]
+
+
+def _unused_batch_metric(*args: object) -> jax.Array:
+    raise AssertionError("the loop does not compute batch metrics itself.")

@@ -18,6 +18,8 @@ from stagereg.core.losses import NegativeLogLikelihoodLoss
 from stagereg.core.metric_registry import (
     EpochPredictionData,
     EvaluationGrid,
+    IntervalCoverage,
+    NegativeLogLikelihood,
     PointContinuousRankedProbabilityScore,
     RootMeanSquaredError,
 )
@@ -906,3 +908,128 @@ def test_decision_events_carry_no_metrics_and_add_no_tracker_series(
         "supervised/train/loss",
         "supervised/validation/loss",
     }
+
+
+def _ragged_gaussian_loader(*, split: str, epoch: int) -> list[Batch]:
+    del split, epoch
+    inputs = jnp.linspace(-1.0, 1.0, 5).reshape(-1, 1)
+    targets = 2.0 * inputs + 0.5
+    return [
+        Batch(inputs=inputs[start : start + 2], targets=targets[start : start + 2])
+        for start in range(0, 5, 2)
+    ]
+
+
+def _gaussian_epoch_suite() -> MetricSuite:
+    return MetricSuite(
+        epoch=(
+            RootMeanSquaredError(),
+            NegativeLogLikelihood(),
+            IntervalCoverage(level=0.9),
+            PointContinuousRankedProbabilityScore(),
+        ),
+        predictor=GaussianPredictor(),
+        predictive_sample_count=8,
+        evaluation_grid=EvaluationGrid(np.linspace(-5.0, 5.0, 51)),
+    )
+
+
+def test_training_epoch_metrics_compile_nothing_after_warmup(
+    compile_counter: Callable[[], Any],
+) -> None:
+    model = GaussianHead(1, 1, rngs=nnx.Rngs(3))
+    optimizer = create_optimizer(model, optax.sgd(0.01))
+    state = initialize_training_state(model, optimizer, rng_key=jax.random.key(5))
+
+    with compile_counter() as counter:
+        run_supervised(
+            model=model,
+            optimizer=optimizer,
+            train_loader=_ragged_gaussian_loader,
+            loss=make_supervised_loss(NegativeLogLikelihoodLoss()),
+            state=state,
+            epochs=4,
+            metrics=_gaussian_epoch_suite(),
+            event_sinks=[counter],
+        )
+
+    assert counter.during_warmup("supervised") > 0
+    assert counter.after_warmup("supervised") == 0
+
+
+def test_training_epoch_metrics_do_not_rerun_the_model_eagerly_after_warmup() -> None:
+    python_calls: list[None] = []
+
+    class CallCountingHead(nnx.Module):
+        def __init__(self) -> None:
+            self.head = GaussianHead(1, 1, rngs=nnx.Rngs(3))
+
+        def __call__(self, inputs: jax.Array) -> Any:
+            python_calls.append(None)
+            return self.head(inputs)
+
+    calls_at_epoch_end: list[int] = []
+
+    class EpochEndSink:
+        def on_event(self, event: Any) -> None:
+            if event.name == "epoch_end":
+                calls_at_epoch_end.append(len(python_calls))
+
+    model = CallCountingHead()
+    optimizer = create_optimizer(model, optax.sgd(0.01))
+    state = initialize_training_state(model, optimizer, rng_key=jax.random.key(5))
+
+    run_supervised(
+        model=model,
+        optimizer=optimizer,
+        train_loader=_ragged_gaussian_loader,
+        loss=make_supervised_loss(NegativeLogLikelihoodLoss()),
+        state=state,
+        epochs=3,
+        metrics=_gaussian_epoch_suite(),
+        event_sinks=[EpochEndSink()],
+    )
+
+    assert calls_at_epoch_end[0] > 0
+    assert calls_at_epoch_end[1:] == [calls_at_epoch_end[0]] * 2
+
+
+class _StatefulGaussianHead(nnx.Module):
+    """Writes to its variables on every call: a counter and batch statistics."""
+
+    def __init__(self) -> None:
+        self.calls = nnx.Variable(jnp.array(0))
+        self.norm = nnx.BatchNorm(1, rngs=nnx.Rngs(2))
+        self.head = GaussianHead(1, 1, rngs=nnx.Rngs(3))
+
+    def __call__(self, inputs: jax.Array) -> Any:
+        self.calls[...] += 1
+        return self.head(self.norm(inputs))
+
+
+def test_training_epoch_metrics_leave_the_live_model_unchanged() -> None:
+    def train(metrics: MetricSuite) -> _StatefulGaussianHead:
+        model = _StatefulGaussianHead()
+        optimizer = create_optimizer(model, optax.sgd(0.01))
+        state = initialize_training_state(model, optimizer, rng_key=jax.random.key(5))
+        run_supervised(
+            model=model,
+            optimizer=optimizer,
+            train_loader=_ragged_gaussian_loader,
+            loss=make_supervised_loss(NegativeLogLikelihoodLoss()),
+            state=state,
+            epochs=3,
+            metrics=metrics,
+        )
+        return model
+
+    without_metrics = train(MetricSuite())
+    with_metrics = train(_gaussian_epoch_suite())
+
+    assert int(with_metrics.calls[...]) == 9
+    for plain_leaf, metric_leaf in zip(
+        jax.tree.leaves(nnx.state(without_metrics)),
+        jax.tree.leaves(nnx.state(with_metrics)),
+        strict=True,
+    ):
+        assert jnp.array_equal(plain_leaf, metric_leaf)

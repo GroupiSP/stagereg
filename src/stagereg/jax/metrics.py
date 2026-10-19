@@ -589,6 +589,81 @@ def resolve_epoch_prediction_data(
     )
 
 
+class _CompiledInferenceModel(nnx.Module):
+    """Run a live model's inference-mode forward pass as one compiled call.
+
+    The inference-mode structure is taken once, from a single clone switched
+    to ``eval()``; every call then merges it with the live
+    model's current state inside a jitted function. Whatever the forward pass
+    writes to its variables stays inside that call, so the live model is
+    never mutated, and the forward pass compiles once per input shape.
+    """
+
+    def __init__(self, model: nnx.Module) -> None:
+        """Take the inference-mode structure of ``model`` and compile its call.
+
+        Args:
+            model: The live model, whose current state each call reads.
+        """
+        inference_model = nnx.clone(model)
+        inference_model.eval()
+        graphdef, _ = nnx.split(inference_model)
+
+        def forward(state: nnx.State, inputs: PyTree) -> Any:
+            return nnx.merge(graphdef, state)(inputs)
+
+        self._forward = jax.jit(forward)
+        self._model = model
+
+    def __call__(self, inputs: PyTree) -> Any:
+        """Predict on ``inputs`` with the live model's current state.
+
+        Args:
+            inputs: Batch inputs.
+
+        Returns:
+            The inference-mode model output, a JAX pytree.
+        """
+        return self._forward(nnx.state(self._model), inputs)
+
+
+def make_epoch_prediction_resolver(
+    *,
+    suite: MetricSuite,
+    model: nnx.Module,
+) -> Callable[[Batch, jax.Array], EpochPredictionData]:
+    """Build a per-batch epoch-prediction resolver for a model being trained.
+
+    Unlike ``resolve_epoch_prediction_data``, which clones the model and
+    runs it eagerly on every batch, the resolver takes the inference-mode
+    structure once and runs every forward pass compiled, against the model's
+    state at that moment. The live model is never mutated. The model's
+    output must be a JAX pytree, as
+    [`Gaussian`][stagereg.jax.Gaussian] and
+    [`PosteriorPredictive`][stagereg.jax.PosteriorPredictive] are.
+
+    Args:
+        suite: The metric suite whose predictor materializes each batch.
+        model: The live model; its parameters may change between calls.
+
+    Returns:
+        A callable ``(batch, key) -> EpochPredictionData``.
+
+    Raises:
+        ValueError: If the suite has no predictor.
+    """
+    predictor = suite.predictor
+    if predictor is None:
+        raise ValueError("epoch metrics require an explicit suite predictor.")
+    requirements = suite.prediction_requirements
+    inference_model = _CompiledInferenceModel(model)
+
+    def resolve(batch: Batch, key: jax.Array, /) -> EpochPredictionData:
+        return predictor(inference_model, batch, requirements, key)
+
+    return resolve
+
+
 def merge_epoch_prediction_data(
     parts: Sequence[EpochPredictionData],
 ) -> EpochPredictionData:

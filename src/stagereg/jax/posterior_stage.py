@@ -50,6 +50,7 @@ from stagereg.jax.metrics import (
 from stagereg.jax.posterior import (
     InferenceMethod,
     IsotropicGaussianPrior,
+    PaddedPosterior,
     Posterior,
     PosteriorProblem,
     Prior,
@@ -559,7 +560,9 @@ class _PosteriorPredictiveModel(nnx.Module):
     """The posterior predictive at inputs, for a fixed draw key.
 
     Every call with the same instance takes the same draws, so draw ``s`` is
-    the same mean function in every batch of an epoch.
+    the same mean function in every batch of an epoch. A padded posterior's
+    spare slots are kept and masked out, so its shapes do not change as its
+    draws accumulate.
     """
 
     def __init__(
@@ -575,6 +578,13 @@ class _PosteriorPredictiveModel(nnx.Module):
         self.num_samples = num_samples
 
     def __call__(self, inputs: PyTree) -> PosteriorPredictive:
+        if isinstance(self.posterior, PaddedPosterior):
+            draws, draw_mask = self.posterior.padded_sample_means(inputs, self.draw_key)
+            return PosteriorPredictive(
+                draws=draws,
+                aleatoric_variance=self.aleatoric_variance(inputs),
+                draw_mask=draw_mask,
+            )
         return PosteriorPredictive(
             draws=self.posterior.sample_means(inputs, self.draw_key, self.num_samples),
             aleatoric_variance=self.aleatoric_variance(inputs),

@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -77,6 +77,35 @@ class Posterior(Protocol):
         Raises:
             ValueError: If ``num_samples`` is given to a finite posterior, or
                 omitted for an unlimited one.
+        """
+        ...
+
+
+@runtime_checkable
+class PaddedPosterior(Protocol):
+    """A finite posterior whose draws sit in a fixed number of slots.
+
+    A posterior whose number of draws grows as inference goes on, such as
+    one of retained samples, can keep spare slots, so that its draws keep one
+    shape and the code consuming them compiles once. The posterior stage
+    validates such a posterior through
+    [`padded_sample_means`][stagereg.jax.RetainedSamplesPosterior.padded_sample_means],
+    excluding the spare slots from the predictive mixture by the mask.
+    """
+
+    def padded_sample_means(
+        self, inputs: PyTree, key: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        """Evaluate every slot's mean function at ``inputs``, spare ones included.
+
+        Args:
+            inputs: Model inputs with a leading batch dimension.
+            key: The PRNG key selecting the draws.
+
+        Returns:
+            The mean predictions of every slot, shaped ``[slots, *batch]``,
+            and the boolean mask of the slots holding draws, shaped
+            ``[slots]``.
         """
         ...
 

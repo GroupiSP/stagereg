@@ -9,7 +9,6 @@ from flax import nnx
 
 from stagereg.core.checkpoints import CheckpointStore
 from stagereg.core.early_stopping import EarlyStopper
-from stagereg.core.metric_registry import EpochPredictionData
 from stagereg.core.protocols import LoaderFactory, ValidationStrategy
 from stagereg.core.tracking import EventSink
 from stagereg.core.types import Batch, PyTree, StageResult, TrainingState
@@ -22,7 +21,7 @@ from stagereg.jax.evaluation import SupervisedLoss
 from stagereg.jax.metrics import (
     BatchMetricSpec,
     MetricSuite,
-    resolve_epoch_prediction_data,
+    make_epoch_prediction_resolver,
 )
 from stagereg.jax.state import snapshot
 
@@ -242,10 +241,11 @@ def run_supervised(
             parameters=snapshot(model), optimizer_state=snapshot(optimizer)
         )
 
-    def epoch_predictions(batch: Batch, key: jax.Array, /) -> EpochPredictionData:
-        return resolve_epoch_prediction_data(
-            suite=metric_suite, model=model, batch=batch, key=key
-        )
+    epoch_predictions = (
+        make_epoch_prediction_resolver(suite=metric_suite, model=model)
+        if metric_suite.epoch
+        else None
+    )
 
     return run_epoch_loop(
         step=step,

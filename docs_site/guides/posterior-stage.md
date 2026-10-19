@@ -294,13 +294,21 @@ pSGLD counts `burn_in` and `thinning` in update steps, that is training
 batches. It has no posterior before its first retained sample, so the stage
 skips validation for the epochs that end before then: they record no
 validation metrics. The chain starts from the trained mean, which already fits
-the data, so a short burn-in is usually enough:
+the data, so a short burn-in is usually enough.
+
+pSGLD keeps its retained samples in a buffer of `capacity` slots (64 by
+default) and hands validation every slot with a mask of the retained ones, so
+the posterior keeps one shape as samples accumulate and validation compiles
+nothing after the first epoch. A full buffer doubles, which compiles
+validation once more; setting `capacity` to the number of samples the run
+retains avoids that:
 
 ```python
 from stagereg.jax import PreconditionedSGLD
 
-# Eight batches per epoch: retain the position at the end of every epoch.
-method = PreconditionedSGLD(step_size=3e-3, burn_in=0, thinning=8)
+# Eight batches per epoch: retain the position at the end of every epoch,
+# for 100 epochs.
+method = PreconditionedSGLD(step_size=3e-3, burn_in=0, thinning=8, capacity=100)
 ```
 
 ## Writing your own inference method

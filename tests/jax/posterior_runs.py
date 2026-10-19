@@ -28,6 +28,7 @@ from stagereg.core.checkpoints import (
     InMemoryCheckpointStore,
 )
 from stagereg.core.early_stopping import EarlyStopper
+from stagereg.core.protocols import LoaderFactory
 from stagereg.core.tracking import EventSink
 from stagereg.core.types import Batch, PyTree, TrainingState
 from stagereg.jax import (
@@ -111,6 +112,7 @@ def build_stages(
     *sinks: EventSink,
     seed: int = 0,
     checkpoint_store: CheckpointStore | None = None,
+    loader: LoaderFactory = regression_loader,
 ) -> MeanAndVarianceStages:
     """Build both stages; a checkpoint store also adds patient early stoppers.
 
@@ -120,6 +122,8 @@ def build_stages(
         *sinks: The event sinks attached to both stages.
         seed: Seeds the fresh models' initial weights.
         checkpoint_store: Where both stages save their checkpoints.
+        loader: The mean stage's training and validation loader, and the
+            variance stage's source loader.
 
     Returns:
         The two stages.
@@ -133,11 +137,11 @@ def build_stages(
     mean_stage = MeanStage(
         model=mean_model,
         optimizer=create_optimizer(mean_model, optax.adam(0.1)),
-        train_loader=regression_loader,
+        train_loader=loader,
         options=SupervisedStageOptions(
             epochs=20,
             validation=HeldOutValidation(
-                model=mean_model, loader=regression_loader, loss=squared_error
+                model=mean_model, loader=loader, loss=squared_error
             ),
             event_sinks=sinks,
             early_stopper=stopper,
@@ -148,7 +152,7 @@ def build_stages(
     variance_stage = GammaVarianceStage(
         model=variance_model,
         optimizer=create_optimizer(variance_model, optax.adam(0.05)),
-        source_loader=regression_loader,
+        source_loader=loader,
         options=SupervisedStageOptions(
             epochs=5,
             event_sinks=sinks,

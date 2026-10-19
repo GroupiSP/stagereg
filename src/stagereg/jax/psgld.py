@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from functools import partial
+from functools import cached_property, partial
 from typing import Any
 
 import jax
@@ -20,15 +20,17 @@ import jax.numpy as jnp
 import numpy as np
 
 from stagereg.core.types import Batch, PyTree
-from stagereg.jax.posterior import PosteriorProblem, require_inferred_tree
+from stagereg.jax.posterior import (
+    PosteriorProblem,
+    TracedPosterior,
+    require_inferred_tree,
+)
 from stagereg.jax.rng import network_key
 
+_DEFAULT_CAPACITY = 64
+"""The slots first reserved when the number of retained samples is unknown."""
 
-@partial(
-    jax.tree_util.register_dataclass,
-    data_fields=["samples", "draw_mask"],
-    meta_fields=["mean_function"],
-)
+
 @dataclass(frozen=True)
 class RetainedSamplesPosterior:
     """A finite posterior whose draws are retained parameter samples.
@@ -39,39 +41,20 @@ class RetainedSamplesPosterior:
     all the draws. For a deterministic posterior network the key changes
     nothing.
 
-    The samples may sit in a fixed number of slots, some of them spare, with a
-    ``draw_mask`` marking the slots that hold retained samples: a chain that
-    keeps retaining samples then keeps the same array shapes, so code that
-    consumes it compiles once.
-    [`padded_sample_means`][stagereg.jax.RetainedSamplesPosterior.padded_sample_means]
-    evaluates every slot, for such code; a draw keeps its slot's index ``s``
-    for its key.
-
-    It is a JAX pytree whose children are ``samples`` and ``draw_mask`` and
-    whose ``mean_function`` is static, compared by identity, so it passes into
-    jitted code whole, as [`PosteriorStage.predict`][stagereg.jax.PosteriorStage.predict]
-    passes it.
-
     Attributes:
         mean_function: Maps ``(parameters, inputs, key)`` to the posterior
             network's mean predictions at ``inputs``.
-        samples: The parameter trees of the slots, stacked along a leading
-            axis; without a ``draw_mask``, each slot holds a retained sample.
-        draw_mask: Which slots hold retained samples, a boolean array shaped
-            like the leading axis of ``samples``. Defaults to ``None``: every
-            slot does.
+        samples: The retained parameter trees, stacked along a leading axis of
+            length ``S``.
     """
 
     mean_function: Callable[[PyTree, PyTree, jax.Array], jax.Array]
     samples: PyTree
-    draw_mask: jax.Array | None = None
 
     @property
     def num_draws(self) -> int:
         """The number of retained samples ``S``."""
-        if self.draw_mask is None:
-            return _num_slots(self.samples)
-        return int(np.count_nonzero(jax.device_get(self.draw_mask)))
+        return _num_slots(self.samples)
 
     def sample_means(
         self,
@@ -98,46 +81,76 @@ class RetainedSamplesPosterior:
                 "a finite posterior uses all its retained samples; "
                 "num_samples must be None."
             )
-        if self.draw_mask is None:
-            return self._evaluate(
-                self.samples, inputs, key, jnp.arange(_num_slots(self.samples))
-            )
-        slots = np.flatnonzero(jax.device_get(self.draw_mask))
-        retained = jax.tree.map(lambda leaf: leaf[slots], self.samples)
-        return self._evaluate(retained, inputs, key, jnp.asarray(slots))
+        draw_keys = jax.vmap(lambda index: jax.random.fold_in(key, index))(
+            jnp.arange(self.num_draws)
+        )
+        return jax.vmap(self.mean_function, in_axes=(0, None, 0))(
+            self.samples, inputs, draw_keys
+        )
 
-    def padded_sample_means(
-        self, inputs: PyTree, key: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
-        """Evaluate every slot's mean function at ``inputs``, spare ones included.
-
-        The result keeps one shape however many samples are retained, so a
-        consumer compiles once; it excludes the spare slots by the returned
-        mask, e.g. as a
-        [`PosteriorPredictive`][stagereg.jax.PosteriorPredictive]'s
-        ``draw_mask``.
-
-        Args:
-            inputs: Model inputs with a leading batch dimension.
-            key: The PRNG key each slot's mean function is evaluated with.
+    def _traced(self) -> TracedPosterior:
+        """Return the posterior taken apart for compiled code.
 
         Returns:
-            The mean predictions of every slot, shaped ``[slots, *batch]``,
-            and the boolean mask of the slots holding retained samples.
+            Its class and mean function, static, and its arrays, traced.
         """
-        count = _num_slots(self.samples)
-        means = self._evaluate(self.samples, inputs, key, jnp.arange(count))
-        if self.draw_mask is None:
-            return means, jnp.ones(count, dtype=bool)
-        return means, self.draw_mask
+        return TracedPosterior(
+            RetainedSamplesPosterior, self.mean_function, {"samples": self.samples}
+        )
 
-    def _evaluate(
-        self, samples: PyTree, inputs: PyTree, key: jax.Array, slots: jax.Array
-    ) -> jax.Array:
-        """Evaluate stacked samples, each under the key folded with its slot."""
-        draw_keys = jax.vmap(lambda index: jax.random.fold_in(key, index))(slots)
-        return jax.vmap(self.mean_function, in_axes=(0, None, 0))(
-            samples, inputs, draw_keys
+
+class _BufferedPosterior(RetainedSamplesPosterior):
+    """The posterior of a chain whose retained samples fill a buffer's first slots.
+
+    Compiled code takes every slot, the spare ones masked out, so it keeps
+    one shape while the chain retains samples and compiles once. ``samples``
+    holds the retained samples alone, copied out of the buffer the first time
+    it is read.
+    """
+
+    def __init__(
+        self,
+        mean_function: Callable[[PyTree, PyTree, jax.Array], jax.Array],
+        buffer: PyTree,
+        draw_mask: jax.Array,
+        retained: int,
+    ) -> None:
+        """Hold a copy of a chain's buffer.
+
+        Args:
+            mean_function: The posterior network's mean function.
+            buffer: A copy of the chain's buffer, every slot.
+            draw_mask: Which slots hold retained samples, the first
+                ``retained``.
+            retained: The number of retained samples.
+        """
+        object.__setattr__(self, "mean_function", mean_function)
+        object.__setattr__(self, "_buffer", buffer)
+        object.__setattr__(self, "_draw_mask", draw_mask)
+        object.__setattr__(self, "_retained", retained)
+
+    @cached_property
+    def samples(self) -> PyTree:  # type: ignore[override]
+        """The retained parameter trees, stacked along a leading axis."""
+        return _retained_samples(self._buffer, self._retained, like=None)
+
+    @property
+    def num_draws(self) -> int:
+        """The number of retained samples ``S``."""
+        return self._retained
+
+    def _traced(self) -> TracedPosterior:
+        """Return the posterior taken apart for compiled code.
+
+        Returns:
+            Every slot of the buffer, with the mask of the retained ones, so
+            compiled code keeps one shape as samples accumulate.
+        """
+        return TracedPosterior(
+            RetainedSamplesPosterior,
+            self.mean_function,
+            {"samples": self._buffer},
+            draw_mask=self._draw_mask,
         )
 
 
@@ -167,13 +180,19 @@ class PreconditionedSGLD:
     refuses, so a posterior stage skips validation for the epochs of a
     burn-in.
 
-    Retained samples are written into a buffer of ``capacity`` slots, and the
-    [`posterior`][stagereg.jax.PreconditionedSGLD.posterior] holds every
-    slot with a mask of the retained ones, so the posterior keeps one shape
-    while samples accumulate and validating it compiles nothing new. A full
-    buffer doubles its capacity, which compiles the posterior's consumers once
-    more; a ``capacity`` of at least the number of samples a run retains
-    avoids that.
+    Retained samples are written into a buffer of slots reserved up front,
+    which a posterior stage predicts from whole, spare slots masked out, so
+    validation keeps one shape while samples accumulate and compiles nothing
+    after the first epoch. The buffer is sized when the first sample is
+    retained, for the samples a run retains: ``burn_in`` and ``thinning``
+    applied to ``epochs · ⌈N / B⌉`` steps, from the problem's ``epochs`` (set
+    by a posterior stage), its dataset size ``N`` and the rows ``B`` of that
+    step's batch. A run that retains more, e.g. from a loader yielding more
+    than ``⌈N / B⌉`` batches an epoch, or a problem without ``epochs``, which
+    starts with 64 slots, doubles a full buffer, and each doubling compiles
+    the posterior's consumers once more; ``capacity`` overrides the size.
+    The [`posterior`][stagereg.jax.PreconditionedSGLD.posterior]'s
+    ``samples`` hold the retained samples alone.
 
     SG-MCMC declares no early-stopping support, so a
     [`PosteriorStage`][stagereg.jax.PosteriorStage] refuses an early stopper
@@ -192,7 +211,7 @@ class PreconditionedSGLD:
             ``1e-5``.
         capacity: The number of slots first reserved for retained samples,
             positive; the buffer doubles whenever it is full. Defaults to
-            ``64``.
+            ``None``: sized for the samples the run retains.
     """
 
     step_size: float
@@ -200,7 +219,7 @@ class PreconditionedSGLD:
     thinning: int = 1
     decay: float = 0.99
     stability: float = 1e-5
-    capacity: int = 64
+    capacity: int | None = None
     _problem: PosteriorProblem | None = field(default=None, init=False, repr=False)
     _step: Callable[..., Any] | None = field(default=None, init=False, repr=False)
     _parameters: PyTree = field(default=None, init=False, repr=False)
@@ -227,7 +246,7 @@ class PreconditionedSGLD:
             raise ValueError("thinning must be positive.")
         if not 0.0 <= self.decay < 1.0:
             raise ValueError("decay must be in [0, 1).")
-        if self.capacity <= 0:
+        if self.capacity is not None and self.capacity <= 0:
             raise ValueError("capacity must be positive.")
 
     @property
@@ -261,7 +280,7 @@ class PreconditionedSGLD:
         self._parameters = problem.initial_parameters
         self._second_moment = jax.tree.map(jnp.zeros_like, problem.initial_parameters)
         self._steps = 0
-        self._buffer = _empty_buffer(problem.initial_parameters, self.capacity)
+        self._buffer = None
         self._retained = 0
 
     def update(self, batch: Batch, key: jax.Array) -> Mapping[str, Any]:
@@ -293,7 +312,9 @@ class PreconditionedSGLD:
         retained_after = self._steps - self.burn_in
         if retained_after > 0 and retained_after % self.thinning == 0:
             if self._retained == _num_slots(self._buffer):
-                self._buffer = _doubled(self._buffer)
+                self._buffer = _resized(
+                    self._buffer, self._parameters, self._capacity_for(batch)
+                )
             self._buffer = _write(self._buffer, self._parameters, self._retained)
             self._retained += 1
         return {"loss": loss}
@@ -302,20 +323,17 @@ class PreconditionedSGLD:
         """Return the posterior of the samples retained so far.
 
         Returns:
-            A finite posterior with one draw per retained sample, whose
-            samples are a copy of every buffer slot with a mask of the
-            retained ones.
+            A finite posterior with one draw per retained sample, independent
+            of later updates.
 
         Raises:
             ValueError: If no sample has been retained yet, e.g. during
                 burn-in.
         """
         self._require_retained()
-        samples, draw_mask = _snapshot(self._buffer, self._retained)
-        return RetainedSamplesPosterior(
-            mean_function=self._require_problem().mean_function,
-            samples=samples,
-            draw_mask=draw_mask,
+        buffer, draw_mask = _snapshot(self._buffer, self._retained)
+        return _BufferedPosterior(
+            self._require_problem().mean_function, buffer, draw_mask, self._retained
         )
 
     def state(self) -> PyTree:
@@ -329,7 +347,9 @@ class PreconditionedSGLD:
             "parameters": self._parameters,
             "second_moment": self._second_moment,
             "steps": jnp.asarray(self._steps),
-            "samples": _retained_samples(self._buffer, self._retained),
+            "samples": _retained_samples(
+                self._buffer, self._retained, like=self._parameters
+            ),
         }
 
     def load_state(self, state: PyTree) -> None:
@@ -342,7 +362,7 @@ class PreconditionedSGLD:
         self._parameters = state["parameters"]
         self._second_moment = state["second_moment"]
         self._steps = int(state["steps"])
-        self._buffer, self._retained = _buffer_of(state["samples"], self.capacity)
+        self._buffer, self._retained = _buffer_of(state["samples"])
 
     def posterior_state(self) -> PyTree:
         """Return the retained samples, stacked along a leading axis.
@@ -354,7 +374,7 @@ class PreconditionedSGLD:
             ValueError: If no sample has been retained yet.
         """
         self._require_retained()
-        return _retained_samples(self._buffer, self._retained)
+        return _retained_samples(self._buffer, self._retained, like=None)
 
     def load_posterior(self, state: PyTree) -> None:
         """Rebuild the posterior of the given retained samples after ``init``.
@@ -373,7 +393,29 @@ class PreconditionedSGLD:
         """
         if self._problem is not None:
             require_inferred_tree(state, self._problem.initial_parameters)
-        self._buffer, self._retained = _buffer_of(state, self.capacity)
+        self._buffer, self._retained = _buffer_of(state)
+
+    def _capacity_for(self, batch: Batch) -> int:
+        """Return the slots a full (or absent) buffer grows to.
+
+        Args:
+            batch: The batch of the step whose position is due.
+
+        Returns:
+            The planned size on first use, ``capacity`` or the samples the run
+            retains, and at least double the current size once that is full.
+        """
+        slots = _num_slots(self._buffer)
+        if slots > 0:
+            return 2 * slots
+        if self.capacity is not None:
+            return self.capacity
+        problem = self._require_problem()
+        if problem.epochs is None:
+            return _DEFAULT_CAPACITY
+        rows = int(jax.tree.leaves(batch.inputs)[0].shape[0])
+        steps = problem.epochs * -(-problem.dataset_size // rows)
+        return max((steps - self.burn_in) // self.thinning, 1)
 
     def _require_retained(self) -> None:
         """Refuse to read a posterior before the first sample is retained."""
@@ -452,62 +494,107 @@ def _make_step(
 
 @partial(jax.jit, donate_argnums=0)
 def _write(buffer: PyTree, sample: PyTree, slot: int) -> PyTree:
-    """Write ``sample`` into the buffer's ``slot``; the slot is traced, not static."""
+    """Write ``sample`` into the buffer's ``slot``; the slot is traced, not static.
+
+    Args:
+        buffer: The buffer, donated.
+        sample: A parameter tree.
+        slot: The index of the slot to write.
+
+    Returns:
+        The buffer with ``sample`` in ``slot``.
+    """
     return jax.tree.map(lambda leaf, value: leaf.at[slot].set(value), buffer, sample)
 
 
 @jax.jit
 def _snapshot(buffer: PyTree, retained: int) -> tuple[PyTree, jax.Array]:
-    """Copy every slot of the buffer, with the mask of its first ``retained``."""
+    """Copy every slot of the buffer, with the mask of its first ``retained``.
+
+    Args:
+        buffer: The buffer.
+        retained: The number of retained samples, traced, not static.
+
+    Returns:
+        A copy of the buffer and the boolean mask of its retained slots.
+    """
     mask = jnp.arange(_num_slots(buffer)) < retained
     return jax.tree.map(jnp.copy, buffer), mask
 
 
-def _doubled(buffer: PyTree) -> PyTree:
-    """Double the buffer's slots; the new ones repeat the old, so stay finite."""
-    return jax.tree.map(lambda leaf: jnp.concatenate([leaf, leaf]), buffer)
+def _resized(buffer: PyTree | None, like: PyTree, capacity: int) -> PyTree:
+    """Grow the buffer to ``capacity`` slots, on the host.
+
+    Args:
+        buffer: The buffer, or ``None`` before the first sample.
+        like: A parameter tree each new slot copies, so spare slots stay
+            finite.
+        capacity: The number of slots, at least the buffer's.
+
+    Returns:
+        The grown buffer, its old slots first.
+    """
+
+    def grow(spare_value: jax.Array, leaf: jax.Array | None) -> jax.Array:
+        filled = 0 if leaf is None else leaf.shape[0]
+        spare = np.repeat(np.asarray(spare_value)[None], capacity - filled, axis=0)
+        if leaf is None:
+            return jnp.asarray(spare)
+        return jnp.asarray(np.concatenate([np.asarray(leaf), spare]))
+
+    if buffer is None:
+        return jax.tree.map(lambda value: grow(value, None), like)
+    return jax.tree.map(grow, like, buffer)
 
 
-def _empty_buffer(like: PyTree, capacity: int) -> PyTree:
-    """Return a buffer of ``capacity`` slots, each a copy of ``like``."""
-    return jax.tree.map(
-        lambda leaf: jnp.asarray(np.repeat(np.asarray(leaf)[None], capacity, axis=0)),
-        like,
-    )
-
-
-def _retained_samples(buffer: PyTree, retained: int) -> PyTree:
+def _retained_samples(buffer: PyTree | None, retained: int, like: PyTree) -> PyTree:
     """Copy the retained samples out of the buffer, stacked; possibly none.
 
     The slice is taken on the host, so a new count compiles nothing.
+
+    Args:
+        buffer: The buffer, or ``None`` before the first sample.
+        retained: The number of retained samples, in its first slots.
+        like: A parameter tree, shaping the empty stack of no samples.
+
+    Returns:
+        The retained samples, stacked along a leading axis of ``retained``.
     """
+    if buffer is None:
+        return jax.tree.map(
+            lambda leaf: jnp.zeros((0, *jnp.shape(leaf)), jnp.result_type(leaf)), like
+        )
     return jax.tree.map(
         lambda leaf: jnp.asarray(np.asarray(leaf)[:retained].copy()), buffer
     )
 
 
-def _buffer_of(stacked: PyTree, capacity: int) -> tuple[PyTree, int]:
+def _buffer_of(stacked: PyTree) -> tuple[PyTree | None, int]:
     """Return a buffer holding stacked samples, and their number.
 
-    The capacity doubles from ``capacity`` until the samples fit; spare slots
-    repeat the last sample, or hold zeros when there is none.
+    Args:
+        stacked: Retained samples, stacked along a leading axis; possibly none.
+
+    Returns:
+        A buffer of exactly those samples, or ``None`` when there are none,
+        and their number; the next retained sample grows it.
     """
     retained = _num_slots(stacked)
-    while capacity < retained:
-        capacity *= 2
-
-    def fill(leaf: jax.Array) -> jax.Array:
-        samples = np.asarray(leaf)
-        spare = capacity - retained
-        if retained == 0:
-            padding = np.zeros((spare, *samples.shape[1:]), dtype=samples.dtype)
-        else:
-            padding = np.repeat(samples[-1:], spare, axis=0)
-        return jnp.asarray(np.concatenate([samples, padding]))
-
-    return jax.tree.map(fill, stacked), retained
+    if retained == 0:
+        return None, 0
+    # A copy: writes donate the buffer, which must not be the caller's arrays.
+    return jax.tree.map(jnp.array, stacked), retained
 
 
-def _num_slots(stacked: PyTree) -> int:
-    """Return the length of the leading axis shared by a stacked tree's leaves."""
+def _num_slots(stacked: PyTree | None) -> int:
+    """Return the length of the leading axis shared by a stacked tree's leaves.
+
+    Args:
+        stacked: A tree whose leaves share a leading axis, or ``None``.
+
+    Returns:
+        The axis' length, or ``0`` for ``None``.
+    """
+    if stacked is None:
+        return 0
     return int(jax.tree.leaves(stacked)[0].shape[0])

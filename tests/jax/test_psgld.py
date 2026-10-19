@@ -169,6 +169,7 @@ def test_burn_in_and_thinning_retain_exactly_the_due_positions(
         return
     expected = jax.tree.map(lambda leaf: leaf[np.asarray(due) - 1], every_position)
     assert method.posterior().num_draws == len(due)
+    jax.tree.map(np.testing.assert_array_equal, method.posterior().samples, expected)
     jax.tree.map(np.testing.assert_array_equal, method.posterior_state(), expected)
 
 
@@ -352,31 +353,26 @@ def test_a_psgld_posterior_stage_compiles_nothing_after_warmup_as_samples_accumu
     assert state.model_components["posterior"].num_draws == 10
 
 
-def _noisy_line(parameters: PyTree, inputs: jax.Array, key: jax.Array) -> jax.Array:
-    """A line plus one key-dependent offset, so each draw's key shows."""
-    return _linear_mean(parameters, inputs, key) + jax.random.normal(key)
+def test_a_psgld_posterior_stage_sizes_its_sample_buffer_from_its_epochs(
+    variance_ready_run: MakeVarianceReadyRun,
+    compile_counter: Callable[[], Any],
+) -> None:
+    # Two batches per epoch, every position retained: 80 samples, more than
+    # the 64 slots a chain reserves when it knows nothing of its run.
+    state = variance_ready_run().state
+    method = PreconditionedSGLD(step_size=1e-3, burn_in=0, thinning=1)
+    with compile_counter() as counter:
+        stage = _psgld_stage(
+            method,
+            epochs=40,
+            validation_loader=regression_loader,
+            event_sinks=(counter,),
+        )
+        stage.prepare(state)
+        stage.train(state)
 
-
-def test_a_padded_retained_samples_posterior_draws_only_its_retained_samples() -> None:
-    lines = _five_lines().samples
-    retained = jnp.array([True, False, True, True, False])
-    padded = RetainedSamplesPosterior(
-        mean_function=_noisy_line, samples=lines, draw_mask=retained
-    )
-    inputs = jnp.linspace(-1.0, 1.0, 7)[:, None]
-    key = jax.random.key(3)
-    every_slot = RetainedSamplesPosterior(
-        mean_function=_noisy_line, samples=lines
-    ).sample_means(inputs, key)
-
-    slots, mask = padded.padded_sample_means(inputs, key)
-
-    assert padded.num_draws == 3
-    np.testing.assert_array_equal(mask, retained)
-    np.testing.assert_allclose(slots[retained], every_slot[retained], rtol=1e-6)
-    np.testing.assert_allclose(
-        padded.sample_means(inputs, key), every_slot[retained], rtol=1e-6
-    )
+    assert counter.after_warmup("posterior") == 0
+    assert state.model_components["posterior"].num_draws == 80
 
 
 def test_a_full_sample_buffer_grows_and_keeps_every_retained_position(
@@ -409,7 +405,7 @@ def test_a_posterior_is_independent_of_later_updates(
     np.testing.assert_array_equal(early.sample_means(inputs, jax.random.key(0)), before)
     jax.tree.map(
         np.testing.assert_array_equal,
-        jax.tree.map(lambda leaf: leaf[:3], early.samples),
+        early.samples,
         jax.tree.map(lambda leaf: leaf[:3], every_position),
     )
 

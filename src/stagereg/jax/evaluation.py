@@ -9,6 +9,7 @@ either depending on the other.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Protocol
 
 import jax
@@ -18,6 +19,7 @@ from stagereg.core.types import Batch, PyTree
 from stagereg.jax.metrics import (
     BatchMetricSpec,
     MetricSuite,
+    StepScalar,
     collect_step_metrics,
     initialize_batch_metric_values,
     maybe_collect_epoch_prediction_data,
@@ -154,93 +156,96 @@ def evaluate_loader(
         ``key`` is advanced past all consumed batches.
     """
     metric_suite = metrics if metrics is not None else MetricSuite()
-    return _evaluate_with_step(
-        model,
-        loader,
-        key=key,
-        metrics=metric_suite,
-        evaluation_step=_build_evaluation_step(metric_suite, loss),
-        has_loss=loss is not None,
-    )
+    return PreparedEvaluation.of(metric_suite, loss)(model, loader, key=key)
 
 
-def _build_evaluation_step(
-    metrics: MetricSuite, loss: SupervisedLoss | None
-) -> Callable[..., Mapping[str, jax.Array]]:
-    """Build the jitted step `evaluate_loader` runs for ``metrics`` and ``loss``.
+@dataclass(frozen=True)
+class PreparedEvaluation:
+    """[`evaluate_loader`][stagereg.jax.evaluate_loader] with its step built once.
 
-    Each call builds a new function, which ``nnx.jit`` compiles afresh; a
-    caller evaluating repeatedly builds it once and keeps it.
+    ``nnx.jit`` compiles each new step function afresh, so a caller
+    evaluating every epoch, such as
+    [`HeldOutValidation`][stagereg.jax.HeldOutValidation], prepares the
+    evaluation once and keeps it. It is internal to the JAX backend, not
+    exported (ADR 0002 keeps the evaluation step private).
 
-    Args:
-        metrics: The suite whose batch metrics the step computes.
-        loss: The loss the step also computes, if any.
-
-    Returns:
-        The jitted evaluation step.
-    """
-    if loss is None:
-        return _make_metrics_step(metrics.batch)
-    return make_evaluation_step(loss, metrics=metrics.batch)
-
-
-def _evaluate_with_step(
-    model: nnx.Module,
-    loader: Iterable[Batch],
-    *,
-    key: jax.Array,
-    metrics: MetricSuite,
-    evaluation_step: Callable[..., Mapping[str, jax.Array]],
-    has_loss: bool,
-) -> tuple[dict[str, float], jax.Array]:
-    """Run `evaluate_loader` with an evaluation step already built.
-
-    Args:
-        model: The NNX module to evaluate.
-        loader: An iterable of batches to evaluate.
-        key: The JAX PRNG key to use, advanced once per batch.
+    Attributes:
         metrics: The registered batch/epoch metrics.
-        evaluation_step: The step `_build_evaluation_step` built for
-            ``metrics`` and the loss.
         has_loss: Whether the step computes a loss.
-
-    Returns:
-        The reduced metrics and the advanced key, as `evaluate_loader`.
+        step: The jitted evaluation step.
     """
-    losses: list[float] | None = [] if has_loss else None
-    batch_metric_values = initialize_batch_metric_values(metrics.batch)
-    epoch_metric_parts = [] if metrics.epoch else None
 
-    for batch in loader:
-        key, batch_key = split_key(key)
-        step_output = evaluation_step(
-            model,
-            batch.inputs,
-            batch.targets,
-            batch.sample_weight,
-            batch_key,
-        )
-        collect_step_metrics(
-            step_output,
-            metrics=metrics.batch,
-            losses=losses,
-            batch_metric_values=batch_metric_values,
-            context="evaluation step",
-        )
-        maybe_collect_epoch_prediction_data(
-            epoch_metric_parts,
-            suite=metrics,
-            model=model,
-            batch=batch,
-            batch_key=batch_key,
-        )
+    metrics: MetricSuite
+    has_loss: bool
+    step: Callable[..., Mapping[str, jax.Array]]
 
-    return (
-        reduce_metric_suite(
-            suite=metrics,
-            losses=losses,
-            batch_metric_values=batch_metric_values,
-            epoch_metric_parts=epoch_metric_parts,
-        ),
-        key,
-    )
+    @classmethod
+    def of(
+        cls, metrics: MetricSuite, loss: SupervisedLoss | None
+    ) -> PreparedEvaluation:
+        """Build the evaluation step for ``metrics`` and ``loss``.
+
+        Args:
+            metrics: The suite whose batch metrics the step computes.
+            loss: The loss the step also computes, if any.
+
+        Returns:
+            The prepared evaluation.
+        """
+        step = (
+            _make_metrics_step(metrics.batch)
+            if loss is None
+            else make_evaluation_step(loss, metrics=metrics.batch)
+        )
+        return cls(metrics=metrics, has_loss=loss is not None, step=step)
+
+    def __call__(
+        self, model: nnx.Module, loader: Iterable[Batch], *, key: jax.Array
+    ) -> tuple[dict[str, float], jax.Array]:
+        """Evaluate a loader, as [`evaluate_loader`][stagereg.jax.evaluate_loader].
+
+        Args:
+            model: The NNX module to evaluate.
+            loader: An iterable of batches to evaluate.
+            key: The JAX PRNG key to use, advanced once per batch.
+
+        Returns:
+            The reduced metrics and the advanced key.
+        """
+        losses: list[StepScalar] | None = [] if self.has_loss else None
+        batch_metric_values = initialize_batch_metric_values(self.metrics.batch)
+        epoch_metric_parts = [] if self.metrics.epoch else None
+
+        for batch in loader:
+            key, batch_key = split_key(key)
+            step_output = self.step(
+                model,
+                batch.inputs,
+                batch.targets,
+                batch.sample_weight,
+                batch_key,
+            )
+            collect_step_metrics(
+                step_output,
+                metrics=self.metrics.batch,
+                losses=losses,
+                batch_metric_values=batch_metric_values,
+                context="evaluation step",
+            )
+            maybe_collect_epoch_prediction_data(
+                epoch_metric_parts,
+                suite=self.metrics,
+                model=model,
+                batch=batch,
+                batch_key=batch_key,
+            )
+
+        return (
+            reduce_metric_suite(
+                suite=self.metrics,
+                losses=losses,
+                batch_metric_values=batch_metric_values,
+                epoch_metric_parts=epoch_metric_parts,
+            ),
+            key,
+        )

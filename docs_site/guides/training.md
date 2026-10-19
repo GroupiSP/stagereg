@@ -137,6 +137,19 @@ your back: the model you get back is the model after the last epoch.
 `epochs` is always the maximum. Adding an early stopper can end the run sooner
 but never later; see [Validation and early stopping](validation.md).
 
+## The compiled training step
+
+`run_supervised` compiles one training step for the run and binds `model` and
+`optimizer` to it once, so a step does not walk the NNX module graph on every
+call. The step updates the model's and optimizer's variables in place, and
+changes you make to them between steps, such as restoring a checkpoint, are
+seen by the next step. The module structure and plain Python attributes are
+fixed when the run starts: a loss that sets an attribute, say
+`model.flag = ...`, inside the step does not change `model`. Change such
+attributes outside the run, or use
+[`make_train_step`][stagereg.jax.make_train_step], which writes them back at
+the cost of walking the graph on every call.
+
 ## What comes back
 
 The runner returns a [`StageResult`][stagereg.core.StageResult]:

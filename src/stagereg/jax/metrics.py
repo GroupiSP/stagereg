@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
 from stagereg.core.metric_registry import (
@@ -27,6 +28,9 @@ from stagereg.core.types import Batch, PyTree
 from stagereg.jax.distributions import Gaussian, PosteriorPredictive
 
 _METRIC_RNG_NAMESPACE = 0x4D455452  # "METR" in ASCII
+
+type StepScalar = jax.Array | float
+"""A scalar a training or evaluation step outputs, on the device until read."""
 
 
 def _metric_mean(values: Sequence[float]) -> float:
@@ -414,7 +418,7 @@ def _require_scalar_gaussian(prediction: object) -> Gaussian:
 
 
 def _host_mean_and_targets(
-    mean: Any, targets: Any, batch_shape: tuple[int, ...]
+    mean: ArrayLike, targets: ArrayLike, batch_shape: tuple[int, ...]
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Return shape-compatible host predictive means and targets, flattened."""
     host_mean = np.broadcast_to(np.asarray(mean, dtype=np.float64), batch_shape)
@@ -776,7 +780,7 @@ def _merge_grid(parts: Sequence[EpochPredictionData]) -> EvaluationGrid | None:
 
 def initialize_batch_metric_values(
     metrics: Sequence[BatchMetricSpec],
-) -> dict[str, list[Any]]:
+) -> dict[str, list[StepScalar]]:
     """Create per-metric accumulation buffers for raw step outputs."""
     return {spec.name: [] for spec in metrics}
 
@@ -785,8 +789,8 @@ def collect_step_metrics(
     step_output: Mapping[str, Any],
     *,
     metrics: Sequence[BatchMetricSpec],
-    losses: list[Any] | None,
-    batch_metric_values: dict[str, list[Any]],
+    losses: list[StepScalar] | None,
+    batch_metric_values: dict[str, list[StepScalar]],
     context: str,
 ) -> None:
     """Append one step's loss and registered batch metrics as they are.

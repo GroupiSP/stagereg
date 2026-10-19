@@ -144,9 +144,9 @@ summary = predictive.moment_matched()
 assert bool(jnp.all(summary.epistemic_variance >= 0.0))
 ```
 
-Every built-in posterior is a JAX pytree, so `predict` draws the means,
-evaluates the aleatoric variance and forms the predictive in one compiled
-call, compiled once per input shape. Score with the posterior predictive
+For every built-in posterior, `predict` draws the means, evaluates the
+aleatoric variance and forms the predictive in one compiled call, compiled once
+per input shape. Score with the posterior predictive
 itself: it is exact for the draws taken and may be skewed or multimodal. The
 moment-matched predictive is for reporting the variance split or drawing a
 band.
@@ -311,19 +311,22 @@ skips validation for the epochs that end before then: they record no
 validation metrics. The chain starts from the trained mean, which already fits
 the data, so a short burn-in is usually enough.
 
-pSGLD keeps its retained samples in a buffer of `capacity` slots (64 by
-default) and hands validation every slot with a mask of the retained ones, so
-the posterior keeps one shape as samples accumulate and validation compiles
-nothing after the first epoch. A full buffer doubles, which compiles
-validation once more; setting `capacity` to the number of samples the run
-retains avoids that:
+pSGLD keeps its retained samples in a buffer whose slots it reserves up front,
+and validation predicts from every slot with the spare ones masked out, so the
+posterior keeps one shape as samples accumulate and validation compiles nothing
+after the first epoch. The buffer is sized for the samples the run retains,
+from the stage's `epochs`, the `dataset_size` and the size of the first batch,
+assuming `ceil(dataset_size / batch size)` batches an epoch. A loader that
+yields more batches than that retains more samples than planned: a full buffer
+doubles, and each doubling compiles validation once more. Set `capacity` to the
+number of samples the run retains to size it yourself. The posterior's
+`samples` hold the retained samples alone, however many slots are reserved.
 
 ```python
 from stagereg.jax import PreconditionedSGLD
 
-# Eight batches per epoch: retain the position at the end of every epoch,
-# for 100 epochs.
-method = PreconditionedSGLD(step_size=3e-3, burn_in=0, thinning=8, capacity=100)
+# Eight batches per epoch: retain the position at the end of every epoch.
+method = PreconditionedSGLD(step_size=3e-3, burn_in=0, thinning=8)
 ```
 
 ## Writing your own inference method
@@ -351,12 +354,14 @@ pSGLD and MC-Dropout:
   other metric. Undeclared keys are ignored, and `prepare` refuses a key whose
   tag the stage already records, such as `loss`. Bayes by Backprop, pSGLD and
   MC-Dropout declare none.
-- Register the method's posterior as a JAX pytree, with the problem's
-  `mean_function` as static data, as the built-in posteriors are. Validation
-  and [`predict`][stagereg.jax.PosteriorStage.predict] then form its posterior
-  predictive in one compiled call per batch. Any other posterior works too:
-  the stage calls its `sample_means` from Python, which is slower unless
-  `sample_means` is compiled itself.
+- Validation and [`predict`][stagereg.jax.PosteriorStage.predict] form a
+  built-in posterior's predictive in one compiled call per batch. They call
+  your posterior's `sample_means` from Python, with the aleatoric variance
+  compiled, which is slower unless `sample_means` is compiled itself, e.g. by
+  dispatching to a `jax.jit` function that takes the problem's `mean_function`
+  as a static argument and the posterior's arrays as traced ones. The problem's
+  `epochs` says how many epochs the stage trains for, should the method size
+  anything up front.
 
 ## The XSin example
 

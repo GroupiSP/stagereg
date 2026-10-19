@@ -171,6 +171,10 @@ def run_supervised(
     loss, is not written back to ``model``, as it would be by
     [`make_train_step`][stagereg.jax.make_train_step].
 
+    Epoch metrics run the model's inference-mode forward pass as one
+    compiled call, so with ``metrics`` holding any epoch metric the model's
+    output must be a JAX pytree, as every built-in distribution is.
+
     Args:
         model: The NNX module to train, mutated in place.
         optimizer: The NNX optimizer used to update ``model``, mutated

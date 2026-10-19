@@ -168,7 +168,11 @@ class ReferenceSamplesExtractor(Protocol):
 
 
 class Predictor(Protocol):
-    """Materialize typed host predictions from a JAX model and batch."""
+    """Materialize typed host predictions from a JAX model and batch.
+
+    During training the model it receives runs compiled, so its output must be a JAX
+    pytree, as every built-in distribution is.
+    """
 
     def __call__(
         self,

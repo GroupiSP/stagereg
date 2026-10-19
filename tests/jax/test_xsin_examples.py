@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import sys
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -180,3 +181,44 @@ def test_xsin_posterior_is_reproducible_with_finite_scores(
             scores.extrapolation_crps,
         )
     )
+
+
+run_xsin_posteriors = _POSTERIOR_BENCHMARK.run_xsin_posteriors
+
+
+def test_xsin_posteriors_share_supervised_stages_trained_once() -> None:
+    config = XSinConfig(
+        train_size=128,
+        evaluation_size=41,
+        batch_size=32,
+        hidden_features=8,
+        mean_epochs=3,
+        variance_epochs=4,
+        posterior_epochs=2,
+        posterior_num_draws=4,
+        psgld_burn_in=2,
+        psgld_thinning=1,
+        seed=3,
+    )
+    data = make_xsin_data(config)
+    epoch_ends: Counter[str] = Counter()
+
+    class _EpochEndCounter:
+        def on_event(self, event: Any) -> None:
+            if event.name == "epoch_end" and event.split == "train":
+                epoch_ends[event.stage] += 1
+
+    results = run_xsin_posteriors(data, config, event_sinks=(_EpochEndCounter(),))
+
+    assert list(results) == ["Bayes by Backprop", "pSGLD", "MC-Dropout"]
+    assert epoch_ends["mean"] == config.mean_epochs
+    assert epoch_ends["variance"] == config.variance_epochs
+    assert epoch_ends["posterior"] == len(results) * config.posterior_epochs
+    variance_stages = [result.variance_stage for result in results.values()]
+    for variance_stage in variance_stages[1:]:
+        assert jnp.array_equal(variance_stage.mean, variance_stages[0].mean)
+        assert jnp.array_equal(variance_stage.variance, variance_stages[0].variance)
+    # Sharing the stages leaves each method's run as it was when it trained its own.
+    alone = run_xsin_posterior(data, config, xsin_psgld(config))
+    assert jnp.allclose(results["pSGLD"].mean, alone.mean)
+    assert jnp.allclose(results["pSGLD"].epistemic_variance, alone.epistemic_variance)

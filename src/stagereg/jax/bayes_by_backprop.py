@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import jax
@@ -33,6 +34,11 @@ from stagereg.jax.posterior import (
 from stagereg.jax.rng import network_key
 
 
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=["means", "stds"],
+    meta_fields=["mean_function"],
+)
 @dataclass(frozen=True)
 class MeanFieldGaussianPosterior:
     """An independent Gaussian on every parameter of the posterior network.
@@ -41,6 +47,11 @@ class MeanFieldGaussianPosterior:
     ``draw_key = jax.random.fold_in(key, s)`` and evaluates its mean function
     with a key derived from ``draw_key``, so it is the same mean function at every input, in every
     call, and whatever the number of draws asked for.
+
+    It is a JAX pytree whose children are ``means`` and ``stds`` and whose
+    ``mean_function`` is static, compared by identity, so it passes into
+    jitted code whole, as [`PosteriorStage.predict`][stagereg.jax.PosteriorStage.predict]
+    passes it.
 
     Attributes:
         mean_function: Maps ``(parameters, inputs, key)`` to the posterior

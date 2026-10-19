@@ -24,6 +24,11 @@ from stagereg.jax.posterior import PosteriorProblem, require_inferred_tree
 from stagereg.jax.rng import network_key
 
 
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=["samples", "draw_mask"],
+    meta_fields=["mean_function"],
+)
 @dataclass(frozen=True)
 class RetainedSamplesPosterior:
     """A finite posterior whose draws are retained parameter samples.
@@ -41,6 +46,11 @@ class RetainedSamplesPosterior:
     [`padded_sample_means`][stagereg.jax.RetainedSamplesPosterior.padded_sample_means]
     evaluates every slot, for such code; a draw keeps its slot's index ``s``
     for its key.
+
+    It is a JAX pytree whose children are ``samples`` and ``draw_mask`` and
+    whose ``mean_function`` is static, compared by identity, so it passes into
+    jitted code whole, as [`PosteriorStage.predict`][stagereg.jax.PosteriorStage.predict]
+    passes it.
 
     Attributes:
         mean_function: Maps ``(parameters, inputs, key)`` to the posterior

@@ -154,14 +154,62 @@ def evaluate_loader(
         ``key`` is advanced past all consumed batches.
     """
     metric_suite = metrics if metrics is not None else MetricSuite()
-    evaluation_step = (
-        _make_metrics_step(metric_suite.batch)
-        if loss is None
-        else make_evaluation_step(loss, metrics=metric_suite.batch)
+    return _evaluate_with_step(
+        model,
+        loader,
+        key=key,
+        metrics=metric_suite,
+        evaluation_step=_build_evaluation_step(metric_suite, loss),
+        has_loss=loss is not None,
     )
-    losses: list[float] | None = None if loss is None else []
-    batch_metric_values = initialize_batch_metric_values(metric_suite.batch)
-    epoch_metric_parts = [] if metric_suite.epoch else None
+
+
+def _build_evaluation_step(
+    metrics: MetricSuite, loss: SupervisedLoss | None
+) -> Callable[..., Mapping[str, jax.Array]]:
+    """Build the jitted step `evaluate_loader` runs for ``metrics`` and ``loss``.
+
+    Each call builds a new function, which ``nnx.jit`` compiles afresh; a
+    caller evaluating repeatedly builds it once and keeps it.
+
+    Args:
+        metrics: The suite whose batch metrics the step computes.
+        loss: The loss the step also computes, if any.
+
+    Returns:
+        The jitted evaluation step.
+    """
+    if loss is None:
+        return _make_metrics_step(metrics.batch)
+    return make_evaluation_step(loss, metrics=metrics.batch)
+
+
+def _evaluate_with_step(
+    model: nnx.Module,
+    loader: Iterable[Batch],
+    *,
+    key: jax.Array,
+    metrics: MetricSuite,
+    evaluation_step: Callable[..., Mapping[str, jax.Array]],
+    has_loss: bool,
+) -> tuple[dict[str, float], jax.Array]:
+    """Run `evaluate_loader` with an evaluation step already built.
+
+    Args:
+        model: The NNX module to evaluate.
+        loader: An iterable of batches to evaluate.
+        key: The JAX PRNG key to use, advanced once per batch.
+        metrics: The registered batch/epoch metrics.
+        evaluation_step: The step `_build_evaluation_step` built for
+            ``metrics`` and the loss.
+        has_loss: Whether the step computes a loss.
+
+    Returns:
+        The reduced metrics and the advanced key, as `evaluate_loader`.
+    """
+    losses: list[float] | None = [] if has_loss else None
+    batch_metric_values = initialize_batch_metric_values(metrics.batch)
+    epoch_metric_parts = [] if metrics.epoch else None
 
     for batch in loader:
         key, batch_key = split_key(key)
@@ -174,14 +222,14 @@ def evaluate_loader(
         )
         collect_step_metrics(
             step_output,
-            metrics=metric_suite.batch,
+            metrics=metrics.batch,
             losses=losses,
             batch_metric_values=batch_metric_values,
             context="evaluation step",
         )
         maybe_collect_epoch_prediction_data(
             epoch_metric_parts,
-            suite=metric_suite,
+            suite=metrics,
             model=model,
             batch=batch,
             batch_key=batch_key,
@@ -189,7 +237,7 @@ def evaluate_loader(
 
     return (
         reduce_metric_suite(
-            suite=metric_suite,
+            suite=metrics,
             losses=losses,
             batch_metric_values=batch_metric_values,
             epoch_metric_parts=epoch_metric_parts,

@@ -48,7 +48,26 @@ def make_train_step(
         avoid a second state-mutating training-mode forward pass.
     """
 
-    @nnx.jit
+    return nnx.jit(_train_step_body(loss, metrics=metrics))
+
+
+def _train_step_body(
+    loss: SupervisedLoss,
+    *,
+    metrics: Sequence[BatchMetricSpec],
+) -> Callable[..., Mapping[str, jax.Array]]:
+    """Return the untransformed training step behind ``make_train_step``.
+
+    Args:
+        loss: The supervised loss to minimise.
+        metrics: Batch metrics evaluated on the pre-update parameters.
+
+    Returns:
+        A function ``train_step(model, optimizer, inputs, targets,
+        sample_weight, key)`` that updates ``model`` through ``optimizer``
+        and returns the loss and batch metric values.
+    """
+
     def train_step(
         model: nnx.Module,
         optimizer: nnx.Optimizer,
@@ -82,6 +101,42 @@ def make_train_step(
         return values
 
     return train_step
+
+
+def _bind_train_step(
+    loss: SupervisedLoss,
+    *,
+    metrics: Sequence[BatchMetricSpec],
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
+) -> Callable[..., Mapping[str, jax.Array]]:
+    """Compile a training step with ``model`` and ``optimizer`` bound once.
+
+    ``make_train_step`` walks the module graph of ``model`` and ``optimizer``
+    on every call, which costs more than the compiled step itself for the
+    small models of the examples. Binding them flattens the graph once; the
+    bound step still reads and writes the same Variables, so in-place
+    updates made between calls, such as a restored checkpoint, are seen.
+    The module structure and static attributes, such as a training flag,
+    are fixed when binding, and changes to them inside the step are not
+    written back to ``model``.
+
+    Args:
+        loss: The supervised loss to minimise.
+        metrics: Batch metrics evaluated on the pre-update parameters.
+        model: The live model, updated in place by every call.
+        optimizer: The live optimizer, updated in place by every call.
+
+    Returns:
+        A function ``bound_step(inputs, targets, sample_weight, key)``.
+    """
+    return nnx.jit_partial(
+        _train_step_body(loss, metrics=metrics),
+        model,
+        optimizer,
+        graph=True,
+        graph_updates=False,
+    )
 
 
 def run_supervised(
@@ -169,12 +224,12 @@ def run_supervised(
     state.register_component(model_name, model)
     state.register_optimizer(optimizer_name, optimizer)
     metric_suite = metrics if metrics is not None else MetricSuite()
-    train_step = make_train_step(loss, metrics=metric_suite.batch)
+    train_step = _bind_train_step(
+        loss, metrics=metric_suite.batch, model=model, optimizer=optimizer
+    )
 
     def step(batch: Batch, key: jax.Array, /) -> Mapping[str, jax.Array]:
         return train_step(
-            model,
-            optimizer,
             batch.inputs,
             batch.targets,
             batch.sample_weight,

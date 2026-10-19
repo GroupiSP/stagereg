@@ -45,7 +45,6 @@ from stagereg.jax import (
     InferenceMethod,
     MCDropout,
     MetricSuite,
-    Posterior,
     PosteriorPredictive,
     PosteriorPredictivePredictor,
     PosteriorStage,
@@ -136,32 +135,23 @@ class XSinTwoStepGaussian(nnx.Module):
         )
 
 
-class XSinPosteriorPredictive(nnx.Module):
-    """The posterior predictive at inputs, for a fixed draw key.
+class XSinPosteriorPredictive(nnx.Module, pytree=False):
+    """A trained posterior stage's predictive at inputs, for a fixed draw key.
 
     Every call takes the same draws, so draw ``s`` is the same mean function
-    at every input. A finite posterior uses all its draws; an unlimited one
-    takes ``num_draws``.
+    at every input, and each call is one compiled call of
+    ``PosteriorStage.predict``. A finite posterior uses all its draws; an
+    unlimited one takes the stage's ``num_draws``.
     """
 
-    def __init__(
-        self,
-        posterior: Posterior,
-        variance_model: nnx.Module,
-        *,
-        draw_key: jax.Array,
-        num_draws: int,
-    ) -> None:
-        self.posterior = nnx.static(posterior)
-        self.variance_model = variance_model
+    def __init__(self, stage: PosteriorStage, *, draw_key: jax.Array) -> None:
+        # The bound method compares by identity, so the module stays hashable
+        # static data under ``nnx.jit``; the stage itself holds arrays.
+        self.predict = stage.predict
         self.draw_key = draw_key
-        self.num_draws = None if posterior.num_draws is not None else num_draws
 
     def __call__(self, inputs: jax.Array) -> PosteriorPredictive:
-        return PosteriorPredictive(
-            draws=self.posterior.sample_means(inputs, self.draw_key, self.num_draws),
-            aleatoric_variance=self.variance_model(inputs).mean(),
-        )
+        return self.predict(inputs, self.draw_key)
 
 
 def xsin_bayes_by_backprop(config: XSinConfig) -> BayesByBackprop:
@@ -363,10 +353,7 @@ def run_xsin_posterior(
     posterior_stage.train(state)
 
     predictive = XSinPosteriorPredictive(
-        state.model_components[posterior_stage.model_name],
-        variance_model,
-        draw_key=jax.random.key(config.seed + 3),
-        num_draws=config.posterior_num_draws,
+        posterior_stage, draw_key=jax.random.key(config.seed + 3)
     )
     moments = predictive(data.evaluation_inputs).moment_matched()
     score_key = jax.random.key(config.seed + 4)

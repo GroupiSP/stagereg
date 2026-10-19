@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Callable
 from typing import Any
@@ -413,3 +414,27 @@ def test_a_posterior_is_independent_of_later_updates(
 def test_psgld_refuses_a_non_positive_capacity() -> None:
     with pytest.raises(ValueError, match="capacity"):
         PreconditionedSGLD(step_size=0.01, capacity=0)
+
+
+def test_a_buffer_first_due_on_a_ragged_batch_is_sized_from_the_full_batches() -> None:
+    # Batches of 31 and 1 rows over 10 epochs: 20 steps, 19 retained. Sizing
+    # from the 1-row batch the first sample falls on would plan 320 steps.
+    full = _linear_regression_batch()
+    batches = [
+        Batch(inputs=full.inputs[:31], targets=full.targets[:31]),
+        Batch(inputs=full.inputs[31:], targets=full.targets[31:]),
+    ]
+    problem = dataclasses.replace(
+        _linear_regression_problem(full),
+        train_loader=lambda *, split, epoch: batches,
+        epochs=10,
+    )
+    method = PreconditionedSGLD(step_size=0.01, burn_in=1, thinning=1)
+    method.init(problem)
+
+    for key, batch in zip(jax.random.split(jax.random.key(0), 2), batches):
+        method.update(batch, key)
+
+    draw_mask = method.posterior()._traced().draw_mask
+    assert draw_mask is not None
+    assert draw_mask.shape == (19,)

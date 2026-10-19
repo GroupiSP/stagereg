@@ -186,9 +186,10 @@ class PreconditionedSGLD:
     after the first epoch. The buffer is sized when the first sample is
     retained, for the samples a run retains: ``burn_in`` and ``thinning``
     applied to ``epochs · ⌈N / B⌉`` steps, from the problem's ``epochs`` (set
-    by a posterior stage), its dataset size ``N`` and the rows ``B`` of that
-    step's batch. A run that retains more, e.g. from a loader yielding more
-    than ``⌈N / B⌉`` batches an epoch, or a problem without ``epochs``, which
+    by a posterior stage), its dataset size ``N`` and the rows ``B`` of the
+    largest batch stepped on so far, so that a short final batch does not
+    count. A run that retains more, e.g. from a loader yielding more than
+    ``⌈N / B⌉`` batches an epoch, or a problem without ``epochs``, which
     starts with 64 slots, doubles a full buffer, and each doubling compiles
     the posterior's consumers once more; ``capacity`` overrides the size.
     The [`posterior`][stagereg.jax.PreconditionedSGLD.posterior]'s
@@ -227,6 +228,7 @@ class PreconditionedSGLD:
     _steps: int = field(default=0, init=False, repr=False)
     _buffer: PyTree = field(default=None, init=False, repr=False)
     _retained: int = field(default=0, init=False, repr=False)
+    _batch_rows: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate the hyperparameters.
@@ -282,6 +284,7 @@ class PreconditionedSGLD:
         self._steps = 0
         self._buffer = None
         self._retained = 0
+        self._batch_rows = 0
 
     def update(self, batch: Batch, key: jax.Array) -> Mapping[str, Any]:
         """Take one Langevin step, retaining the new position if it is due.
@@ -309,11 +312,14 @@ class PreconditionedSGLD:
             key,
         )
         self._steps += 1
+        self._batch_rows = max(
+            self._batch_rows, int(jax.tree.leaves(batch.inputs)[0].shape[0])
+        )
         retained_after = self._steps - self.burn_in
         if retained_after > 0 and retained_after % self.thinning == 0:
             if self._retained == _num_slots(self._buffer):
                 self._buffer = _resized(
-                    self._buffer, self._parameters, self._capacity_for(batch)
+                    self._buffer, self._parameters, self._capacity_for()
                 )
             self._buffer = _write(self._buffer, self._parameters, self._retained)
             self._retained += 1
@@ -395,11 +401,8 @@ class PreconditionedSGLD:
             require_inferred_tree(state, self._problem.initial_parameters)
         self._buffer, self._retained = _buffer_of(state)
 
-    def _capacity_for(self, batch: Batch) -> int:
+    def _capacity_for(self) -> int:
         """Return the slots a full (or absent) buffer grows to.
-
-        Args:
-            batch: The batch of the step whose position is due.
 
         Returns:
             The planned size on first use, ``capacity`` or the samples the run
@@ -413,8 +416,7 @@ class PreconditionedSGLD:
         problem = self._require_problem()
         if problem.epochs is None:
             return _DEFAULT_CAPACITY
-        rows = int(jax.tree.leaves(batch.inputs)[0].shape[0])
-        steps = problem.epochs * -(-problem.dataset_size // rows)
+        steps = problem.epochs * -(-problem.dataset_size // self._batch_rows)
         return max((steps - self.burn_in) // self.thinning, 1)
 
     def _require_retained(self) -> None:

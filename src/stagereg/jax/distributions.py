@@ -277,29 +277,64 @@ class PosteriorPredictive:
     multimodal. Its single-Gaussian summary is
     [`moment_matched`][stagereg.jax.PosteriorPredictive.moment_matched].
 
+    A ``draw_mask`` excludes draw slots from the mixture, which is then the
+    equally weighted mixture over the included draws alone. It lets a posterior
+    whose number of draws grows, such as one of retained samples, keep a fixed
+    number of slots, so that compiled code sees the same shapes as it grows.
+
     Attributes:
         draws: The mean of each draw at the predicted inputs, shaped
-            ``[S, *batch]`` with ``S >= 1`` draws on the leading axis.
+            ``[S, *batch]`` with ``S >= 1`` draw slots on the leading axis.
         aleatoric_variance: The positive aleatoric variance, broadcastable
             against ``draws[0]`` and shared by every draw.
+        draw_mask: Which of the ``S`` draw slots the mixture includes, a
+            boolean array shaped ``[S]`` with at least one ``True``; the means
+            in excluded slots are ignored. Defaults to ``None``, which
+            includes every slot.
     """
 
     draws: jax.Array
     aleatoric_variance: jax.Array
+    draw_mask: jax.Array | None = None
 
     def __post_init__(self) -> None:
-        """Validate the leading draw axis.
+        """Validate the leading draw axis and the draw mask's shape.
 
         Raises:
-            ValueError: If ``draws`` has no leading draw axis or no draws.
+            ValueError: If ``draws`` has no leading draw axis or no draws, or
+                if ``draw_mask`` is not shaped ``[S]``.
         """
         if jnp.ndim(self.draws) == 0 or jnp.shape(self.draws)[0] == 0:
             raise ValueError("draws must have a non-empty leading draw axis.")
+        if self.draw_mask is not None and jnp.shape(self.draw_mask) != (
+            self.num_draws,
+        ):
+            raise ValueError("draw_mask must hold one entry per draw slot.")
 
     @property
     def num_draws(self) -> int:
-        """The number of draws ``S`` the mixture averages over."""
+        """The number of draw slots ``S``, including any the mask excludes."""
         return self.draws.shape[0]
+
+    def _included_count(self) -> int | jax.Array:
+        """Return the number of draws the mixture averages over."""
+        if self.draw_mask is None:
+            return self.num_draws
+        return jnp.sum(self.draw_mask)
+
+    def _included(self, values: jax.Array, fill: float) -> jax.Array:
+        """Replace the values of excluded draw slots, on the leading axis, by
+        ``fill``."""
+        if self.draw_mask is None:
+            return values
+        mask = jnp.reshape(self.draw_mask, (-1,) + (1,) * (jnp.ndim(values) - 1))
+        return jnp.where(mask, values, fill)
+
+    def _draw_mean(self) -> jax.Array:
+        """Return the average of the included draws' means, shaped like ``draws[0]``."""
+        if self.draw_mask is None:
+            return jnp.mean(self.draws, axis=0)
+        return jnp.sum(self._included(self.draws, 0.0), axis=0) / self._included_count()
 
     @property
     def batch_shape(self) -> tuple[int, ...]:
@@ -330,15 +365,18 @@ class PosteriorPredictive:
             targets: Target values broadcastable against ``batch_shape``.
 
         Returns:
-            ``logsumexp`` over draws of the component log-densities, minus
-            ``log S``.
+            ``logsumexp`` over the included draws of the component
+            log-densities, minus the log of their number.
         """
         loc, scale = self._components()
-        component = jstats.norm.logpdf(targets, loc=loc, scale=scale)
-        return jsp.logsumexp(component, axis=0) - jnp.log(self.num_draws)
+        component = self._included(
+            jstats.norm.logpdf(targets, loc=loc, scale=scale), -jnp.inf
+        )
+        return jsp.logsumexp(component, axis=0) - jnp.log(self._included_count())
 
     def sample(self, key: jax.Array, sample_shape: tuple[int, ...] = ()) -> jax.Array:
-        """Draw predictive samples, each from a uniformly chosen draw's Gaussian.
+        """Draw predictive samples, each from a uniformly chosen included draw's
+        Gaussian.
 
         The Gaussian noise uses ``key`` exactly as
         [`Gaussian.sample`][stagereg.jax.Gaussian.sample] does, so with one draw
@@ -355,8 +393,11 @@ class PosteriorPredictive:
         shape = sample_shape + self.batch_shape
         noise = jax.random.normal(key, shape)
         component = jax.random.randint(
-            jax.random.fold_in(key, 1), shape, 0, self.num_draws
+            jax.random.fold_in(key, 1), shape, 0, self._included_count()
         )
+        if self.draw_mask is not None:
+            # The k-th included slot is the first whose running count reaches k + 1.
+            component = jnp.searchsorted(jnp.cumsum(self.draw_mask), component + 1)
         means = jnp.broadcast_to(
             jnp.moveaxis(self.draws, 0, -1), shape + (self.num_draws,)
         )
@@ -364,8 +405,8 @@ class PosteriorPredictive:
         return loc + jnp.sqrt(self.aleatoric_variance) * noise
 
     def mean(self) -> jax.Array:
-        """Return the mixture mean, the average of the draws' means."""
-        return jnp.broadcast_to(jnp.mean(self.draws, axis=0), self.batch_shape)
+        """Return the mixture mean, the average of the included draws' means."""
+        return jnp.broadcast_to(self._draw_mean(), self.batch_shape)
 
     def variance(self) -> jax.Array:
         """Return the mixture variance, aleatoric plus epistemic."""
@@ -378,18 +419,19 @@ class PosteriorPredictive:
             targets: Target values broadcastable against ``batch_shape``.
 
         Returns:
-            The average over draws of the component Gaussian CDFs.
+            The average over the included draws of the component Gaussian
+            CDFs.
         """
         loc, scale = self._components()
-        component = jstats.norm.cdf(targets, loc=loc, scale=scale)
-        return jnp.mean(component, axis=0)
+        component = self._included(jstats.norm.cdf(targets, loc=loc, scale=scale), 0.0)
+        return jnp.sum(component, axis=0) / self._included_count()
 
     def quantile(self, probability: float) -> jax.Array:
         """Compute the elementwise mixture quantile at ``probability``.
 
         The mixture CDF has no closed-form inverse, so the quantile is found
-        by bisection between the smallest and the largest of the draws'
-        Gaussian quantiles, which bracket it.
+        by bisection between the smallest and the largest of the included
+        draws' Gaussian quantiles, which bracket it.
 
         Args:
             probability: The cumulative probability, strictly between 0 and 1.
@@ -404,8 +446,8 @@ class PosteriorPredictive:
             raise ValueError("probability must be strictly between 0 and 1.")
         loc, scale = self._components()
         component = loc + NormalDist().inv_cdf(probability) * scale
-        lower = jnp.min(component, axis=0)
-        upper = jnp.max(component, axis=0)
+        lower = jnp.min(self._included(component, jnp.inf), axis=0)
+        upper = jnp.max(self._included(component, -jnp.inf), axis=0)
 
         def bisect(
             _: int, bracket: tuple[jax.Array, jax.Array]
@@ -422,7 +464,7 @@ class PosteriorPredictive:
         """Summarize the mixture by the Gaussian with its mean and variance.
 
         By the law of total variance, the mixture variance is the aleatoric
-        variance plus the epistemic variance of the draws' means.
+        variance plus the epistemic variance of the included draws' means.
 
         Returns:
             The [`MomentMatchedPredictive`][stagereg.jax.MomentMatchedPredictive],
@@ -434,9 +476,17 @@ class PosteriorPredictive:
                 self.aleatoric_variance, self.batch_shape
             ),
             epistemic_variance=jnp.broadcast_to(
-                jnp.var(self.draws, axis=0), self.batch_shape
+                self._epistemic_variance(), self.batch_shape
             ),
         )
+
+    def _epistemic_variance(self) -> jax.Array:
+        """Return the variance of the included draws' means, shaped like
+        ``draws[0]``."""
+        if self.draw_mask is None:
+            return jnp.var(self.draws, axis=0)
+        deviation = self._included(self.draws - self._draw_mean(), 0.0)
+        return jnp.sum(jnp.square(deviation), axis=0) / self._included_count()
 
 
 class GaussianHead(nnx.Module):

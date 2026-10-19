@@ -12,7 +12,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
-from cmapss_trajectories import build_random_trajectories
 
 # The example module itself arrives through the `cmapss_run` fixture; these
 # names are used directly by the test bodies, so they stay module-level.
@@ -83,23 +82,6 @@ def test_cmapss_config_rejects_invalid_values(cmapss_run: ModuleType) -> None:
         cmapss_run.CmapssConfig(variance_epochs=0)
     with pytest.raises(ValueError, match="predictive_sample_count"):
         cmapss_run.CmapssConfig(predictive_sample_count=0)
-
-
-@pytest.fixture
-def offline_fd001(cmapss_run: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Serve synthetic FD001 splits in place of the cached NASA archive."""
-    rng = np.random.default_rng(7)
-    sensor_names = cmapss_run._SENSOR_NAMES
-    train_data = build_random_trajectories(
-        rng, unit_ids=range(1, 11), n_cycles=60, feature_columns=sensor_names
-    )
-    test_data = build_random_trajectories(
-        rng, unit_ids=range(1, 6), n_cycles=45, feature_columns=sensor_names
-    )
-    test_rul = rng.uniform(low=1.0, high=100.0, size=5)
-    monkeypatch.setattr(cmapss_run, "load_fd001_data", lambda: train_data)
-    monkeypatch.setattr(cmapss_run, "load_fd001_test_data", lambda: test_data)
-    monkeypatch.setattr(cmapss_run, "load_fd001_test_rul", lambda: test_rul)
 
 
 @pytest.fixture

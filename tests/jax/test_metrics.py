@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -23,7 +26,7 @@ from stagereg.core.metric_registry import (
     WeightedSpread,
 )
 from stagereg.core.types import Batch
-from stagereg.jax.distributions import Gaussian, PosteriorPredictive
+from stagereg.jax.distributions import Gaussian, GaussianHead, PosteriorPredictive
 from stagereg.jax.metrics import (
     GaussianPredictor,
     MetricSuite,
@@ -31,6 +34,7 @@ from stagereg.jax.metrics import (
     PredictionRequirements,
     merge_epoch_prediction_data,
     reduce_metric_suite,
+    make_epoch_prediction_resolver,
     metric_key,
     resolve_epoch_prediction_data,
 )
@@ -568,3 +572,108 @@ def test_merge_concatenates_log_likelihood_across_batches() -> None:
     merged = merge_epoch_prediction_data(parts)
 
     assert np.array_equal(merged.log_likelihood, np.array([-1.0, -2.0, -2.0]))
+
+
+def test_compiled_resolver_matches_the_cloning_resolver() -> None:
+    model = GaussianHead(1, 1, rngs=nnx.Rngs(0))
+    batch = Batch(
+        inputs=jnp.array([[-1.0], [0.0], [2.0]]),
+        targets=jnp.array([[-0.5], [0.25], [1.5]]),
+    )
+    suite = MetricSuite(
+        epoch=(
+            RootMeanSquaredError(),
+            NegativeLogLikelihood(),
+            IntervalCoverage(level=0.8),
+            PointContinuousRankedProbabilityScore(),
+        ),
+        predictor=GaussianPredictor(),
+        predictive_sample_count=16,
+        evaluation_grid=EvaluationGrid(np.linspace(-5.0, 5.0, 51)),
+    )
+    key = metric_key(jax.random.key(2))
+
+    expected = resolve_epoch_prediction_data(
+        suite=suite, model=model, batch=batch, key=key
+    )
+    actual = make_epoch_prediction_resolver(suite=suite, model=model)(batch, key)
+
+    np.testing.assert_allclose(actual.mean, expected.mean, rtol=1e-6)
+    np.testing.assert_allclose(
+        actual.log_likelihood, expected.log_likelihood, rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        actual.predictive_samples, expected.predictive_samples, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        actual.interval(0.8).lower, expected.interval(0.8).lower, rtol=1e-6
+    )
+
+
+def test_compiled_resolver_reads_the_live_model_state_at_each_call() -> None:
+    model = GaussianHead(1, 1, rngs=nnx.Rngs(0))
+    batch = Batch(inputs=jnp.array([[1.0]]), targets=jnp.array([[0.0]]))
+    suite = MetricSuite(epoch=(RootMeanSquaredError(),), predictor=GaussianPredictor())
+    resolve = make_epoch_prediction_resolver(suite=suite, model=model)
+
+    before = resolve(batch, jax.random.key(0)).mean
+    nnx.update(
+        model, jax.tree.map(lambda leaf: leaf + 1.0, nnx.state(model, nnx.Param))
+    )
+    after = resolve(batch, jax.random.key(0)).mean
+
+    assert not np.allclose(before, after)
+
+
+class FixedPredictionModel(nnx.Module, pytree=False):
+    """Returns one prediction, built beforehand, whatever the inputs."""
+
+    def __init__(self, prediction: object) -> None:
+        self.prediction = prediction
+
+    def __call__(self, inputs: jax.Array) -> object:
+        del inputs
+        return self.prediction
+
+
+_DEVICE_FIELDS = PredictionRequirements(
+    fields=MetricRequirements(
+        variance=True, predictive_samples=True, log_likelihood=True
+    ),
+    predictive_sample_count=16,
+)
+
+
+@pytest.mark.parametrize(
+    ("predictor", "prediction"),
+    [
+        (
+            GaussianPredictor(),
+            Gaussian(loc=jnp.linspace(0.0, 1.0, 11), scale=jnp.full(11, 0.5)),
+        ),
+        (
+            PosteriorPredictivePredictor(),
+            PosteriorPredictive(
+                draws=jnp.linspace(0.0, 1.0, 33).reshape(3, 11),
+                aleatoric_variance=jnp.full(11, 0.25),
+                draw_mask=jnp.array([True, False, True]),
+            ),
+        ),
+    ],
+    ids=["gaussian", "posterior predictive"],
+)
+def test_a_predictor_materializes_a_prediction_in_one_compiled_call(
+    compile_counter: Callable[[], Any], predictor: object, prediction: object
+) -> None:
+    batch = Batch(inputs=jnp.zeros((11, 1)), targets=jnp.linspace(0.0, 2.0, 11))
+    model = FixedPredictionModel(prediction)
+    key = metric_key(jax.random.key(0))
+
+    with compile_counter() as counter:
+        data = predictor(model, batch, _DEVICE_FIELDS, key)  # type: ignore[operator]
+
+    assert counter.total == 1
+    assert data.variance is not None and data.variance.shape == (11,)
+    assert data.log_likelihood is not None and data.log_likelihood.shape == (11,)
+    assert data.predictive_samples is not None
+    assert data.predictive_samples.shape == (11, 16)

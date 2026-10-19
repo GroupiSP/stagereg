@@ -8,7 +8,13 @@ from typing import Protocol
 import numpy as np
 from numpy.typing import NDArray
 
-from stagereg.core.metrics import coverage, crps, point_crps, rmse, sample_crps, wsu
+from stagereg.core.metrics import (
+    coverage,
+    crps,
+    expected_sample_crps,
+    rmse,
+    wsu,
+)
 
 FloatArray = NDArray[np.float64]
 
@@ -39,6 +45,33 @@ def _matrix(values: object, *, name: str) -> FloatArray:
     result = np.array(array, dtype=np.float64, order="C", copy=True)
     result.setflags(write=False)
     return result
+
+
+def _point_crps_per_unit(
+    targets: FloatArray, samples: FloatArray, grid: FloatArray
+) -> FloatArray:
+    """Return the point CRPS of every scoring unit at once.
+
+    Each row matches [`point_crps`][stagereg.core.point_crps]. The empirical
+    CDF at each grid point is counted by sorting each row's samples together
+    with the grid, which needs ``(units, S + G)`` memory instead of the
+    ``(units, G, S)`` of a broadcast comparison.
+    """
+    unit_count, sample_count = samples.shape
+    pooled = np.concatenate(
+        [samples, np.broadcast_to(grid, (unit_count, grid.size))], axis=1
+    )
+    # A stable sort keeps samples ahead of equal grid points, so the samples
+    # counted before a grid point are exactly those ``<=`` it.
+    order = np.argsort(pooled, axis=1, kind="stable")
+    is_sample = order < sample_count
+    samples_up_to = np.cumsum(is_sample, axis=1)[~is_sample].reshape(
+        unit_count, grid.size
+    )
+    # Grid points are already increasing, so they appear in their own order.
+    predicted_cdf = samples_up_to / sample_count
+    true_cdf = (grid[None, :] >= targets[:, None]).astype(np.float64)
+    return np.trapezoid((true_cdf - predicted_cdf) ** 2, grid, axis=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,12 +491,9 @@ class PointContinuousRankedProbabilityScore:
             raise ValueError("Point CRPS requires predictive_samples.")
         if data.evaluation_grid is None:
             raise ValueError("Point CRPS requires an evaluation_grid.")
-        scores = [
-            point_crps(target, samples, data.evaluation_grid.values)
-            for target, samples in zip(
-                data.targets, data.predictive_samples, strict=True
-            )
-        ]
+        scores = _point_crps_per_unit(
+            data.targets, data.predictive_samples, data.evaluation_grid.values
+        )
         return float(np.mean(scores))
 
 
@@ -496,12 +526,7 @@ class SampleContinuousRankedProbabilityScore:
         """
         if data.predictive_samples is None:
             raise ValueError("Sample CRPS requires predictive_samples.")
-        scores = [
-            sample_crps(target, samples)
-            for target, samples in zip(
-                data.targets, data.predictive_samples, strict=True
-            )
-        ]
+        scores = expected_sample_crps(data.predictive_samples, data.targets[:, None])
         return float(np.mean(scores))
 
 

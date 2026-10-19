@@ -9,13 +9,16 @@ from flax import nnx
 
 from stagereg.core.protocols import LoaderFactory
 from stagereg.core.types import TrainingState, ValidationResult
-from stagereg.jax.evaluation import SupervisedLoss, evaluate_loader
+from stagereg.jax.evaluation import PreparedEvaluation, SupervisedLoss
 from stagereg.jax.metrics import MetricSuite
 
 
 @dataclass(frozen=True)
 class HeldOutValidation:
     """Evaluate an NNX model against a held-out validation loader.
+
+    The evaluation step is built and compiled once per strategy and reused
+    every epoch, so validation compiles nothing after the first epoch.
 
     Attributes:
         model: The NNX module to evaluate.
@@ -32,6 +35,13 @@ class HeldOutValidation:
     loss: SupervisedLoss
     metrics: MetricSuite = field(default_factory=MetricSuite)
     metadata: dict[str, object] = field(default_factory=dict)
+    _evaluation: PreparedEvaluation = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Build the evaluation step every epoch reuses."""
+        object.__setattr__(
+            self, "_evaluation", PreparedEvaluation.of(self.metrics, self.loss)
+        )
 
     def __call__(self, state: TrainingState, *, epoch: int) -> ValidationResult:
         """Evaluate the held-out split after a training epoch.
@@ -51,11 +61,9 @@ class HeldOutValidation:
         """
         if not isinstance(state.rng_state, jax.Array):
             raise TypeError("state.rng_state must be a JAX random key.")
-        metrics, state.rng_state = evaluate_loader(
+        metrics, state.rng_state = self._evaluation(
             self.model,
             self.loader(split="validation", epoch=epoch),
             key=state.rng_state,
-            metrics=self.metrics,
-            loss=self.loss,
         )
         return ValidationResult(passed=True, metrics=metrics, message=None)

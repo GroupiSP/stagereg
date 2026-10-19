@@ -9,7 +9,6 @@ from flax import nnx
 
 from stagereg.core.checkpoints import CheckpointStore
 from stagereg.core.early_stopping import EarlyStopper
-from stagereg.core.metric_registry import EpochPredictionData
 from stagereg.core.protocols import LoaderFactory, ValidationStrategy
 from stagereg.core.tracking import EventSink
 from stagereg.core.types import Batch, PyTree, StageResult, TrainingState
@@ -22,7 +21,7 @@ from stagereg.jax.evaluation import SupervisedLoss
 from stagereg.jax.metrics import (
     BatchMetricSpec,
     MetricSuite,
-    resolve_epoch_prediction_data,
+    make_epoch_prediction_resolver,
 )
 from stagereg.jax.state import snapshot
 
@@ -49,7 +48,26 @@ def make_train_step(
         avoid a second state-mutating training-mode forward pass.
     """
 
-    @nnx.jit
+    return nnx.jit(_train_step_body(loss, metrics=metrics))
+
+
+def _train_step_body(
+    loss: SupervisedLoss,
+    *,
+    metrics: Sequence[BatchMetricSpec],
+) -> Callable[..., Mapping[str, jax.Array]]:
+    """Return the untransformed training step behind ``make_train_step``.
+
+    Args:
+        loss: The supervised loss to minimise.
+        metrics: Batch metrics evaluated on the pre-update parameters.
+
+    Returns:
+        A function ``train_step(model, optimizer, inputs, targets,
+        sample_weight, key)`` that updates ``model`` through ``optimizer``
+        and returns the loss and batch metric values.
+    """
+
     def train_step(
         model: nnx.Module,
         optimizer: nnx.Optimizer,
@@ -85,6 +103,42 @@ def make_train_step(
     return train_step
 
 
+def _bind_train_step(
+    loss: SupervisedLoss,
+    *,
+    metrics: Sequence[BatchMetricSpec],
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
+) -> Callable[..., Mapping[str, jax.Array]]:
+    """Compile a training step with ``model`` and ``optimizer`` bound once.
+
+    ``make_train_step`` walks the module graph of ``model`` and ``optimizer``
+    on every call, which costs more than the compiled step itself for the
+    small models of the examples. Binding them flattens the graph once; the
+    bound step still reads and writes the same Variables, so in-place
+    updates made between calls, such as a restored checkpoint, are seen.
+    The module structure and static attributes, such as a training flag,
+    are fixed when binding, and changes to them inside the step are not
+    written back to ``model``.
+
+    Args:
+        loss: The supervised loss to minimise.
+        metrics: Batch metrics evaluated on the pre-update parameters.
+        model: The live model, updated in place by every call.
+        optimizer: The live optimizer, updated in place by every call.
+
+    Returns:
+        A function ``bound_step(inputs, targets, sample_weight, key)``.
+    """
+    return nnx.jit_partial(
+        _train_step_body(loss, metrics=metrics),
+        model,
+        optimizer,
+        graph=True,
+        graph_updates=False,
+    )
+
+
 def run_supervised(
     *,
     model: nnx.Module,
@@ -109,6 +163,17 @@ def run_supervised(
     ``model`` holds the parameters of the last epoch run. To continue from the
     best model, load the checkpoint from ``checkpoint_store`` and pass it to
     [`restore_checkpoint`][stagereg.jax.restore_checkpoint].
+
+    The training step is compiled once with ``model`` and ``optimizer`` bound
+    to it. It updates their variables in place and sees changes made to them
+    between steps, but their module structure and plain Python attributes
+    are fixed for the run: an attribute set inside the step, e.g. by the
+    loss, is not written back to ``model``, as it would be by
+    [`make_train_step`][stagereg.jax.make_train_step].
+
+    Epoch metrics run the model's inference-mode forward pass as one
+    compiled call, so with ``metrics`` holding any epoch metric the model's
+    output must be a JAX pytree, as every built-in distribution is.
 
     Args:
         model: The NNX module to train, mutated in place.
@@ -170,12 +235,12 @@ def run_supervised(
     state.register_component(model_name, model)
     state.register_optimizer(optimizer_name, optimizer)
     metric_suite = metrics if metrics is not None else MetricSuite()
-    train_step = make_train_step(loss, metrics=metric_suite.batch)
+    train_step = _bind_train_step(
+        loss, metrics=metric_suite.batch, model=model, optimizer=optimizer
+    )
 
     def step(batch: Batch, key: jax.Array, /) -> Mapping[str, jax.Array]:
         return train_step(
-            model,
-            optimizer,
             batch.inputs,
             batch.targets,
             batch.sample_weight,
@@ -187,10 +252,11 @@ def run_supervised(
             parameters=snapshot(model), optimizer_state=snapshot(optimizer)
         )
 
-    def epoch_predictions(batch: Batch, key: jax.Array, /) -> EpochPredictionData:
-        return resolve_epoch_prediction_data(
-            suite=metric_suite, model=model, batch=batch, key=key
-        )
+    epoch_predictions = (
+        make_epoch_prediction_resolver(suite=metric_suite, model=model)
+        if metric_suite.epoch
+        else None
+    )
 
     return run_epoch_loop(
         step=step,

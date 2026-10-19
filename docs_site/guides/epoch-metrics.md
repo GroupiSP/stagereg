@@ -59,6 +59,13 @@ draws of a posterior, use
 which scores the exact mixture: its log-density, samples from it and its
 quantiles.
 
+During training, the model a predictor receives runs as one compiled call, so
+the model's output must be a JAX pytree. The built-in distributions are (see
+[Distributions inside jitted code](distributions-and-losses.md#distributions-inside-jitted-code));
+a model returning your own distribution type must register it with
+[`jax.tree_util`](https://docs.jax.dev/en/latest/pytrees.html) before epoch
+metrics can score it.
+
 `EpochPredictionData` holds one row per **scoring unit**: a single scalar
 target with its predictive mean and, when requested, its variance, predictive
 and reference samples (as `(n_scoring_units, n_samples)` matrices), labelled

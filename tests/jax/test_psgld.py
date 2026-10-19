@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import math
+from collections.abc import Callable
 from typing import Any
 
 import jax
@@ -168,6 +170,7 @@ def test_burn_in_and_thinning_retain_exactly_the_due_positions(
         return
     expected = jax.tree.map(lambda leaf: leaf[np.asarray(due) - 1], every_position)
     assert method.posterior().num_draws == len(due)
+    jax.tree.map(np.testing.assert_array_equal, method.posterior().samples, expected)
     jax.tree.map(np.testing.assert_array_equal, method.posterior_state(), expected)
 
 
@@ -326,3 +329,112 @@ def test_the_posterior_stage_skips_validation_until_psgld_retains_a_sample(
         assert len(values) == 2
         assert all(math.isfinite(value) for value in values)
     assert state.model_components["posterior"].num_draws == 4
+
+
+def test_a_psgld_posterior_stage_compiles_nothing_after_warmup_as_samples_accumulate(
+    variance_ready_run: MakeVarianceReadyRun,
+    compile_counter: Callable[[], Any],
+) -> None:
+    state = variance_ready_run().state
+    method = PreconditionedSGLD(step_size=1e-3, burn_in=0, thinning=1)
+    with compile_counter() as counter:
+        stage = _psgld_stage(
+            method,
+            epochs=5,
+            validation_loader=regression_loader,
+            event_sinks=(counter,),
+        )
+        stage.prepare(state)
+        stage.train(state)
+
+    assert counter.during_warmup("posterior") > 0
+    assert counter.after_warmup("posterior") == 0
+    assert len(state.metric_history["posterior/validation/nll"]) == 5
+    # Two batches per epoch, every position retained.
+    assert state.model_components["posterior"].num_draws == 10
+
+
+def test_a_psgld_posterior_stage_sizes_its_sample_buffer_from_its_epochs(
+    variance_ready_run: MakeVarianceReadyRun,
+    compile_counter: Callable[[], Any],
+) -> None:
+    # Two batches per epoch, every position retained: 80 samples, more than
+    # the 64 slots a chain reserves when it knows nothing of its run.
+    state = variance_ready_run().state
+    method = PreconditionedSGLD(step_size=1e-3, burn_in=0, thinning=1)
+    with compile_counter() as counter:
+        stage = _psgld_stage(
+            method,
+            epochs=40,
+            validation_loader=regression_loader,
+            event_sinks=(counter,),
+        )
+        stage.prepare(state)
+        stage.train(state)
+
+    assert counter.after_warmup("posterior") == 0
+    assert state.model_components["posterior"].num_draws == 80
+
+
+def test_a_full_sample_buffer_grows_and_keeps_every_retained_position(
+    linear_regression_problem: PosteriorProblem, every_position: PyTree
+) -> None:
+    method = PreconditionedSGLD(step_size=0.01, capacity=3)
+
+    _run_chain(method, linear_regression_problem, _MAX_STEPS)
+
+    assert method.posterior().num_draws == _MAX_STEPS
+    jax.tree.map(
+        np.testing.assert_array_equal, method.posterior_state(), every_position
+    )
+
+
+def test_a_posterior_is_independent_of_later_updates(
+    linear_regression_problem: PosteriorProblem, every_position: PyTree
+) -> None:
+    method = PreconditionedSGLD(step_size=0.01, capacity=4)
+    _run_chain(method, linear_regression_problem, 3)
+    early = method.posterior()
+    inputs = jnp.linspace(-1.0, 1.0, 5)[:, None]
+    before = early.sample_means(inputs, jax.random.key(0))
+
+    batch = next(iter(linear_regression_problem.train_loader(split="train", epoch=0)))
+    for key in jax.random.split(jax.random.key(9), 6):
+        method.update(batch, key)
+
+    assert early.num_draws == 3
+    np.testing.assert_array_equal(early.sample_means(inputs, jax.random.key(0)), before)
+    jax.tree.map(
+        np.testing.assert_array_equal,
+        early.samples,
+        jax.tree.map(lambda leaf: leaf[:3], every_position),
+    )
+
+
+def test_psgld_refuses_a_non_positive_capacity() -> None:
+    with pytest.raises(ValueError, match="capacity"):
+        PreconditionedSGLD(step_size=0.01, capacity=0)
+
+
+def test_a_buffer_first_due_on_a_ragged_batch_is_sized_from_the_full_batches() -> None:
+    # Batches of 31 and 1 rows over 10 epochs: 20 steps, 19 retained. Sizing
+    # from the 1-row batch the first sample falls on would plan 320 steps.
+    full = _linear_regression_batch()
+    batches = [
+        Batch(inputs=full.inputs[:31], targets=full.targets[:31]),
+        Batch(inputs=full.inputs[31:], targets=full.targets[31:]),
+    ]
+    problem = dataclasses.replace(
+        _linear_regression_problem(full),
+        train_loader=lambda *, split, epoch: batches,
+        epochs=10,
+    )
+    method = PreconditionedSGLD(step_size=0.01, burn_in=1, thinning=1)
+    method.init(problem)
+
+    for key, batch in zip(jax.random.split(jax.random.key(0), 2), batches):
+        method.update(batch, key)
+
+    draw_mask = method.posterior()._traced().draw_mask
+    assert draw_mask is not None
+    assert draw_mask.shape == (19,)

@@ -21,6 +21,7 @@ import optax
 from stagereg.core.types import Batch, PyTree
 from stagereg.jax.posterior import (
     PosteriorProblem,
+    TracedPosterior,
     default_optimizer,
     draw_unlimited,
     require_inferred_tree,
@@ -76,6 +77,16 @@ class MCDropoutPosterior:
             )
 
         return draw_unlimited(draw, num_samples)
+
+    def _traced(self) -> TracedPosterior:
+        """Return the posterior taken apart for compiled code.
+
+        Returns:
+            Its class and mean function, static, and its arrays, traced.
+        """
+        return TracedPosterior(
+            type(self), self.mean_function, {"parameters": self.parameters}
+        )
 
 
 @dataclass

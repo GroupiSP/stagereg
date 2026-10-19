@@ -6,6 +6,7 @@ import copy
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +54,8 @@ from stagereg.jax.posterior import (
     Posterior,
     PosteriorProblem,
     Prior,
+    TraceablePosterior,
+    TracedPosterior,
     require_inferred_tree,
 )
 from stagereg.jax.rng import split_key
@@ -65,7 +68,6 @@ from stagereg.jax.stage_checkpoints import (
     select_checkpoint,
 )
 from stagereg.jax.state import restore_keeping_components
-
 
 _DEFAULT_PREDICTIVE_SAMPLE_COUNT = 100
 
@@ -206,6 +208,9 @@ class PosteriorStage:
     _validation: ValidationStrategy | None = field(default=None, init=False, repr=False)
     _prepared: bool = field(default=False, init=False, repr=False)
     _posterior: Posterior | None = field(default=None, init=False, repr=False)
+    _aleatoric_variance: _AleatoricVariance | None = field(
+        default=None, init=False, repr=False
+    )
 
     def prepare(self, state: TrainingState) -> None:
         """Warm-start the posterior network and initialize the inference method.
@@ -255,12 +260,13 @@ class PosteriorStage:
                 "the inference method does not support early stopping; "
                 "remove the early stopper."
             )
+        aleatoric_variance = _AleatoricVariance.of(variance_model)
         validation = (
             None
             if options.validation_loader is None
             else _PosteriorPredictiveValidation(
                 inference_method=self.inference_method,
-                aleatoric_variance=_aleatoric_variance(variance_model),
+                aleatoric_variance=aleatoric_variance,
                 loader=options.validation_loader,
                 metrics=options.validation_metrics,
                 num_draws=options.num_draws,
@@ -283,6 +289,7 @@ class PosteriorStage:
         self._validation = validation
         self._prepared = True
         self._posterior = None
+        self._aleatoric_variance = aleatoric_variance
 
     def train(self, state: TrainingState) -> StageResult:
         """Infer the posterior, register it and transition to ``POSTERIOR_READY``.
@@ -420,6 +427,7 @@ class PosteriorStage:
         self.inference_method.load_posterior(posterior_state)
         restore_keeping_components(state, checkpoint, drop={self.model_name})
         self._register_posterior(state, posterior_state)
+        self._aleatoric_variance = problem.aleatoric_variance
         self._validation = None
         self._prepared = False
 
@@ -480,7 +488,7 @@ class PosteriorStage:
         nnx.update(network, jax.tree.map(jnp.copy, mean_parameters))
         split = _InferredSplit.of(network, self.inferred_subnetwork)
         mean_function = split.mean_function()
-        aleatoric_variance = _aleatoric_variance(variance_model)
+        aleatoric_variance = _AleatoricVariance.of(variance_model)
         return PosteriorProblem(
             initial_parameters=jax.tree.map(jnp.copy, split.inferred),
             mean_function=mean_function,
@@ -493,6 +501,7 @@ class PosteriorStage:
             train_loader=self.train_loader,
             dataset_size=self.dataset_size,
             aleatoric_variance=aleatoric_variance,
+            epochs=self.options.epochs,
         )
 
     def _register_posterior(
@@ -506,6 +515,38 @@ class PosteriorStage:
         state.lifecycle_state = StageState.POSTERIOR_READY
         state.active_stage = self.name
         self._posterior = posterior
+
+    def predict(self, inputs: PyTree, key: jax.Array) -> PosteriorPredictive:
+        """Return the trained posterior's posterior predictive at ``inputs``.
+
+        The predictive is the mixture over the posterior's draws under
+        ``key``: all draws of a finite posterior, or ``options.num_draws``
+        draws of an unlimited one, the same draws its
+        [`sample_means`][stagereg.jax.Posterior.sample_means] takes under
+        ``key``, each with the frozen aleatoric variance, the mean of the
+        variance model's prediction. A built-in posterior is predicted in one
+        compiled call, which compiles once per input shape; any other is
+        drawn from in Python, with the aleatoric variance still compiled.
+
+        Args:
+            inputs: Model inputs with a leading batch dimension.
+            key: The PRNG key selecting the draws.
+
+        Returns:
+            The posterior predictive at ``inputs``.
+
+        Raises:
+            ValueError: If the stage has no posterior, i.e. it was neither
+                trained nor restored.
+        """
+        posterior = self._posterior
+        if posterior is None or self._aleatoric_variance is None:
+            raise ValueError(
+                "the posterior stage has no posterior; train or restore it first."
+            )
+        return _PosteriorPredictiveModel(
+            posterior, self._aleatoric_variance, key, self.options.num_draws
+        )(inputs)
 
     def validate(self, state: TrainingState) -> ValidationResult:
         """Validate posterior-stage lifecycle, ownership and freezing.
@@ -555,26 +596,53 @@ class PosteriorStage:
         )
 
 
-class _PosteriorPredictiveModel(nnx.Module):
+class _PosteriorPredictiveModel(nnx.Module, pytree=False):
     """The posterior predictive at inputs, for a fixed draw key.
 
     Every call with the same instance takes the same draws, so draw ``s`` is
-    the same mean function in every batch of an epoch.
+    the same mean function in every batch of an epoch. A built-in posterior
+    is predicted in one compiled call, which compiles once per input shape;
+    any other is drawn from in Python, through its ``sample_means``, with the
+    aleatoric variance compiled.
     """
 
     def __init__(
         self,
         posterior: Posterior,
-        aleatoric_variance: Callable[[PyTree], jax.Array],
+        aleatoric_variance: _AleatoricVariance,
         draw_key: jax.Array,
-        num_samples: int | None,
+        num_draws: int,
     ) -> None:
-        self.posterior = nnx.static(posterior)
-        self.aleatoric_variance = nnx.static(aleatoric_variance)
+        """Fix the posterior's draws.
+
+        Args:
+            posterior: The posterior.
+            aleatoric_variance: The frozen aleatoric variance.
+            draw_key: The PRNG key selecting the draws.
+            num_draws: The number of draws of an unlimited posterior.
+        """
+        self.posterior = posterior
+        self.aleatoric_variance = aleatoric_variance
         self.draw_key = draw_key
-        self.num_samples = num_samples
+        self.num_samples = _draw_count(posterior, num_draws)
 
     def __call__(self, inputs: PyTree) -> PosteriorPredictive:
+        """Return the posterior predictive at ``inputs``.
+
+        Args:
+            inputs: Model inputs with a leading batch dimension.
+
+        Returns:
+            The mixture over the draws, each with the aleatoric variance.
+        """
+        if isinstance(self.posterior, TraceablePosterior):
+            return _compiled_posterior_predictive(
+                self.posterior._traced(),
+                self.aleatoric_variance,
+                inputs,
+                self.draw_key,
+                num_samples=self.num_samples,
+            )
         return PosteriorPredictive(
             draws=self.posterior.sample_means(inputs, self.draw_key, self.num_samples),
             aleatoric_variance=self.aleatoric_variance(inputs),
@@ -593,7 +661,7 @@ class _PosteriorPredictiveValidation:
     """
 
     inference_method: InferenceMethod
-    aleatoric_variance: Callable[[PyTree], jax.Array]
+    aleatoric_variance: _AleatoricVariance
     loader: LoaderFactory
     metrics: MetricSuite
     num_draws: int
@@ -608,10 +676,7 @@ class _PosteriorPredictiveValidation:
         posterior = self.inference_method.posterior()
         state.rng_state, draw_key = split_key(state.rng_state)
         model = _PosteriorPredictiveModel(
-            posterior,
-            self.aleatoric_variance,
-            draw_key,
-            None if posterior.num_draws is not None else self.num_draws,
+            posterior, self.aleatoric_variance, draw_key, self.num_draws
         )
         predictor = self.metrics.predictor
         parts: list[EpochPredictionData] = []
@@ -769,22 +834,96 @@ def _keyed_rest(rest: nnx.State, key: jax.Array) -> nnx.State:
     )
 
 
-def _aleatoric_variance(
-    variance_model: nnx.Module,
-) -> Callable[[PyTree], jax.Array]:
-    """Return the frozen aleatoric variance, the variance prediction's mean.
+@partial(jax.tree_util.register_dataclass, data_fields=["state"], meta_fields=["graph"])
+@dataclass(frozen=True)
+class _AleatoricVariance:
+    """The frozen aleatoric variance, the variance prediction's mean.
 
-    The variance model is copied in inference mode, so neither training nor later
-    changes to the live model affect it, and it carries no gradient.
+    A pytree, so compiled code takes it as an argument: the graph is static
+    and the frozen state is traced. Calling it is itself compiled. It carries
+    no gradient.
+
+    Attributes:
+        graph: The variance model's graph definition, in inference mode.
+        state: The variance model's frozen state.
     """
-    frozen = nnx.clone(variance_model)
-    frozen.eval()
-    graph, frozen_state = nnx.split(frozen)
 
-    def aleatoric_variance(inputs: PyTree) -> jax.Array:
-        return jax.lax.stop_gradient(nnx.merge(graph, frozen_state)(inputs).mean())
+    graph: nnx.GraphDef[nnx.Module]
+    state: nnx.State
 
-    return aleatoric_variance
+    @classmethod
+    def of(cls, variance_model: nnx.Module) -> _AleatoricVariance:
+        """Freeze a copy of ``variance_model`` in inference mode.
+
+        Neither training nor later changes to the live model affect it.
+
+        Args:
+            variance_model: The trained variance model.
+
+        Returns:
+            The aleatoric variance of a frozen copy of ``variance_model``.
+        """
+        frozen = nnx.clone(variance_model)
+        frozen.eval()
+        graph, state = nnx.split(frozen)
+        return cls(graph, state)
+
+    @jax.jit
+    def __call__(self, inputs: PyTree) -> jax.Array:
+        """Return the aleatoric variance at ``inputs``.
+
+        Args:
+            inputs: Model inputs with a leading batch dimension.
+
+        Returns:
+            The scalar aleatoric variance, the variance prediction's mean.
+        """
+        return jax.lax.stop_gradient(nnx.merge(self.graph, self.state)(inputs).mean())
+
+
+@partial(jax.jit, static_argnames=("num_samples",))
+def _compiled_posterior_predictive(
+    posterior: TracedPosterior,
+    aleatoric_variance: _AleatoricVariance,
+    inputs: PyTree,
+    key: jax.Array,
+    num_samples: int | None,
+) -> PosteriorPredictive:
+    """Form the posterior predictive at ``inputs`` in one compiled call.
+
+    Args:
+        posterior: The posterior taken apart; any slots its ``draw_mask``
+            excludes are kept and masked out, so its shapes do not change as
+            its draws accumulate.
+        aleatoric_variance: The frozen aleatoric variance.
+        inputs: Model inputs with a leading batch dimension.
+        key: The PRNG key selecting the draws.
+        num_samples: The number of draws of an unlimited posterior, or
+            ``None`` for a finite one; static.
+
+    Returns:
+        The mixture over the draws under ``key``, each with the aleatoric
+        variance at ``inputs``.
+    """
+    return PosteriorPredictive(
+        draws=posterior.sample_means(inputs, key, num_samples),
+        aleatoric_variance=aleatoric_variance(inputs),
+        draw_mask=posterior.draw_mask,
+    )
+
+
+def _draw_count(posterior: Posterior, num_draws: int) -> int | None:
+    """Return the draw count to ask a posterior for.
+
+    Args:
+        posterior: The posterior.
+        num_draws: The stage's number of draws of an unlimited posterior.
+
+    Returns:
+        ``None`` for a finite posterior, which uses all its draws, or
+        ``num_draws`` for an unlimited one.
+    """
+    return None if posterior.num_draws is not None else num_draws
 
 
 def _scaled_log_likelihood(

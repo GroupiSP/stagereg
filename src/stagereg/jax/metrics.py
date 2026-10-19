@@ -10,8 +10,10 @@ from statistics import NormalDist
 from typing import Any, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
 from stagereg.core.metric_registry import (
@@ -26,6 +28,9 @@ from stagereg.core.types import Batch, PyTree
 from stagereg.jax.distributions import Gaussian, PosteriorPredictive
 
 _METRIC_RNG_NAMESPACE = 0x4D455452  # "METR" in ASCII
+
+type StepScalar = jax.Array | float
+"""A scalar a training or evaluation step outputs, on the device until read."""
 
 
 def _metric_mean(values: Sequence[float]) -> float:
@@ -163,7 +168,11 @@ class ReferenceSamplesExtractor(Protocol):
 
 
 class Predictor(Protocol):
-    """Materialize typed host predictions from a JAX model and batch."""
+    """Materialize typed host predictions from a JAX model and batch.
+
+    During training the model it receives runs compiled, so its output must be a JAX
+    pytree, as every built-in distribution is.
+    """
 
     def __call__(
         self,
@@ -298,17 +307,44 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
     coordinate_extractor: CoordinateExtractor | None,
     reference_samples_extractor: ReferenceSamplesExtractor | None,
 ) -> EpochPredictionData:
-    """Materialize the requested fields of one scalar-event prediction."""
-    mean, target_values = _materialize_mean_and_targets(prediction, targets)
+    """Materialize the requested fields of one scalar-event prediction.
+
+    The mean, variance, predictive samples and log-likelihood are computed by one
+    compiled call and copied to the host together.
+    """
     fields = requirements.fields
+    sample_count = (
+        requirements.predictive_sample_count if fields.predictive_samples else None
+    )
+    # A subclass not registered as a pytree itself cannot cross a jit boundary.
+    compute = (
+        _compiled_device_fields
+        if not jax.tree_util.treedef_is_leaf(jax.tree.structure(prediction))
+        else _device_fields
+    )
+    device = jax.device_get(
+        compute(
+            prediction,
+            jnp.asarray(targets) if fields.log_likelihood else None,
+            key,
+            variance=fields.variance,
+            sample_count=sample_count,
+        )
+    )
+    batch_shape = prediction.batch_shape
+    mean, target_values = _host_mean_and_targets(device["mean"], targets, batch_shape)
     return EpochPredictionData(
         targets=target_values,
         mean=mean,
-        variance=_materialize_variance(prediction, required=fields.variance),
-        predictive_samples=_materialize_predictive_samples(
-            prediction,
-            requirements=requirements,
-            key=key,
+        variance=_host_per_unit(device.get("variance"), batch_shape),
+        predictive_samples=(
+            None
+            if sample_count is None
+            else _samples_to_rows(
+                device["predictive_samples"],
+                prediction_shape=batch_shape,
+                name="predictive_samples",
+            )
         ),
         reference_samples=_materialize_reference_samples(
             reference_samples_extractor,
@@ -326,10 +362,47 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
             required=fields.coordinate,
         ),
         evaluation_grid=_required_evaluation_grid(requirements),
-        log_likelihood=_materialize_log_likelihood(
-            prediction, targets, required=fields.log_likelihood
-        ),
+        log_likelihood=_host_per_unit(device.get("log_likelihood"), batch_shape),
     )
+
+
+def _device_fields(
+    prediction: PredictiveDistribution,
+    targets: jax.Array | None,
+    key: jax.Array,
+    *,
+    variance: bool,
+    sample_count: int | None,
+) -> dict[str, jax.Array]:
+    """Compute a prediction's requested device fields.
+
+    Args:
+        prediction: The predictive distribution.
+        targets: The targets to score the log-density of, or ``None`` when
+            the log-likelihood is not requested.
+        key: The metric key; predictive samples use ``fold_in(key, 0)``.
+        variance: Whether to compute the predictive variance.
+        sample_count: The number of predictive samples, or ``None`` for none.
+
+    Returns:
+        The mean, and each requested field under its ``EpochPredictionData``
+        name.
+    """
+    computed = {"mean": prediction.mean()}
+    if variance:
+        computed["variance"] = prediction.variance()
+    if sample_count is not None:
+        computed["predictive_samples"] = prediction.sample(
+            jax.random.fold_in(key, 0), sample_shape=(sample_count,)
+        )
+    if targets is not None:
+        computed["log_likelihood"] = prediction.log_prob(targets)
+    return computed
+
+
+_compiled_device_fields = jax.jit(
+    _device_fields, static_argnames=("variance", "sample_count")
+)
 
 
 def _require_targets(batch: Batch) -> Any:
@@ -348,53 +421,25 @@ def _require_scalar_gaussian(prediction: object) -> Gaussian:
     return prediction
 
 
-def _materialize_mean_and_targets(
-    prediction: PredictiveDistribution,
-    targets: Any,
+def _host_mean_and_targets(
+    mean: ArrayLike, targets: ArrayLike, batch_shape: tuple[int, ...]
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Materialize shape-compatible predictive means and targets."""
-    mean = np.broadcast_to(
-        np.asarray(jax.device_get(prediction.mean()), dtype=np.float64),
-        prediction.batch_shape,
-    )
+    """Return shape-compatible host predictive means and targets, flattened."""
+    host_mean = np.broadcast_to(np.asarray(mean, dtype=np.float64), batch_shape)
     target_values = np.asarray(jax.device_get(targets), dtype=np.float64)
-    if mean.shape != target_values.shape:
+    if host_mean.shape != target_values.shape:
         raise ValueError("prediction mean and targets must have matching shapes.")
-    return mean.reshape(-1), target_values.reshape(-1)
+    return host_mean.reshape(-1), target_values.reshape(-1)
 
 
-def _materialize_variance(
-    prediction: PredictiveDistribution,
-    *,
-    required: bool,
+def _host_per_unit(
+    values: Any, batch_shape: tuple[int, ...]
 ) -> NDArray[np.float64] | None:
-    """Materialize broadcast predictive variance when requested."""
-    if not required:
+    """Broadcast host values to the prediction's shape and flatten them."""
+    if values is None:
         return None
-    return np.broadcast_to(
-        np.asarray(jax.device_get(prediction.variance()), dtype=np.float64),
-        prediction.batch_shape,
-    ).reshape(-1)
-
-
-def _materialize_predictive_samples(
-    prediction: PredictiveDistribution,
-    *,
-    requirements: PredictionRequirements,
-    key: jax.Array,
-) -> NDArray[np.float64] | None:
-    """Materialize predictive samples when requested."""
-    if not requirements.fields.predictive_samples:
-        return None
-    assert requirements.predictive_sample_count is not None
-    samples = prediction.sample(
-        jax.random.fold_in(key, 0),
-        sample_shape=(requirements.predictive_sample_count,),
-    )
-    return _samples_to_rows(
-        samples,
-        prediction_shape=prediction.batch_shape,
-        name="predictive_samples",
+    return np.broadcast_to(np.asarray(values, dtype=np.float64), batch_shape).reshape(
+        -1
     )
 
 
@@ -420,21 +465,6 @@ def _materialize_reference_samples(
             "reference samples must have shape (n_scoring_units, n_samples)."
         )
     return samples
-
-
-def _materialize_log_likelihood(
-    prediction: PredictiveDistribution,
-    targets: Any,
-    *,
-    required: bool,
-) -> NDArray[np.float64] | None:
-    """Materialize each target's exact predictive log-density when requested."""
-    if not required:
-        return None
-    return np.broadcast_to(
-        np.asarray(jax.device_get(prediction.log_prob(targets)), dtype=np.float64),
-        prediction.batch_shape,
-    ).reshape(-1)
 
 
 def _materialize_coordinate(
@@ -589,6 +619,81 @@ def resolve_epoch_prediction_data(
     )
 
 
+class _CompiledInferenceModel(nnx.Module):
+    """Run a live model's inference-mode forward pass as one compiled call.
+
+    The inference-mode structure is taken once, from a single clone switched
+    to ``eval()``; every call then merges it with the live
+    model's current state inside a jitted function. Whatever the forward pass
+    writes to its variables stays inside that call, so the live model is
+    never mutated, and the forward pass compiles once per input shape.
+    """
+
+    def __init__(self, model: nnx.Module) -> None:
+        """Take the inference-mode structure of ``model`` and compile its call.
+
+        Args:
+            model: The live model, whose current state each call reads.
+        """
+        inference_model = nnx.clone(model)
+        inference_model.eval()
+        graphdef, _ = nnx.split(inference_model)
+
+        def forward(state: nnx.State, inputs: PyTree) -> Any:
+            return nnx.merge(graphdef, state)(inputs)
+
+        self._forward = jax.jit(forward)
+        self._model = model
+
+    def __call__(self, inputs: PyTree) -> Any:
+        """Predict on ``inputs`` with the live model's current state.
+
+        Args:
+            inputs: Batch inputs.
+
+        Returns:
+            The inference-mode model output, a JAX pytree.
+        """
+        return self._forward(nnx.state(self._model), inputs)
+
+
+def make_epoch_prediction_resolver(
+    *,
+    suite: MetricSuite,
+    model: nnx.Module,
+) -> Callable[[Batch, jax.Array], EpochPredictionData]:
+    """Build a per-batch epoch-prediction resolver for a model being trained.
+
+    Unlike ``resolve_epoch_prediction_data``, which clones the model and
+    runs it eagerly on every batch, the resolver takes the inference-mode
+    structure once and runs every forward pass compiled, against the model's
+    state at that moment. The live model is never mutated. The model's
+    output must be a JAX pytree, as
+    [`Gaussian`][stagereg.jax.Gaussian] and
+    [`PosteriorPredictive`][stagereg.jax.PosteriorPredictive] are.
+
+    Args:
+        suite: The metric suite whose predictor materializes each batch.
+        model: The live model; its parameters may change between calls.
+
+    Returns:
+        A callable ``(batch, key) -> EpochPredictionData``.
+
+    Raises:
+        ValueError: If the suite has no predictor.
+    """
+    predictor = suite.predictor
+    if predictor is None:
+        raise ValueError("epoch metrics require an explicit suite predictor.")
+    requirements = suite.prediction_requirements
+    inference_model = _CompiledInferenceModel(model)
+
+    def resolve(batch: Batch, key: jax.Array, /) -> EpochPredictionData:
+        return predictor(inference_model, batch, requirements, key)
+
+    return resolve
+
+
 def merge_epoch_prediction_data(
     parts: Sequence[EpochPredictionData],
 ) -> EpochPredictionData:
@@ -679,8 +784,8 @@ def _merge_grid(parts: Sequence[EpochPredictionData]) -> EvaluationGrid | None:
 
 def initialize_batch_metric_values(
     metrics: Sequence[BatchMetricSpec],
-) -> dict[str, list[float]]:
-    """Create per-metric host-side accumulation buffers."""
+) -> dict[str, list[StepScalar]]:
+    """Create per-metric accumulation buffers for raw step outputs."""
     return {spec.name: [] for spec in metrics}
 
 
@@ -688,23 +793,39 @@ def collect_step_metrics(
     step_output: Mapping[str, Any],
     *,
     metrics: Sequence[BatchMetricSpec],
-    losses: list[float] | None,
-    batch_metric_values: dict[str, list[float]],
+    losses: list[StepScalar] | None,
+    batch_metric_values: dict[str, list[StepScalar]],
     context: str,
 ) -> None:
-    """Append one step's loss and registered batch metrics.
+    """Append one step's loss and registered batch metrics as they are.
 
-    Passing ``losses=None`` collects only the registered batch metrics, for
-    steps that compute no loss at all.
+    The values are not read on the host, so device arrays stay on the device
+    and the next step can be dispatched without waiting for this one;
+    ``step_outputs_to_host`` moves
+    them once the epoch ends. Passing ``losses=None`` collects only the
+    registered batch metrics, for steps that compute no loss at all.
     """
     if losses is not None:
-        losses.append(float(step_output["loss"]))
+        losses.append(step_output["loss"])
     for spec in metrics:
         if spec.name not in step_output:
             raise ValueError(
                 f"{context} did not produce registered metric {spec.name!r}."
             )
-        batch_metric_values[spec.name].append(float(step_output[spec.name]))
+        batch_metric_values[spec.name].append(step_output[spec.name])
+
+
+def step_outputs_to_host[T](values: T) -> T:
+    """Move accumulated step outputs to the host in one transfer.
+
+    Args:
+        values: A pytree whose leaves are scalar step outputs, either device
+            arrays or Python numbers.
+
+    Returns:
+        ``values`` with every leaf replaced by a Python float.
+    """
+    return jax.tree.map(float, jax.device_get(values))
 
 
 def maybe_collect_epoch_prediction_data(
@@ -731,16 +852,23 @@ def maybe_collect_epoch_prediction_data(
 def reduce_metric_suite(
     *,
     suite: MetricSuite,
-    losses: Sequence[float] | None,
-    batch_metric_values: Mapping[str, Sequence[float]],
+    losses: Sequence[Any] | None,
+    batch_metric_values: Mapping[str, Sequence[Any]],
     epoch_metric_parts: Sequence[EpochPredictionData] | None,
 ) -> dict[str, float]:
     """Reduce accumulated batch and typed epoch metrics into one mapping.
 
-    Passing ``losses=None`` omits the ``"loss"`` key entirely, for
-    evaluations that compute no loss. This is distinct from an empty
-    sequence, which means a loss was requested but no batch produced one.
+    ``losses`` and ``batch_metric_values`` may hold raw step outputs; they
+    are moved to the host together before reducing, so each
+    [`BatchMetricSpec.reduce`][stagereg.jax.BatchMetricSpec] still
+    receives Python floats. Passing ``losses=None`` omits the ``"loss"`` key
+    entirely, for evaluations that compute no loss. This is distinct from an
+    empty sequence, which means a loss was requested but no batch produced
+    one.
     """
+    losses, batch_metric_values = step_outputs_to_host(
+        (losses, dict(batch_metric_values))
+    )
     reduced: dict[str, float] = {}
     if losses is not None:
         reduced["loss"] = _finite_float("loss", _metric_mean(losses))

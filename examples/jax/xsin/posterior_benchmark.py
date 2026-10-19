@@ -9,8 +9,8 @@ in ``benchmark.py``.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +21,8 @@ from benchmark import (
     XSinConfig,
     XSinData,
     XSinDropoutMeanModel,
+    XSinGammaModel,
+    XSinMeanModel,
     XSinResult,
     interpolation_mask,
     make_xsin_loader,
@@ -35,7 +37,7 @@ from stagereg.core import (
     PointContinuousRankedProbabilityScore,
 )
 from stagereg.core.tracking import EventSink
-from stagereg.core.types import Batch
+from stagereg.core.types import Batch, TrainingState
 from stagereg.jax import (
     BayesByBackprop,
     Gaussian,
@@ -43,7 +45,6 @@ from stagereg.jax import (
     InferenceMethod,
     MCDropout,
     MetricSuite,
-    Posterior,
     PosteriorPredictive,
     PosteriorPredictivePredictor,
     PosteriorStage,
@@ -101,6 +102,25 @@ class XSinPosteriorResult:
     posterior_scores: XSinScores
 
 
+@dataclass(frozen=True)
+class XSinSupervisedStages:
+    """The finalized mean and Gamma variance stages a posterior stage starts from.
+
+    Train them once with ``train_xsin_supervised_stages`` and pass them to
+    every ``run_xsin_posterior`` call; each call trains its posterior stage on
+    its own fork of ``state``, so the stages are shared and never retrained.
+
+    Attributes:
+        state: Training state after the variance stage, at ``VARIANCE_READY``.
+        mean_model: The trained mean network.
+        variance_model: The trained Gamma variance network.
+    """
+
+    state: TrainingState
+    mean_model: XSinMeanModel
+    variance_model: XSinGammaModel
+
+
 class XSinTwoStepGaussian(nnx.Module):
     """The variance stage's Gaussian: the trained mean and aleatoric scale."""
 
@@ -115,32 +135,23 @@ class XSinTwoStepGaussian(nnx.Module):
         )
 
 
-class XSinPosteriorPredictive(nnx.Module):
-    """The posterior predictive at inputs, for a fixed draw key.
+class XSinPosteriorPredictive(nnx.Module, pytree=False):
+    """A trained posterior stage's predictive at inputs, for a fixed draw key.
 
     Every call takes the same draws, so draw ``s`` is the same mean function
-    at every input. A finite posterior uses all its draws; an unlimited one
-    takes ``num_draws``.
+    at every input, and each call is one compiled call of
+    ``PosteriorStage.predict``. A finite posterior uses all its draws; an
+    unlimited one takes the stage's ``num_draws``.
     """
 
-    def __init__(
-        self,
-        posterior: Posterior,
-        variance_model: nnx.Module,
-        *,
-        draw_key: jax.Array,
-        num_draws: int,
-    ) -> None:
-        self.posterior = nnx.static(posterior)
-        self.variance_model = variance_model
+    def __init__(self, stage: PosteriorStage, *, draw_key: jax.Array) -> None:
+        # The bound method compares by identity, so the module stays hashable
+        # static data under ``nnx.jit``; the stage itself holds arrays.
+        self.predict = stage.predict
         self.draw_key = draw_key
-        self.num_draws = None if posterior.num_draws is not None else num_draws
 
     def __call__(self, inputs: jax.Array) -> PosteriorPredictive:
-        return PosteriorPredictive(
-            draws=self.posterior.sample_means(inputs, self.draw_key, self.num_draws),
-            aleatoric_variance=self.variance_model(inputs).mean(),
-        )
+        return self.predict(inputs, self.draw_key)
 
 
 def xsin_bayes_by_backprop(config: XSinConfig) -> BayesByBackprop:
@@ -207,36 +218,118 @@ def xsin_mc_dropout_model(config: XSinConfig) -> XSinDropoutMeanModel:
     )
 
 
+XSIN_INFERENCE_METHODS: tuple[
+    tuple[
+        str,
+        Callable[[XSinConfig], InferenceMethod],
+        Callable[[XSinConfig], nnx.Module] | None,
+    ],
+    ...,
+] = (
+    ("Bayes by Backprop", xsin_bayes_by_backprop, None),
+    ("pSGLD", xsin_psgld, None),
+    ("MC-Dropout", xsin_mc_dropout, xsin_mc_dropout_model),
+)
+"""Label, inference-method factory and posterior-network factory of each method.
+
+A ``None`` network factory uses a copy of the mean network.
+"""
+
+
+def train_xsin_supervised_stages(
+    data: XSinData,
+    config: XSinConfig,
+    *,
+    event_sinks: Sequence[EventSink] = (),
+) -> XSinSupervisedStages:
+    """Train the mean and Gamma variance stages a posterior stage starts from.
+
+    Args:
+        data: Shared XSin data.
+        config: Benchmark configuration.
+        event_sinks: Sinks shared by the mean and variance stages.
+
+    Returns:
+        The finalized stages, to share across ``run_xsin_posterior`` calls.
+    """
+    state, mean_model, variance_model = train_xsin_two_step(
+        data, config, event_sinks=event_sinks
+    )
+    return XSinSupervisedStages(state, mean_model, variance_model)
+
+
+def run_xsin_posteriors(
+    data: XSinData,
+    config: XSinConfig,
+    *,
+    event_sinks: Sequence[EventSink] = (),
+) -> dict[str, XSinPosteriorResult]:
+    """Train the supervised stages once, then a posterior stage per method.
+
+    Every method in ``XSIN_INFERENCE_METHODS`` starts its posterior stage from
+    the same finalized mean and variance stages.
+
+    Args:
+        data: Shared XSin data.
+        config: Benchmark configuration.
+        event_sinks: Sinks shared by all stages.
+
+    Returns:
+        Each method's posterior run, keyed by its label, in the order of
+        ``XSIN_INFERENCE_METHODS``.
+    """
+    supervised = train_xsin_supervised_stages(data, config, event_sinks=event_sinks)
+    return {
+        label: run_xsin_posterior(
+            data,
+            config,
+            make_method(config),
+            supervised=supervised,
+            model=None if make_model is None else make_model(config),
+            event_sinks=event_sinks,
+        )
+        for label, make_method, make_model in XSIN_INFERENCE_METHODS
+    }
+
+
 def run_xsin_posterior(
     data: XSinData,
     config: XSinConfig,
     inference_method: InferenceMethod,
     *,
+    supervised: XSinSupervisedStages | None = None,
     model: nnx.Module | None = None,
     event_sinks: Sequence[EventSink] = (),
 ) -> XSinPosteriorResult:
-    """Train mean, variance and posterior stages, then score both predictives.
+    """Train a posterior stage on the supervised stages, then score both predictives.
 
     The posterior stage validates every epoch on the training data with its
     default metrics, the NLL and the CRPS, reported as
-    ``posterior/validation/nll`` and ``posterior/validation/crps``.
+    ``posterior/validation/nll`` and ``posterior/validation/crps``. It trains
+    on a fork of ``supervised.state``, which it leaves at ``VARIANCE_READY``
+    for the next method.
 
     Args:
         data: Shared XSin data.
         config: Benchmark configuration.
         inference_method: A fresh inference method, e.g. from
             ``xsin_bayes_by_backprop``, ``xsin_psgld`` or ``xsin_mc_dropout``.
+        supervised: The finalized mean and variance stages from
+            ``train_xsin_supervised_stages``. Defaults to ``None``, which
+            trains them first.
         model: The posterior network, e.g. from ``xsin_mc_dropout_model``.
             Defaults to ``None``, which uses a copy of the mean network.
-        event_sinks: Sinks shared by all three stages.
+        event_sinks: Sinks shared by all stages trained here.
 
     Returns:
         The posterior predictive on the evaluation grid and the scores of the
         variance stage's Gaussian and of the posterior predictive.
     """
-    state, mean_model, variance_model = train_xsin_two_step(
-        data, config, event_sinks=event_sinks
-    )
+    if supervised is None:
+        supervised = train_xsin_supervised_stages(data, config, event_sinks=event_sinks)
+    state = _fork(supervised.state)
+    mean_model = supervised.mean_model
+    variance_model = supervised.variance_model
     loader = make_xsin_loader(data, config)
     posterior_stage = PosteriorStage(
         inference_method=inference_method,
@@ -254,10 +347,7 @@ def run_xsin_posterior(
     posterior_stage.train(state)
 
     predictive = XSinPosteriorPredictive(
-        state.model_components[posterior_stage.model_name],
-        variance_model,
-        draw_key=jax.random.key(config.seed + 3),
-        num_draws=config.posterior_num_draws,
+        posterior_stage, draw_key=jax.random.key(config.seed + 3)
     )
     moments = predictive(data.evaluation_inputs).moment_matched()
     score_key = jax.random.key(config.seed + 4)
@@ -285,6 +375,23 @@ def run_xsin_posterior(
             config,
             key=score_key,
         ),
+    )
+
+
+def _fork(state: TrainingState) -> TrainingState:
+    """Copy the state's containers so a posterior stage leaves ``state`` as is.
+
+    The trained models stay shared: the posterior stage only reads them.
+    """
+    return replace(
+        state,
+        model_components=dict(state.model_components),
+        parameter_roles=dict(state.parameter_roles),
+        optimizer_states=dict(state.optimizer_states),
+        checkpoint_registry=dict(state.checkpoint_registry),
+        metric_history={
+            tag: list(values) for tag, values in state.metric_history.items()
+        },
     )
 
 

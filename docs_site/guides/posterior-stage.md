@@ -127,31 +127,46 @@ without an evaluation grid. To score other metrics, give the options a
 
 ## Predicting with the posterior
 
-The trained posterior is registered as `state.model_components["posterior"]`.
-It is consumed only through draws: `sample_means` returns each draw's mean at
-the inputs, shaped `[S, *batch]`. Combined with the frozen variance model's
-aleatoric variance, they form the posterior predictive, continuing the run
-above:
+Once trained, or restored, the stage predicts with its posterior:
+[`predict`][stagereg.jax.PosteriorStage.predict] returns the
+[`PosteriorPredictive`][stagereg.jax.PosteriorPredictive] at the inputs, the
+mixture over the posterior's draws under the key, each with the frozen
+aleatoric variance. It takes `options.num_draws` draws of an unlimited
+posterior, such as Bayes by Backprop's, and all draws of a finite one, such as
+pSGLD's. Continuing the run above:
 
 ```{.python continuation}
-posterior = state.model_components["posterior"]
-draws = posterior.sample_means(inputs, jax.random.key(1), 64)
-assert draws.shape == (64, 8, 1)
+predictive = posterior_stage.predict(inputs, jax.random.key(1))
+assert predictive.draws.shape == (16, 8, 1)
 
-predictive = PosteriorPredictive(
-    draws=draws, aleatoric_variance=variance_model(inputs).mean()
-)
 nll = -predictive.log_prob(targets).mean()
 summary = predictive.moment_matched()
 assert bool(jnp.all(summary.epistemic_variance >= 0.0))
 ```
 
-An unlimited posterior, such as Bayes by Backprop's, needs the number of draws;
-a finite one, such as pSGLD's, refuses it and always uses all its draws, so call
-`sample_means(inputs, key)` without it. Score with the posterior predictive
+For every built-in posterior, `predict` draws the means, evaluates the
+aleatoric variance and forms the predictive in one compiled call, compiled once
+per input shape. Score with the posterior predictive
 itself: it is exact for the draws taken and may be skewed or multimodal. The
 moment-matched predictive is for reporting the variance split or drawing a
 band.
+
+The trained posterior is also registered as
+`state.model_components["posterior"]`, and is consumed only through draws:
+`sample_means` returns each draw's mean at the inputs, shaped `[S, *batch]`.
+An unlimited posterior needs the number of draws; a finite one refuses it and
+always uses all its draws, so call `sample_means(inputs, key)` without it.
+Combined with the frozen variance model's aleatoric variance, the draws form
+the same posterior predictive by hand:
+
+```{.python continuation}
+posterior = state.model_components["posterior"]
+draws = posterior.sample_means(inputs, jax.random.key(1), 16)
+by_hand = PosteriorPredictive(
+    draws=draws, aleatoric_variance=variance_model(inputs).mean()
+)
+assert bool(jnp.allclose(by_hand.mean(), predictive.mean(), atol=1e-5))
+```
 
 ## Inferring a subnetwork
 
@@ -294,7 +309,18 @@ pSGLD counts `burn_in` and `thinning` in update steps, that is training
 batches. It has no posterior before its first retained sample, so the stage
 skips validation for the epochs that end before then: they record no
 validation metrics. The chain starts from the trained mean, which already fits
-the data, so a short burn-in is usually enough:
+the data, so a short burn-in is usually enough.
+
+pSGLD keeps its retained samples in a buffer whose slots it reserves up front,
+and validation predicts from every slot with the spare ones masked out, so the
+posterior keeps one shape as samples accumulate and validation compiles nothing
+after the first epoch. The buffer is sized for the samples the run retains,
+from the stage's `epochs`, the `dataset_size` and the size of the first batch,
+assuming `ceil(dataset_size / batch size)` batches an epoch. A loader that
+yields more batches than that retains more samples than planned: a full buffer
+doubles, and each doubling compiles validation once more. Set `capacity` to the
+number of samples the run retains to size it yourself. The posterior's
+`samples` hold the retained samples alone, however many slots are reserved.
 
 ```python
 from stagereg.jax import PreconditionedSGLD
@@ -328,6 +354,14 @@ pSGLD and MC-Dropout:
   other metric. Undeclared keys are ignored, and `prepare` refuses a key whose
   tag the stage already records, such as `loss`. Bayes by Backprop, pSGLD and
   MC-Dropout declare none.
+- Validation and [`predict`][stagereg.jax.PosteriorStage.predict] form a
+  built-in posterior's predictive in one compiled call per batch. They call
+  your posterior's `sample_means` from Python, with the aleatoric variance
+  compiled, which is slower unless `sample_means` is compiled itself, e.g. by
+  dispatching to a `jax.jit` function that takes the problem's `mean_function`
+  as a static argument and the posterior's arrays as traced ones. The problem's
+  `epochs` says how many epochs the stage trains for, should the method size
+  anything up front.
 
 ## The XSin example
 

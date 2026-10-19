@@ -12,7 +12,8 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from functools import partial
+from typing import Any, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -81,6 +82,73 @@ class Posterior(Protocol):
         ...
 
 
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=["arrays", "draw_mask"],
+    meta_fields=["posterior_type", "mean_function"],
+)
+@dataclass(frozen=True)
+class TracedPosterior:
+    """A posterior taken apart for compiled code, which takes it as an argument.
+
+    It is a JAX pytree whose children are the posterior's arrays and whose
+    type and mean function are static, compared by identity, so a compiled
+    function taking it compiles once per posterior lineage and input shape.
+    The posterior itself stays plain data, which Flax NNX can hold as
+    ``nnx.static``. Inside the compiled function the posterior is rebuilt
+    from its arrays and drawn from through its own ``sample_means``
+    (ADR-0009).
+
+    Attributes:
+        posterior_type: The posterior's class, built as
+            ``posterior_type(mean_function=..., **arrays)``.
+        mean_function: The posterior's mean function.
+        arrays: The posterior's other fields, all arrays, by name.
+        draw_mask: Which of the rebuilt posterior's draw slots hold draws,
+            or ``None`` when every one does.
+    """
+
+    posterior_type: type[Posterior]
+    mean_function: Callable[[PyTree, PyTree, jax.Array], jax.Array]
+    arrays: Mapping[str, PyTree]
+    draw_mask: jax.Array | None = None
+
+    def sample_means(
+        self, inputs: PyTree, key: jax.Array, num_samples: int | None
+    ) -> jax.Array:
+        """Draw the rebuilt posterior's mean predictions at ``inputs``.
+
+        Args:
+            inputs: Model inputs with a leading batch dimension.
+            key: The PRNG key selecting the draws.
+            num_samples: The number of draws of an unlimited posterior, or
+                ``None`` for a finite one.
+
+        Returns:
+            The draws' mean predictions, shaped ``[S, *batch]``, including
+            any slots ``draw_mask`` excludes.
+        """
+        posterior = self.posterior_type(mean_function=self.mean_function, **self.arrays)
+        return posterior.sample_means(inputs, key, num_samples)
+
+
+@runtime_checkable
+class TraceablePosterior(Protocol):
+    """A posterior the posterior stage can predict from in one compiled call.
+
+    Every built-in posterior is one. Any other posterior is drawn from in
+    Python through its ``sample_means``.
+    """
+
+    def _traced(self) -> TracedPosterior:
+        """Return the posterior taken apart for compiled code.
+
+        Returns:
+            Its class and mean function, static, and its arrays, traced.
+        """
+        ...
+
+
 @dataclass(frozen=True)
 class PosteriorProblem:
     """Everything a posterior stage hands its inference method.
@@ -111,6 +179,10 @@ class PosteriorProblem:
             e.g. for a discriminator. A
             [`PosteriorStage`][stagereg.jax.PosteriorStage] always sets it.
             Defaults to ``None``, for problems built by hand.
+        epochs: The number of epochs the stage trains for, so a method can
+            size what it keeps up front, e.g. a sample buffer. A
+            [`PosteriorStage`][stagereg.jax.PosteriorStage] always sets it.
+            Defaults to ``None``: unknown.
     """
 
     initial_parameters: PyTree
@@ -120,6 +192,7 @@ class PosteriorProblem:
     train_loader: LoaderFactory
     dataset_size: int
     aleatoric_variance: Callable[[PyTree], jax.Array] | None = None
+    epochs: int | None = None
 
 
 class InferenceMethod(Protocol):

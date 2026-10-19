@@ -26,6 +26,7 @@ from stagereg.jax.posterior import (
     IsotropicGaussianPrior,
     PosteriorProblem,
     Prior,
+    TracedPosterior,
     default_optimizer,
     draw_unlimited,
     require_inferred_tree,
@@ -86,6 +87,16 @@ class MeanFieldGaussianPosterior:
             return self.mean_function(parameters, inputs, network_key(draw_key))
 
         return draw_unlimited(draw, num_samples)
+
+    def _traced(self) -> TracedPosterior:
+        """Return the posterior taken apart for compiled code.
+
+        Returns:
+            Its class and mean function, static, and its arrays, traced.
+        """
+        return TracedPosterior(
+            type(self), self.mean_function, {"means": self.means, "stds": self.stds}
+        )
 
 
 @dataclass

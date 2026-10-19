@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -79,3 +81,13 @@ def test_training_state_rejects_conflicting_component_registration() -> None:
         state.register_component("mean", object())
     with pytest.raises(ValueError, match="optimizer state 'mean'"):
         state.register_optimizer("mean", object())
+
+
+def test_importing_the_core_imports_no_jax() -> None:
+    probe = "import sys, stagereg.core; print('jax' in sys.modules)"
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe], check=True, capture_output=True, text=True
+    )
+
+    assert result.stdout.strip() == "False"

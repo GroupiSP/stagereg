@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -15,8 +18,10 @@ from stagereg.jax.distributions import (
     GammaHead,
     Gaussian,
     GaussianHead,
+    MomentMatchedPredictive,
     PosteriorPredictive,
 )
+from stagereg.core import Batch
 
 _FINITE = st.floats(min_value=-10.0, max_value=10.0, width=32)
 _POSITIVE = st.floats(min_value=0.0625, max_value=10.0, width=32)
@@ -350,3 +355,67 @@ def test_posterior_predictive_quantile_rejects_probabilities_outside_unit_interv
 
     with pytest.raises(ValueError, match="probability"):
         mixture.quantile(probability)
+
+
+@st.composite
+def distributions(draw: st.DrawFn) -> Any:
+    """Draw any of the JAX backend's distributions, with array-valued fields."""
+    batch = draw(st.integers(1, 4))
+
+    def field(elements: st.SearchStrategy[float], shape: tuple[int, ...]) -> jax.Array:
+        return jnp.asarray(draw(arrays(np.float32, shape, elements=elements)))
+
+    kind = draw(
+        st.sampled_from([Gaussian, Gamma, MomentMatchedPredictive, PosteriorPredictive])
+    )
+    if kind is Gaussian:
+        return Gaussian(loc=field(_FINITE, (batch,)), scale=field(_POSITIVE, (batch,)))
+    if kind is Gamma:
+        return Gamma(
+            concentration=field(_POSITIVE, (batch,)), rate=field(_POSITIVE, (batch,))
+        )
+    if kind is MomentMatchedPredictive:
+        return MomentMatchedPredictive(
+            loc=field(_FINITE, (batch,)),
+            aleatoric_variance=field(_POSITIVE, (batch,)),
+            epistemic_variance=field(_POSITIVE, (batch,)),
+        )
+    num_draws = draw(st.integers(1, 6))
+    return PosteriorPredictive(
+        draws=field(_FINITE, (num_draws, batch)),
+        aleatoric_variance=field(_POSITIVE, (batch,)),
+    )
+
+
+def assert_same_distribution(actual: Any, expected: Any) -> None:
+    """Assert both are the same distribution type with equal array fields."""
+    assert type(actual) is type(expected)
+    for item in dataclasses.fields(expected):
+        np.testing.assert_array_equal(
+            getattr(actual, item.name), getattr(expected, item.name)
+        )
+
+
+@given(distributions())
+def test_distribution_round_trips_through_flatten_and_unflatten(
+    distribution: Any,
+) -> None:
+    leaves, treedef = jax.tree.flatten(distribution)
+
+    assert leaves
+    assert all(isinstance(leaf, jax.Array) for leaf in leaves)
+    assert_same_distribution(jax.tree.unflatten(treedef, leaves), distribution)
+
+
+@settings(deadline=None)
+@given(distributions())
+def test_distribution_passes_through_an_identity_jitted_function(
+    distribution: Any,
+) -> None:
+    assert_same_distribution(jax.jit(lambda value: value)(distribution), distribution)
+
+
+def test_batch_stays_a_single_pytree_leaf() -> None:
+    batch = Batch(inputs=jnp.zeros((2, 1)), targets=jnp.ones((2,)))
+
+    assert jax.tree.leaves(batch) == [batch]

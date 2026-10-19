@@ -298,18 +298,25 @@ class PosteriorPredictive:
     draw_mask: jax.Array | None = None
 
     def __post_init__(self) -> None:
-        """Validate the leading draw axis and the draw mask's shape.
+        """Validate the leading draw axis and the draw mask.
+
+        A traced mask's values are unknown, so only its shape is checked.
 
         Raises:
-            ValueError: If ``draws`` has no leading draw axis or no draws, or
-                if ``draw_mask`` is not shaped ``[S]``.
+            ValueError: If ``draws`` has no leading draw axis or no draws, if
+                ``draw_mask`` is not shaped ``[S]``, or if a concrete
+                ``draw_mask`` includes no draw.
         """
         if jnp.ndim(self.draws) == 0 or jnp.shape(self.draws)[0] == 0:
             raise ValueError("draws must have a non-empty leading draw axis.")
-        if self.draw_mask is not None and jnp.shape(self.draw_mask) != (
-            self.num_draws,
-        ):
+        if self.draw_mask is None:
+            return
+        if jnp.shape(self.draw_mask) != (self.num_draws,):
             raise ValueError("draw_mask must hold one entry per draw slot.")
+        if not isinstance(self.draw_mask, jax.core.Tracer) and not jnp.any(
+            self.draw_mask
+        ):
+            raise ValueError("draw_mask must include at least one draw.")
 
     @property
     def num_draws(self) -> int:

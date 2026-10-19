@@ -466,6 +466,27 @@ def test_a_draw_mask_must_have_one_entry_per_draw() -> None:
         )
 
 
+def test_a_draw_mask_must_include_a_draw() -> None:
+    with pytest.raises(ValueError, match="at least one draw"):
+        PosteriorPredictive(
+            draws=jnp.zeros((3, 2)),
+            aleatoric_variance=jnp.ones(2),
+            draw_mask=jnp.zeros(3, dtype=bool),
+        )
+
+
+def test_a_traced_draw_mask_is_accepted_without_reading_its_values() -> None:
+    @jax.jit
+    def masked_mean(draw_mask: jax.Array) -> jax.Array:
+        return PosteriorPredictive(
+            draws=jnp.array([[1.0], [3.0]]),
+            aleatoric_variance=jnp.ones(1),
+            draw_mask=draw_mask,
+        ).mean()
+
+    np.testing.assert_allclose(masked_mean(jnp.array([True, False])), [1.0])
+
+
 @st.composite
 def distributions(draw: st.DrawFn) -> Any:
     """Draw any of the JAX backend's distributions, with array-valued fields."""

@@ -23,7 +23,7 @@ from stagereg.core.metric_registry import (
     WeightedSpread,
 )
 from stagereg.core.types import Batch
-from stagereg.jax.distributions import Gaussian, PosteriorPredictive
+from stagereg.jax.distributions import Gaussian, GaussianHead, PosteriorPredictive
 from stagereg.jax.metrics import (
     GaussianPredictor,
     MetricSuite,
@@ -31,6 +31,7 @@ from stagereg.jax.metrics import (
     PredictionRequirements,
     merge_epoch_prediction_data,
     reduce_metric_suite,
+    make_epoch_prediction_resolver,
     metric_key,
     resolve_epoch_prediction_data,
 )
@@ -568,3 +569,54 @@ def test_merge_concatenates_log_likelihood_across_batches() -> None:
     merged = merge_epoch_prediction_data(parts)
 
     assert np.array_equal(merged.log_likelihood, np.array([-1.0, -2.0, -2.0]))
+
+
+def test_compiled_resolver_matches_the_cloning_resolver() -> None:
+    model = GaussianHead(1, 1, rngs=nnx.Rngs(0))
+    batch = Batch(
+        inputs=jnp.array([[-1.0], [0.0], [2.0]]),
+        targets=jnp.array([[-0.5], [0.25], [1.5]]),
+    )
+    suite = MetricSuite(
+        epoch=(
+            RootMeanSquaredError(),
+            NegativeLogLikelihood(),
+            IntervalCoverage(level=0.8),
+            PointContinuousRankedProbabilityScore(),
+        ),
+        predictor=GaussianPredictor(),
+        predictive_sample_count=16,
+        evaluation_grid=EvaluationGrid(np.linspace(-5.0, 5.0, 51)),
+    )
+    key = metric_key(jax.random.key(2))
+
+    expected = resolve_epoch_prediction_data(
+        suite=suite, model=model, batch=batch, key=key
+    )
+    actual = make_epoch_prediction_resolver(suite=suite, model=model)(batch, key)
+
+    np.testing.assert_allclose(actual.mean, expected.mean, rtol=1e-6)
+    np.testing.assert_allclose(
+        actual.log_likelihood, expected.log_likelihood, rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        actual.predictive_samples, expected.predictive_samples, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        actual.interval(0.8).lower, expected.interval(0.8).lower, rtol=1e-6
+    )
+
+
+def test_compiled_resolver_reads_the_live_model_state_at_each_call() -> None:
+    model = GaussianHead(1, 1, rngs=nnx.Rngs(0))
+    batch = Batch(inputs=jnp.array([[1.0]]), targets=jnp.array([[0.0]]))
+    suite = MetricSuite(epoch=(RootMeanSquaredError(),), predictor=GaussianPredictor())
+    resolve = make_epoch_prediction_resolver(suite=suite, model=model)
+
+    before = resolve(batch, jax.random.key(0)).mean
+    nnx.update(
+        model, jax.tree.map(lambda leaf: leaf + 1.0, nnx.state(model, nnx.Param))
+    )
+    after = resolve(batch, jax.random.key(0)).mean
+
+    assert not np.allclose(before, after)

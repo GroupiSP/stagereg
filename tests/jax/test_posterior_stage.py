@@ -35,6 +35,7 @@ from stagereg.core.checkpoints import (
     finalized_only,
 )
 from stagereg.core.early_stopping import EarlyStopper
+from stagereg.core.naming import Split, metric_tag
 from stagereg.core.metric_registry import (
     EvaluationGrid,
     NegativeLogLikelihood,
@@ -56,7 +57,11 @@ from stagereg.jax import (
     PosteriorPredictivePredictor,
     PreconditionedSGLD,
 )
-from stagereg.jax.posterior import InferenceMethod, PosteriorProblem
+from stagereg.jax.posterior import (
+    InferenceMethod,
+    PosteriorProblem,
+    TraceablePosterior,
+)
 from stagereg.jax.posterior_stage import PosteriorStage, PosteriorStageOptions
 
 Tracker = Callable[[], Any]
@@ -568,21 +573,21 @@ def test_an_unlimited_posterior_draws_the_configured_count_with_the_same_key_eve
 
 
 def _validation_history(
-    run: VarianceReadyRun, method: InferenceMethod, **options: Any
+    state: TrainingState, stage: PosteriorStage
 ) -> dict[str, list[float]]:
-    """Train a default-validated posterior stage; return its validation history."""
-    stage = PosteriorStage(
-        inference_method=method,
-        train_loader=regression_loader,
-        dataset_size=DATASET_SIZE,
-        options=PosteriorStageOptions(
-            **{"epochs": 3, "validation_loader": regression_loader, **options}
-        ),
-    )
-    stage.prepare(run.state)
-    stage.train(run.state)
+    """Prepare and train ``stage`` on ``state``; return its default validation history.
+
+    Args:
+        state: The variance-ready state to train on.
+        stage: A posterior stage with a validation loader and default metrics.
+
+    Returns:
+        The per-epoch validation ``nll`` and ``crps``, keyed by metric name.
+    """
+    stage.prepare(state)
+    stage.train(state)
     return {
-        name: list(run.state.metric_history[f"posterior/validation/{name}"])
+        name: list(state.metric_history[metric_tag(stage.name, Split.VALIDATION, name)])
         for name in ("nll", "crps")
     }
 
@@ -591,7 +596,11 @@ def test_an_unchanged_posterior_scores_identical_metrics_every_epoch(
     variance_ready_run: MakeVarianceReadyRun,
 ) -> None:
     history = _validation_history(
-        variance_ready_run(), GradientAscentMethod(learning_rate=0.0, offsets=None)
+        variance_ready_run().state,
+        _posterior_stage(
+            GradientAscentMethod(learning_rate=0.0, offsets=None),
+            validation_loader=regression_loader,
+        ),
     )
 
     for values in history.values():
@@ -604,9 +613,12 @@ def test_the_validation_key_selects_the_crps(
 ) -> None:
     def crps(key: jax.Array) -> list[float]:
         return _validation_history(
-            _isolated(shared_variance_ready_run),
-            GradientAscentMethod(offsets=None),
-            validation_key=key,
+            _isolated(shared_variance_ready_run).state,
+            _posterior_stage(
+                GradientAscentMethod(offsets=None),
+                validation_loader=regression_loader,
+                validation_key=key,
+            ),
         )["crps"]
 
     first = crps(jax.random.key(1))
@@ -1432,7 +1444,11 @@ def test_posterior_predictive_validation_compiles_nothing_after_warmup(
 
 @dataclass(frozen=True)
 class OpaquePosterior:
-    """A built-in posterior behind a wrapper that is not a TraceablePosterior."""
+    """A built-in posterior behind a wrapper that is not a TraceablePosterior.
+
+    Attributes:
+        inner: The built-in posterior every call is forwarded to.
+    """
 
     inner: Any
 
@@ -1448,7 +1464,11 @@ class OpaquePosterior:
 
 @dataclass
 class OpaquePosteriorMethod:
-    """A built-in inference method whose posteriors come wrapped as opaque."""
+    """A built-in inference method whose posteriors come wrapped as opaque.
+
+    Attributes:
+        inner: The built-in inference method every attribute is forwarded to.
+    """
 
     inner: Any
 
@@ -1463,20 +1483,20 @@ class OpaquePosteriorMethod:
 def test_compiled_and_uncompiled_validation_agree_under_the_same_key(
     shared_variance_ready_run: VarianceReadyRun, method_name: str
 ) -> None:
-    def history(wrap: bool) -> dict[str, list[float]]:
-        state = _isolated(shared_variance_ready_run).state
-        stage = _compiled_stage(method_name, validation_loader=regression_loader)
-        if wrap:
-            stage.inference_method = OpaquePosteriorMethod(stage.inference_method)
-        stage.prepare(state)
-        stage.train(state)
-        return {
-            name: list(state.metric_history[f"posterior/validation/{name}"])
-            for name in ("nll", "crps")
-        }
+    compiled_stage = _compiled_stage(method_name, validation_loader=regression_loader)
+    wrapped_stage = _compiled_stage(method_name, validation_loader=regression_loader)
+    opaque = OpaquePosteriorMethod(wrapped_stage.inference_method)
+    wrapped_stage.inference_method = opaque
 
-    compiled, uncompiled = history(wrap=False), history(wrap=True)
+    compiled = _validation_history(
+        _isolated(shared_variance_ready_run).state, compiled_stage
+    )
+    uncompiled = _validation_history(
+        _isolated(shared_variance_ready_run).state, wrapped_stage
+    )
 
+    assert isinstance(opaque.inner.posterior(), TraceablePosterior)
+    assert not isinstance(opaque.posterior(), TraceablePosterior)
     for name, values in compiled.items():
         assert len(values) == 4
         assert uncompiled[name] == pytest.approx(values, rel=1e-5)

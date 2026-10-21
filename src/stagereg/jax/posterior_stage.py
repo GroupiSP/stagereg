@@ -155,15 +155,17 @@ class PosteriorStageOptions:
             ValueError: If ``num_draws`` is not positive, or if
                 ``validation_metrics`` registers batch metrics, which need a
                 trained NNX model rather than a posterior.
-            TypeError: If ``validation_key`` is not a typed JAX PRNG key, such
-                as a float array or raw ``uint32`` key data.
+            TypeError: If ``validation_key`` is not a single typed JAX PRNG
+                key, such as a float array, raw ``uint32`` key data or a batch
+                of typed keys.
         """
         if not (
             isinstance(self.validation_key, jax.Array)
             and jnp.issubdtype(self.validation_key.dtype, jax.dtypes.prng_key)
+            and self.validation_key.shape == ()
         ):
             raise TypeError(
-                "validation_key must be a typed JAX PRNG key, such as "
+                "validation_key must be a single typed JAX PRNG key, such as "
                 "jax.random.key(0)."
             )
         if self.num_draws <= 0:

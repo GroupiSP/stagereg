@@ -651,10 +651,14 @@ def test_validation_leaves_the_training_randomness_unchanged(
 
 @pytest.mark.parametrize(
     "key",
-    [jnp.zeros(2), jax.random.key_data(jax.random.key(0))],
-    ids=["float array", "raw uint32 key"],
+    [
+        jnp.zeros(2),
+        jax.random.key_data(jax.random.key(0)),
+        jax.random.split(jax.random.key(0), 2),
+    ],
+    ids=["float array", "raw uint32 key", "batched typed keys"],
 )
-def test_a_validation_key_that_is_not_a_typed_prng_key_is_refused(
+def test_a_validation_key_that_is_not_a_single_typed_prng_key_is_refused(
     key: jax.Array,
 ) -> None:
     with pytest.raises(TypeError, match="validation_key"):

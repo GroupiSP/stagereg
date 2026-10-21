@@ -5,15 +5,20 @@ All notable changes to `stagereg` are recorded here. The format follows
 
 ## [Unreleased]
 
-### Changed
+### Breaking changes
 
 - Posterior validation scores every epoch under one fixed key,
-  `PosteriorStageOptions.validation_key`, which defaults to
-  `jax.random.key(0)`: every epoch, trial and seed scores the same posterior
-  draws and the same predictive samples (ADR 0014, #140). Drawing a new key
-  every epoch is removed, so default posterior validation metrics differ from
-  earlier versions. Validation no longer reads or advances the run's RNG state,
-  so turning it on or off leaves training randomness unchanged.
+  `PosteriorStageOptions.validation_key`, so every epoch, trial and seed
+  scores the same posterior draws and the same predictive samples. Drawing a
+  new key every epoch is removed, so default posterior validation metrics
+  differ from earlier versions. Validation no longer reads or advances the
+  run's RNG state, so turning it on or off leaves training randomness
+  unchanged (ADR 0014, #138).
+
+### Added
+
+- `PosteriorStageOptions.validation_key`: the typed PRNG key posterior
+  validation is scored under, defaulting to `jax.random.key(0)` (#138).
 
 ## [0.3.0] - 2026-10-19
 

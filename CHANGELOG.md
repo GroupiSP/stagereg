@@ -3,6 +3,18 @@
 All notable changes to `stagereg` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- Posterior validation scores every epoch under one fixed key,
+  `PosteriorStageOptions.validation_key`, which defaults to
+  `jax.random.key(0)`: every epoch, trial and seed scores the same posterior
+  draws and the same predictive samples (ADR 0014, #140). Drawing a new key
+  every epoch is removed, so default posterior validation metrics differ from
+  earlier versions. Validation no longer reads or advances the run's RNG state,
+  so turning it on or off leaves training randomness unchanged.
+
 ## [0.3.0] - 2026-10-19
 
 Performance release for the Tier 1 reference workloads (#120): training,

@@ -119,6 +119,19 @@ class PosteriorStageOptions:
             posterior alone.
         checkpoint_key: The key of the best and finalized checkpoints.
             Defaults to ``None``, which resolves to ``posterior/best``.
+        validation_key: The JAX PRNG key every validation is scored under. It
+            is split once into a draw key, which selects the posterior's
+            draws, and a metric key, into which the index of each validation
+            batch is folded to draw that batch's predictive samples. Every
+            epoch, and every run under the same key, therefore scores the same
+            draws and the same predictive samples, so differences between
+            validation metrics reflect the posterior rather than re-drawing.
+            Identical metrics for an unchanged posterior need a
+            ``validation_loader`` yielding the same batches in the same order
+            every epoch; with a shuffling loader the draws stay fixed and only
+            the predictive samples' keys move with the batch order. Validation
+            never reads or advances the run's ``rng_state``. Defaults to
+            ``jax.random.key(0)``; pass another key to score other draws.
     """
 
     epochs: int
@@ -661,11 +674,23 @@ class _PosteriorPredictiveModel(nnx.Module, pytree=False):
 class _PosteriorPredictiveValidation:
     """Score the inference method's current posterior predictive.
 
-    Each epoch draws one key for the posterior's draws, then one key per
-    validation batch for the metrics, both from ``state.rng_state``. An epoch
-    that ends while the method has no posterior yet, such as during an
-    SG-MCMC burn-in, is skipped: it reports no metrics and leaves
-    ``state.rng_state`` unchanged.
+    Every epoch derives the same keys from ``key`` alone: it is split once
+    into a draw key, which fixes the posterior's draws, and a metric key, into
+    which batch ``i``'s index is folded to fix that batch's predictive
+    samples. The same posterior and the same batches in the same order
+    therefore give identical metrics; a shuffling loader keeps the draws fixed
+    and moves only the predictive samples' keys. ``state.rng_state`` is never
+    read or advanced, so training randomness does not depend on whether
+    validation runs. An epoch that ends while the method has no posterior yet,
+    such as during an SG-MCMC burn-in, is skipped and reports no metrics.
+
+    Attributes:
+        inference_method: The method whose current posterior is scored.
+        aleatoric_variance: The frozen aleatoric variance.
+        loader: Factory producing the validation batches.
+        metrics: The epoch metrics the posterior predictive is scored with.
+        num_draws: The number of draws of an unlimited posterior.
+        key: The validation key the draw and metric keys are derived from.
     """
 
     inference_method: InferenceMethod

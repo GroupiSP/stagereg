@@ -1,6 +1,6 @@
 [project]
 name = "stagereg"
-version = "0.3.0"
+version = "0.4.0"
 description = "Stage-oriented probabilistic regression"
 readme = "README.md"
 authors = [

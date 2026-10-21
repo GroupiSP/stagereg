@@ -5,6 +5,8 @@ All notable changes to `stagereg` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-21
+
 ### Breaking changes
 
 - Posterior validation scores every epoch under one fixed key,

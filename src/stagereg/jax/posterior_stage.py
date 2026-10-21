@@ -45,7 +45,6 @@ from stagereg.jax.losses import align_sample_weight
 from stagereg.jax.metrics import (
     MetricSuite,
     PosteriorPredictivePredictor,
-    metric_key,
     reduce_metric_suite,
 )
 from stagereg.jax.posterior import (
@@ -58,7 +57,6 @@ from stagereg.jax.posterior import (
     TracedPosterior,
     require_inferred_tree,
 )
-from stagereg.jax.rng import split_key
 from stagereg.jax.stage_checkpoints import (
     finalized_checkpoint,
     latest_training_result,
@@ -82,6 +80,11 @@ def _default_validation_metrics() -> MetricSuite:
         predictor=PosteriorPredictivePredictor(),
         predictive_sample_count=_DEFAULT_PREDICTIVE_SAMPLE_COUNT,
     )
+
+
+def _default_validation_key() -> jax.Array:
+    """Return the constant key every posterior validation is scored under."""
+    return jax.random.key(0)
 
 
 @dataclass(frozen=True)
@@ -126,15 +129,19 @@ class PosteriorStageOptions:
     event_sinks: Sequence[EventSink] = ()
     checkpoint_store: CheckpointStore | None = None
     checkpoint_key: str | None = None
+    validation_key: jax.Array = field(default_factory=_default_validation_key)
 
     def __post_init__(self) -> None:
-        """Validate the draw count and the validation metrics.
+        """Validate the draw count, the validation metrics and the validation key.
 
         Raises:
             ValueError: If ``num_draws`` is not positive, or if
                 ``validation_metrics`` registers batch metrics, which need a
                 trained NNX model rather than a posterior.
+            TypeError: If ``validation_key`` is not a JAX random key.
         """
+        if not isinstance(self.validation_key, jax.Array):
+            raise TypeError("validation_key must be a JAX random key.")
         if self.num_draws <= 0:
             raise ValueError("num_draws must be positive.")
         if self.validation_metrics.batch:
@@ -270,6 +277,7 @@ class PosteriorStage:
                 loader=options.validation_loader,
                 metrics=options.validation_metrics,
                 num_draws=options.num_draws,
+                key=options.validation_key,
             )
         )
         check_epoch_loop_arguments(
@@ -665,6 +673,7 @@ class _PosteriorPredictiveValidation:
     loader: LoaderFactory
     metrics: MetricSuite
     num_draws: int
+    key: jax.Array
 
     def __call__(self, state: TrainingState, *, epoch: int) -> ValidationResult:
         if not self.inference_method.has_posterior:
@@ -674,21 +683,21 @@ class _PosteriorPredictiveValidation:
                 message="validation skipped: the method has no posterior yet.",
             )
         posterior = self.inference_method.posterior()
-        state.rng_state, draw_key = split_key(state.rng_state)
+        del state
+        draw_key, metric_base_key = jax.random.split(self.key)
         model = _PosteriorPredictiveModel(
             posterior, self.aleatoric_variance, draw_key, self.num_draws
         )
         predictor = self.metrics.predictor
         parts: list[EpochPredictionData] = []
-        for batch in self.loader(split="validation", epoch=epoch):
-            state.rng_state, batch_key = split_key(state.rng_state)
+        for index, batch in enumerate(self.loader(split="validation", epoch=epoch)):
             if predictor is not None:
                 parts.append(
                     predictor(
                         model,
                         batch,
                         self.metrics.prediction_requirements,
-                        metric_key(batch_key),
+                        jax.random.fold_in(metric_base_key, index),
                     )
                 )
         metrics = reduce_metric_suite(

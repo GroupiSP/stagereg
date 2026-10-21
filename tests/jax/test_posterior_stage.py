@@ -540,7 +540,7 @@ def test_the_default_validation_reports_the_nll_and_the_crps_without_a_grid(
         assert all(math.isfinite(value) and value > 0.0 for value in values)
 
 
-def test_an_unlimited_posterior_draws_the_configured_count_with_one_key_per_epoch(
+def test_an_unlimited_posterior_draws_the_configured_count_with_the_same_key_every_epoch(
     variance_ready_run: MakeVarianceReadyRun,
 ) -> None:
     run = variance_ready_run()
@@ -557,13 +557,14 @@ def test_an_unlimited_posterior_draws_the_configured_count_with_one_key_per_epoc
 
     validated = [posterior for posterior in method.posteriors if posterior.calls]
     assert len(validated) == 3
-    for posterior in validated:
-        keys = [jax.random.key_data(key) for key, _ in posterior.calls]
-        assert len(keys) == 2
-        assert all(jnp.array_equal(key, keys[0]) for key in keys)
-        assert {count for _, count in posterior.calls} == {7}
-    first_keys = [jax.random.key_data(p.calls[0][0]) for p in validated]
-    assert not jnp.array_equal(first_keys[0], first_keys[1])
+    keys = [
+        jax.random.key_data(key)
+        for posterior in validated
+        for key, _ in posterior.calls
+    ]
+    assert len(keys) == 3 * 2
+    assert all(jnp.array_equal(key, keys[0]) for key in keys)
+    assert {count for p in validated for _, count in p.calls} == {7}
 
 
 def test_an_early_stopper_is_refused_for_a_method_without_early_stopping(

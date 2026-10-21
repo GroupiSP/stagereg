@@ -125,6 +125,25 @@ without an evaluation grid. To score other metrics, give the options a
 [`PosteriorPredictivePredictor`][stagereg.jax.PosteriorPredictivePredictor];
 [Epoch metrics](epoch-metrics.md) explains how.
 
+Every validation is scored under one fixed key, the options' `validation_key`,
+which defaults to `jax.random.key(0)`. It is split once into a draw key, which
+selects the posterior's draws, and a metric key, into which each validation
+batch's index is folded to draw its predictive samples. Every epoch, and every
+run or HPO trial, therefore scores the same draws and the same predictive
+samples, so early stopping, checkpoint selection and a pruner compare
+posteriors rather than re-drawing noise. The same posterior then scores
+identical metrics only if the validation loader yields the same batches in the
+same order every epoch; with a shuffling loader the draws stay fixed and only
+the predictive samples' keys move with the batch order. Validation never reads
+or advances the run's `rng_state`, so turning it on or off leaves training
+unchanged. Pass another key to see how sensitive the metrics are to the draws:
+
+```{.python notest}
+options = PosteriorStageOptions(
+    epochs=3, validation_loader=loader, validation_key=jax.random.key(7)
+)
+```
+
 ## Predicting with the posterior
 
 Once trained, or restored, the stage predicts with its posterior:

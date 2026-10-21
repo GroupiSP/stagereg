@@ -35,6 +35,7 @@ from stagereg.core.checkpoints import (
     finalized_only,
 )
 from stagereg.core.early_stopping import EarlyStopper
+from stagereg.core.naming import Split, metric_tag
 from stagereg.core.metric_registry import (
     EvaluationGrid,
     NegativeLogLikelihood,
@@ -56,7 +57,11 @@ from stagereg.jax import (
     PosteriorPredictivePredictor,
     PreconditionedSGLD,
 )
-from stagereg.jax.posterior import InferenceMethod, PosteriorProblem
+from stagereg.jax.posterior import (
+    InferenceMethod,
+    PosteriorProblem,
+    TraceablePosterior,
+)
 from stagereg.jax.posterior_stage import PosteriorStage, PosteriorStageOptions
 
 Tracker = Callable[[], Any]
@@ -540,7 +545,7 @@ def test_the_default_validation_reports_the_nll_and_the_crps_without_a_grid(
         assert all(math.isfinite(value) and value > 0.0 for value in values)
 
 
-def test_an_unlimited_posterior_draws_the_configured_count_with_one_key_per_epoch(
+def test_an_unlimited_posterior_draws_the_configured_count_with_the_same_key_every_epoch(
     variance_ready_run: MakeVarianceReadyRun,
 ) -> None:
     run = variance_ready_run()
@@ -557,13 +562,107 @@ def test_an_unlimited_posterior_draws_the_configured_count_with_one_key_per_epoc
 
     validated = [posterior for posterior in method.posteriors if posterior.calls]
     assert len(validated) == 3
-    for posterior in validated:
-        keys = [jax.random.key_data(key) for key, _ in posterior.calls]
-        assert len(keys) == 2
-        assert all(jnp.array_equal(key, keys[0]) for key in keys)
-        assert {count for _, count in posterior.calls} == {7}
-    first_keys = [jax.random.key_data(p.calls[0][0]) for p in validated]
-    assert not jnp.array_equal(first_keys[0], first_keys[1])
+    keys = [
+        jax.random.key_data(key)
+        for posterior in validated
+        for key, _ in posterior.calls
+    ]
+    assert len(keys) == 3 * 2
+    assert all(jnp.array_equal(key, keys[0]) for key in keys)
+    assert {count for p in validated for _, count in p.calls} == {7}
+
+
+def _validation_history(
+    state: TrainingState, stage: PosteriorStage
+) -> dict[str, list[float]]:
+    """Prepare and train ``stage`` on ``state``; return its default validation history.
+
+    Args:
+        state: The variance-ready state to train on.
+        stage: A posterior stage with a validation loader and default metrics.
+
+    Returns:
+        The per-epoch validation ``nll`` and ``crps``, keyed by metric name.
+    """
+    stage.prepare(state)
+    stage.train(state)
+    return {
+        name: list(state.metric_history[metric_tag(stage.name, Split.VALIDATION, name)])
+        for name in ("nll", "crps")
+    }
+
+
+def test_an_unchanged_posterior_scores_identical_metrics_every_epoch(
+    variance_ready_run: MakeVarianceReadyRun,
+) -> None:
+    history = _validation_history(
+        variance_ready_run().state,
+        _posterior_stage(
+            GradientAscentMethod(learning_rate=0.0, offsets=None),
+            validation_loader=regression_loader,
+        ),
+    )
+
+    for values in history.values():
+        assert len(values) == 3
+        assert values == [values[0]] * 3
+
+
+def test_the_validation_key_selects_the_crps(
+    shared_variance_ready_run: VarianceReadyRun,
+) -> None:
+    def crps(key: jax.Array) -> list[float]:
+        return _validation_history(
+            _isolated(shared_variance_ready_run).state,
+            _posterior_stage(
+                GradientAscentMethod(offsets=None),
+                validation_loader=regression_loader,
+                validation_key=key,
+            ),
+        )["crps"]
+
+    first = crps(jax.random.key(1))
+
+    assert crps(jax.random.key(1)) == first
+    assert crps(jax.random.key(2)) != first
+
+
+def test_validation_leaves_the_training_randomness_unchanged(
+    shared_variance_ready_run: VarianceReadyRun,
+) -> None:
+    def train(**options: Any) -> tuple[TrainingState, GradientAscentMethod]:
+        run = _isolated(shared_variance_ready_run)
+        method = GradientAscentMethod(offsets=None)
+        stage = _posterior_stage(method, **options)
+        stage.prepare(run.state)
+        stage.train(run.state)
+        return run.state, method
+
+    validated, validated_method = train(validation_loader=regression_loader)
+    unvalidated, unvalidated_method = train()
+
+    assert "posterior/validation/crps" in validated.metric_history
+    assert jnp.array_equal(
+        jax.random.key_data(validated.rng_state),
+        jax.random.key_data(unvalidated.rng_state),
+    )
+    assert leaves_equal(validated_method.parameters, unvalidated_method.parameters)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        jnp.zeros(2),
+        jax.random.key_data(jax.random.key(0)),
+        jax.random.split(jax.random.key(0), 2),
+    ],
+    ids=["float array", "raw uint32 key", "batched typed keys"],
+)
+def test_a_validation_key_that_is_not_a_single_typed_prng_key_is_refused(
+    key: jax.Array,
+) -> None:
+    with pytest.raises(TypeError, match="validation_key"):
+        PosteriorStageOptions(epochs=1, validation_key=key)
 
 
 def test_an_early_stopper_is_refused_for_a_method_without_early_stopping(
@@ -1345,6 +1444,66 @@ def test_posterior_predictive_validation_compiles_nothing_after_warmup(
     assert counter.during_warmup("posterior") > 0
     assert counter.after_warmup("posterior") == 0
     assert len(state.metric_history["posterior/validation/nll"]) == 4
+
+
+@dataclass(frozen=True)
+class OpaquePosterior:
+    """A built-in posterior behind a wrapper that is not a TraceablePosterior.
+
+    Attributes:
+        inner: The built-in posterior every call is forwarded to.
+    """
+
+    inner: Any
+
+    @property
+    def num_draws(self) -> int | None:
+        return self.inner.num_draws
+
+    def sample_means(
+        self, inputs: PyTree, key: jax.Array, num_samples: int | None = None
+    ) -> jax.Array:
+        return self.inner.sample_means(inputs, key, num_samples)
+
+
+@dataclass
+class OpaquePosteriorMethod:
+    """A built-in inference method whose posteriors come wrapped as opaque.
+
+    Attributes:
+        inner: The built-in inference method every attribute is forwarded to.
+    """
+
+    inner: Any
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    def posterior(self) -> OpaquePosterior:
+        return OpaquePosterior(self.inner.posterior())
+
+
+@pytest.mark.parametrize("method_name", sorted(_COMPILED_METHODS))
+def test_compiled_and_uncompiled_validation_agree_under_the_same_key(
+    shared_variance_ready_run: VarianceReadyRun, method_name: str
+) -> None:
+    compiled_stage = _compiled_stage(method_name, validation_loader=regression_loader)
+    wrapped_stage = _compiled_stage(method_name, validation_loader=regression_loader)
+    opaque = OpaquePosteriorMethod(wrapped_stage.inference_method)
+    wrapped_stage.inference_method = opaque
+
+    compiled = _validation_history(
+        _isolated(shared_variance_ready_run).state, compiled_stage
+    )
+    uncompiled = _validation_history(
+        _isolated(shared_variance_ready_run).state, wrapped_stage
+    )
+
+    assert isinstance(opaque.inner.posterior(), TraceablePosterior)
+    assert not isinstance(opaque.posterior(), TraceablePosterior)
+    for name, values in compiled.items():
+        assert len(values) == 4
+        assert uncompiled[name] == pytest.approx(values, rel=1e-5)
 
 
 @dataclass

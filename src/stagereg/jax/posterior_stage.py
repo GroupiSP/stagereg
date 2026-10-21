@@ -45,7 +45,6 @@ from stagereg.jax.losses import align_sample_weight
 from stagereg.jax.metrics import (
     MetricSuite,
     PosteriorPredictivePredictor,
-    metric_key,
     reduce_metric_suite,
 )
 from stagereg.jax.posterior import (
@@ -58,7 +57,6 @@ from stagereg.jax.posterior import (
     TracedPosterior,
     require_inferred_tree,
 )
-from stagereg.jax.rng import split_key
 from stagereg.jax.stage_checkpoints import (
     finalized_checkpoint,
     latest_training_result,
@@ -82,6 +80,15 @@ def _default_validation_metrics() -> MetricSuite:
         predictor=PosteriorPredictivePredictor(),
         predictive_sample_count=_DEFAULT_PREDICTIVE_SAMPLE_COUNT,
     )
+
+
+def _default_validation_key() -> jax.Array:
+    """Return the constant key every posterior validation is scored under.
+
+    Returns:
+        The typed PRNG key ``jax.random.key(0)``.
+    """
+    return jax.random.key(0)
 
 
 @dataclass(frozen=True)
@@ -116,6 +123,19 @@ class PosteriorStageOptions:
             posterior alone.
         checkpoint_key: The key of the best and finalized checkpoints.
             Defaults to ``None``, which resolves to ``posterior/best``.
+        validation_key: The typed JAX PRNG key every validation is scored
+            under. It is split once into a draw key, which selects the
+            posterior's draws, and a metric key, into which the index of each validation
+            batch is folded to draw that batch's predictive samples. Every
+            epoch, and every run under the same key, therefore scores the same
+            draws and the same predictive samples, so differences between
+            validation metrics reflect the posterior rather than re-drawing.
+            Identical metrics for an unchanged posterior need a
+            ``validation_loader`` yielding the same batches in the same order
+            every epoch; with a shuffling loader the draws stay fixed and only
+            the predictive samples' keys move with the batch order. Validation
+            never reads or advances the run's ``rng_state``. Defaults to
+            ``jax.random.key(0)``; pass another key to score other draws.
     """
 
     epochs: int
@@ -126,15 +146,28 @@ class PosteriorStageOptions:
     event_sinks: Sequence[EventSink] = ()
     checkpoint_store: CheckpointStore | None = None
     checkpoint_key: str | None = None
+    validation_key: jax.Array = field(default_factory=_default_validation_key)
 
     def __post_init__(self) -> None:
-        """Validate the draw count and the validation metrics.
+        """Validate the draw count, the validation metrics and the validation key.
 
         Raises:
             ValueError: If ``num_draws`` is not positive, or if
                 ``validation_metrics`` registers batch metrics, which need a
                 trained NNX model rather than a posterior.
+            TypeError: If ``validation_key`` is not a single typed JAX PRNG
+                key, such as a float array, raw ``uint32`` key data or a batch
+                of typed keys.
         """
+        if not (
+            isinstance(self.validation_key, jax.Array)
+            and jnp.issubdtype(self.validation_key.dtype, jax.dtypes.prng_key)
+            and self.validation_key.shape == ()
+        ):
+            raise TypeError(
+                "validation_key must be a single typed JAX PRNG key, such as "
+                "jax.random.key(0)."
+            )
         if self.num_draws <= 0:
             raise ValueError("num_draws must be positive.")
         if self.validation_metrics.batch:
@@ -270,6 +303,7 @@ class PosteriorStage:
                 loader=options.validation_loader,
                 metrics=options.validation_metrics,
                 num_draws=options.num_draws,
+                key=options.validation_key,
             )
         )
         check_epoch_loop_arguments(
@@ -653,11 +687,19 @@ class _PosteriorPredictiveModel(nnx.Module, pytree=False):
 class _PosteriorPredictiveValidation:
     """Score the inference method's current posterior predictive.
 
-    Each epoch draws one key for the posterior's draws, then one key per
-    validation batch for the metrics, both from ``state.rng_state``. An epoch
-    that ends while the method has no posterior yet, such as during an
-    SG-MCMC burn-in, is skipped: it reports no metrics and leaves
-    ``state.rng_state`` unchanged.
+    Every epoch derives the same draw and per-batch metric keys from ``key``
+    alone, as ``PosteriorStageOptions.validation_key`` describes, and never
+    reads or advances ``state.rng_state``. An epoch that ends while the method
+    has no posterior yet, such as during an SG-MCMC burn-in, is skipped and
+    reports no metrics.
+
+    Attributes:
+        inference_method: The method whose current posterior is scored.
+        aleatoric_variance: The frozen aleatoric variance.
+        loader: Factory producing the validation batches.
+        metrics: The epoch metrics the posterior predictive is scored with.
+        num_draws: The number of draws of an unlimited posterior.
+        key: The validation key the draw and metric keys are derived from.
     """
 
     inference_method: InferenceMethod
@@ -665,6 +707,7 @@ class _PosteriorPredictiveValidation:
     loader: LoaderFactory
     metrics: MetricSuite
     num_draws: int
+    key: jax.Array
 
     def __call__(self, state: TrainingState, *, epoch: int) -> ValidationResult:
         if not self.inference_method.has_posterior:
@@ -674,21 +717,21 @@ class _PosteriorPredictiveValidation:
                 message="validation skipped: the method has no posterior yet.",
             )
         posterior = self.inference_method.posterior()
-        state.rng_state, draw_key = split_key(state.rng_state)
+        del state
+        draw_key, metric_base_key = jax.random.split(self.key)
         model = _PosteriorPredictiveModel(
             posterior, self.aleatoric_variance, draw_key, self.num_draws
         )
         predictor = self.metrics.predictor
         parts: list[EpochPredictionData] = []
-        for batch in self.loader(split="validation", epoch=epoch):
-            state.rng_state, batch_key = split_key(state.rng_state)
+        for index, batch in enumerate(self.loader(split="validation", epoch=epoch)):
             if predictor is not None:
                 parts.append(
                     predictor(
                         model,
                         batch,
                         self.metrics.prediction_requirements,
-                        metric_key(batch_key),
+                        jax.random.fold_in(metric_base_key, index),
                     )
                 )
         metrics = reduce_metric_suite(

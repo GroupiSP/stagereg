@@ -685,15 +685,11 @@ class _PosteriorPredictiveModel(nnx.Module, pytree=False):
 class _PosteriorPredictiveValidation:
     """Score the inference method's current posterior predictive.
 
-    Every epoch derives the same keys from ``key`` alone: it is split once
-    into a draw key, which fixes the posterior's draws, and a metric key, into
-    which batch ``i``'s index is folded to fix that batch's predictive
-    samples. The same posterior and the same batches in the same order
-    therefore give identical metrics; a shuffling loader keeps the draws fixed
-    and moves only the predictive samples' keys. ``state.rng_state`` is never
-    read or advanced, so training randomness does not depend on whether
-    validation runs. An epoch that ends while the method has no posterior yet,
-    such as during an SG-MCMC burn-in, is skipped and reports no metrics.
+    Every epoch derives the same draw and per-batch metric keys from ``key``
+    alone, as ``PosteriorStageOptions.validation_key`` describes, and never
+    reads or advances ``state.rng_state``. An epoch that ends while the method
+    has no posterior yet, such as during an SG-MCMC burn-in, is skipped and
+    reports no metrics.
 
     Attributes:
         inference_method: The method whose current posterior is scored.

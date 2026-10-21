@@ -637,6 +637,18 @@ def test_validation_leaves_the_training_randomness_unchanged(
     assert leaves_equal(validated_method.parameters, unvalidated_method.parameters)
 
 
+@pytest.mark.parametrize(
+    "key",
+    [jnp.zeros(2), jax.random.key_data(jax.random.key(0))],
+    ids=["float array", "raw uint32 key"],
+)
+def test_a_validation_key_that_is_not_a_typed_prng_key_is_refused(
+    key: jax.Array,
+) -> None:
+    with pytest.raises(TypeError, match="validation_key"):
+        PosteriorStageOptions(epochs=1, validation_key=key)
+
+
 def test_an_early_stopper_is_refused_for_a_method_without_early_stopping(
     variance_ready_run: MakeVarianceReadyRun,
 ) -> None:

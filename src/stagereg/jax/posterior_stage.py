@@ -83,7 +83,11 @@ def _default_validation_metrics() -> MetricSuite:
 
 
 def _default_validation_key() -> jax.Array:
-    """Return the constant key every posterior validation is scored under."""
+    """Return the constant key every posterior validation is scored under.
+
+    Returns:
+        The typed PRNG key ``jax.random.key(0)``.
+    """
     return jax.random.key(0)
 
 
@@ -119,9 +123,9 @@ class PosteriorStageOptions:
             posterior alone.
         checkpoint_key: The key of the best and finalized checkpoints.
             Defaults to ``None``, which resolves to ``posterior/best``.
-        validation_key: The JAX PRNG key every validation is scored under. It
-            is split once into a draw key, which selects the posterior's
-            draws, and a metric key, into which the index of each validation
+        validation_key: The typed JAX PRNG key every validation is scored
+            under. It is split once into a draw key, which selects the
+            posterior's draws, and a metric key, into which the index of each validation
             batch is folded to draw that batch's predictive samples. Every
             epoch, and every run under the same key, therefore scores the same
             draws and the same predictive samples, so differences between
@@ -151,10 +155,17 @@ class PosteriorStageOptions:
             ValueError: If ``num_draws`` is not positive, or if
                 ``validation_metrics`` registers batch metrics, which need a
                 trained NNX model rather than a posterior.
-            TypeError: If ``validation_key`` is not a JAX random key.
+            TypeError: If ``validation_key`` is not a typed JAX PRNG key, such
+                as a float array or raw ``uint32`` key data.
         """
-        if not isinstance(self.validation_key, jax.Array):
-            raise TypeError("validation_key must be a JAX random key.")
+        if not (
+            isinstance(self.validation_key, jax.Array)
+            and jnp.issubdtype(self.validation_key.dtype, jax.dtypes.prng_key)
+        ):
+            raise TypeError(
+                "validation_key must be a typed JAX PRNG key, such as "
+                "jax.random.key(0)."
+            )
         if self.num_draws <= 0:
             raise ValueError("num_draws must be positive.")
         if self.validation_metrics.batch:

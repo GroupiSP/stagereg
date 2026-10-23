@@ -70,22 +70,34 @@ the two stages, once each with Bayes by Backprop, pSGLD and MC-Dropout:
 uv run --extra jax --extra plot python examples/jax/xsin/posterior.py
 ```
 
-For each inference method it prints the NLL and the CRPS of the variance
-stage's Gaussian and of the posterior predictive, scored on one noisy
+For each inference method it prints the NLL and the closed-form CRPS of the
+variance stage's Gaussian and of the posterior predictive, scored on one noisy
 observation per evaluation point, overall, inside the training domain and
-outside it. It plots the moment-matched predictive's 95% band over the variance
-stage's band, with the aleatoric and epistemic variance below. Under the
-seeded configuration Bayes by Backprop and pSGLD lower the overall NLL, in the
-extrapolation region, where the variance stage's band is far too narrow. Bayes
-by Backprop leaves the overall CRPS about unchanged and pSGLD raises it. Their
-epistemic variances both grow away from the training data. pSGLD's grows the most
-relative to its variance inside the training domain, where its scores improve
-too; Bayes by Backprop's is also spread through the training domain and worsens
-both scores there. MC-Dropout, with one dropout layer before the output layer
-of the mean network, lowers the overall NLL far more, by almost an order of
-magnitude, and lowers the overall CRPS too: its epistemic variance grows steeply
-outside the training domain, widening its band there, while inside it both
-scores worsen slightly. All three bands remain too narrow far into
+outside it. Both stages use the same exact CRPS, computed from each predictive's
+own formula, so their difference reflects the predictives rather than the
+estimator. It plots the moment-matched predictive's 95% band over the variance
+stage's band, with the aleatoric and epistemic variance below.
+
+Under the seeded configuration the scores are:
+
+| Predictive | NLL | CRPS | Interpolation NLL | Interpolation CRPS | Extrapolation NLL | Extrapolation CRPS |
+| --- | --- | --- | --- | --- | --- | --- |
+| Variance stage | 188.38 | 5.512 | 1.005 | 0.376 | 374.52 | 10.614 |
+| Bayes by Backprop | 170.91 | 5.539 | 1.048 | 0.388 | 339.65 | 10.655 |
+| pSGLD | 184.26 | 5.926 | 0.948 | 0.345 | 366.36 | 11.471 |
+| MC-Dropout | 23.60 | 4.338 | 1.089 | 0.393 | 45.97 | 8.256 |
+
+Bayes by Backprop and pSGLD lower the overall NLL, in the extrapolation region,
+where the variance stage's band is far too narrow. Bayes by Backprop leaves the
+overall CRPS about unchanged and pSGLD raises it, through a worse extrapolation
+CRPS. Their epistemic variances both grow away from the training data. pSGLD's
+grows the most relative to its variance inside the training domain, where both
+its scores improve; Bayes by Backprop's is also spread through the training
+domain and worsens both scores there. MC-Dropout, with one dropout layer before
+the output layer of the mean network, lowers the overall NLL far more, by about
+a factor of eight, and lowers the overall CRPS too: its epistemic variance grows
+steeply outside the training domain, widening its band there, while inside it
+both scores worsen slightly. All three bands remain too narrow far into
 extrapolation, where the trained mean continues the oscillation poorly.
 
 Source:

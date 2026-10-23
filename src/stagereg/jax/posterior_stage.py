@@ -125,14 +125,14 @@ class PosteriorStageOptions:
             under. It is split once into a draw key, which selects the
             posterior's draws, and a metric key, into which the index of each validation
             batch is folded to draw that batch's predictive samples, if the
-            metrics need any. Every
-            epoch, and every run under the same key, therefore scores the same
-            draws and the same predictive samples, so differences between
-            validation metrics reflect the posterior rather than re-drawing.
-            Identical metrics for an unchanged posterior need a
-            ``validation_loader`` yielding the same batches in the same order
-            every epoch; with a shuffling loader the draws stay fixed and only
-            the predictive samples' keys move with the batch order. Validation
+            metrics need any. Every epoch, and every run under the same key,
+            therefore scores the same draws, and the same predictive samples
+            when a metric draws any, so differences between validation metrics
+            reflect the posterior rather than re-drawing. When the metrics draw
+            predictive samples, identical metrics for an unchanged posterior
+            need a ``validation_loader`` yielding the same batches in the same
+            order every epoch; with a shuffling loader the draws stay fixed and
+            only the predictive samples' keys move with the batch order. Validation
             never reads or advances the run's ``rng_state``. Defaults to
             ``jax.random.key(0)``; pass another key to score other draws.
     """

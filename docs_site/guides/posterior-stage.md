@@ -134,12 +134,13 @@ which defaults to `jax.random.key(0)`. It is split once into a draw key, which
 selects the posterior's draws, and a metric key, into which each validation
 batch's index is folded to draw its predictive samples when a metric needs
 them; the default suite needs none, so only the draws depend on the key. Every
-epoch, and every run or HPO trial, therefore scores the same draws and the same
-predictive samples, so early stopping, checkpoint selection and a pruner compare
-posteriors rather than re-drawing noise. The same posterior then scores
-identical metrics only if the validation loader yields the same batches in the
-same order every epoch; with a shuffling loader the draws stay fixed and only
-the predictive samples' keys move with the batch order. Validation never reads
+epoch, and every run or HPO trial, therefore scores the same draws, and the
+same predictive samples when a metric draws any, so early stopping, checkpoint
+selection and a pruner compare posteriors rather than re-drawing noise. When a
+metric draws predictive samples, the same posterior scores identical metrics
+only if the validation loader yields the same batches in the same order every
+epoch; with a shuffling loader the draws stay fixed and only the predictive
+samples' keys move with the batch order. Validation never reads
 or advances the run's `rng_state`, so turning it on or off leaves training
 unchanged. Pass another key to see how sensitive the metrics are to the draws:
 

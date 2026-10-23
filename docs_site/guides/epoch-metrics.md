@@ -32,7 +32,9 @@ The epoch metrics in `stagereg.core` are
 [`NegativeLogLikelihood`][stagereg.core.NegativeLogLikelihood],
 [`IntervalCoverage`][stagereg.core.IntervalCoverage],
 [`WeightedSpread`][stagereg.core.WeightedSpread],
-[`PointContinuousRankedProbabilityScore`][stagereg.core.PointContinuousRankedProbabilityScore]
+[`PointContinuousRankedProbabilityScore`][stagereg.core.PointContinuousRankedProbabilityScore],
+[`SampleContinuousRankedProbabilityScore`][stagereg.core.SampleContinuousRankedProbabilityScore],
+[`ClosedFormContinuousRankedProbabilityScore`][stagereg.core.ClosedFormContinuousRankedProbabilityScore]
 and
 [`ContinuousRankedProbabilityScore`][stagereg.core.ContinuousRankedProbabilityScore].
 
@@ -118,6 +120,8 @@ their union:
 | `IntervalCoverage(level)` | an interval at exactly `level` |
 | `WeightedSpread(level)` | an interval at `level` and a coordinate |
 | `PointContinuousRankedProbabilityScore` | predictive samples and an evaluation grid |
+| `SampleContinuousRankedProbabilityScore` | predictive samples |
+| `ClosedFormContinuousRankedProbabilityScore` | each target's closed-form CRPS; no samples, no grid |
 | `ContinuousRankedProbabilityScore` | predictive samples, reference samples and an evaluation grid |
 
 Intervals cost nothing to configure: `GaussianPredictor` computes the exact
@@ -199,6 +203,72 @@ import numpy as np
 from stagereg.core import expected_sample_crps
 
 scores = expected_sample_crps(np.array([[1.0, 2.0, 3.0]]), np.array([[1.0, 3.0]]))
+```
+
+### Closed-form CRPS: no samples at all
+
+`SampleContinuousRankedProbabilityScore` is exact for the empirical
+distribution of the samples, not for the predictive itself. Its value carries
+Monte Carlo noise, and the energy form's plug-in bias favours narrow
+predictives, so two runs, or two checkpoints of one run, compare numbers that
+moved partly because different samples were drawn. When the predictive
+distribution has a CRPS formula of its own, as a Gaussian does,
+[`ClosedFormContinuousRankedProbabilityScore`][stagereg.core.ClosedFormContinuousRankedProbabilityScore]
+(`closed_form_crps`) scores each target with that formula instead. It needs
+neither a sample count nor a grid:
+
+```python
+from stagereg.core import ClosedFormContinuousRankedProbabilityScore
+from stagereg.jax import GaussianPredictor, MetricSuite
+
+suite = MetricSuite(
+    epoch=(ClosedFormContinuousRankedProbabilityScore(),),
+    predictor=GaussianPredictor(),
+)
+```
+
+The predictor computes each scoring unit's CRPS on the device, in the same
+compiled call as the mean and the log-likelihood, and the metric averages it
+over every scoring unit of the split.
+
+Prefer it whenever your distribution offers it: it is what early stopping,
+checkpoint selection and pruning should compare. Keep
+`SampleContinuousRankedProbabilityScore` for a predictive that can only be
+sampled.
+
+A distribution offers the closed form by implementing the optional
+[`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS] protocol: a `crps(targets)`
+method that takes one target per scoring unit, shaped `[*batch]`, or `R`
+reference samples per scoring unit, shaped `[R, *batch]`, and returns each
+unit's expected CRPS, shaped `[*batch]`.
+[`Gaussian`][stagereg.jax.Gaussian] implements it;
+[`PredictiveDistribution`][stagereg.core.PredictiveDistribution] does not
+require it. When the model's distribution has no `crps` method, the predictor
+raises a `TypeError` that names the distribution's class and points to
+`SampleContinuousRankedProbabilityScore`. It never falls back to a sample
+estimate, so a value reported as `closed_form_crps` is always the exact score
+([ADR 0015](https://github.com/GroupiSP/stagereg/blob/main/docs/adr/0015-the-closed-form-crps-never-falls-back-to-sampling.md)).
+
+Outside a training run,
+[`expected_gaussian_mixture_crps`][stagereg.core.expected_gaussian_mixture_crps]
+computes the same score with NumPy alone. It takes `(units, M)` draw means, a
+`(units,)` variance shared by every draw of a unit and `(units, R)` reference
+samples, and returns each unit's expected CRPS of the equally weighted mixture
+(Grimit et al. 2006). One draw is a Gaussian, and one reference sample is an
+observed target:
+
+```python
+import numpy as np
+
+from stagereg.core import expected_gaussian_mixture_crps
+
+# A standard normal scored at its own mean: (sqrt(2) - 1) / sqrt(pi).
+scores = expected_gaussian_mixture_crps(
+    draw_means=np.array([[0.0]]),
+    variance=np.array([1.0]),
+    reference_samples=np.array([[0.0]]),
+)
+assert np.allclose(scores, (np.sqrt(2.0) - 1.0) / np.sqrt(np.pi))
 ```
 
 ### Spread: an explicit coordinate

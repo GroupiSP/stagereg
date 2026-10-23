@@ -10,8 +10,11 @@ from types import ModuleType
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import nnx
+
+from stagereg.core import expected_gaussian_mixture_crps
 
 _XSIN_DIR = Path(__file__).parents[2] / "examples" / "jax" / "xsin"
 
@@ -222,3 +225,30 @@ def test_xsin_posteriors_share_supervised_stages_trained_once() -> None:
     alone = run_xsin_posterior(data, config, xsin_psgld(config))
     assert jnp.allclose(results["pSGLD"].mean, alone.mean)
     assert jnp.allclose(results["pSGLD"].epistemic_variance, alone.epistemic_variance)
+
+
+def test_xsin_posterior_scores_the_variance_stage_with_the_closed_form_crps() -> None:
+    config = XSinConfig(
+        train_size=128,
+        evaluation_size=41,
+        batch_size=32,
+        hidden_features=8,
+        mean_epochs=3,
+        variance_epochs=3,
+        posterior_epochs=1,
+        posterior_num_draws=4,
+        seed=3,
+    )
+    data = make_xsin_data(config)
+
+    result = run_xsin_posterior(data, config, xsin_bayes_by_backprop(config))
+
+    stage = result.variance_stage
+    expected = expected_gaussian_mixture_crps(
+        np.asarray(stage.mean).reshape(-1, 1),
+        np.asarray(stage.variance).reshape(-1),
+        np.asarray(data.evaluation_targets).reshape(-1, 1),
+    )
+    assert result.variance_stage_scores.crps == pytest.approx(
+        float(expected.mean()), rel=1e-5
+    )

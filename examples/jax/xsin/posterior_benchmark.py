@@ -1,8 +1,8 @@
 """The posterior stage on the XSin-inspired benchmark.
 
 Bayes by Backprop, pSGLD and MC-Dropout inference methods, MC-Dropout's
-posterior network, a mean, variance and posterior run, the NLL and point CRPS
-of its predictives, and a plot of the posterior predictive band against the
+posterior network, a mean, variance and posterior run, the NLL and closed-form
+CRPS of its predictives, and a plot of the posterior predictive band against the
 variance stage's band. The data, models and the two stages it starts from live
 in ``benchmark.py``.
 """
@@ -14,7 +14,6 @@ from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 from benchmark import (
     INTERVAL_MULTIPLIER,
@@ -32,9 +31,8 @@ from benchmark import (
 from flax import nnx
 
 from stagereg.core import (
-    EvaluationGrid,
+    ClosedFormContinuousRankedProbabilityScore,
     NegativeLogLikelihood,
-    PointContinuousRankedProbabilityScore,
 )
 from stagereg.core.tracking import EventSink
 from stagereg.core.types import Batch, TrainingState
@@ -53,17 +51,14 @@ from stagereg.jax import (
     evaluate_loader,
 )
 
-CRPS_GRID = EvaluationGrid(np.linspace(-40.0, 40.0, 801))
-"""Target grid the point CRPS is integrated over; it covers every XSin target."""
-
 
 @dataclass(frozen=True)
 class XSinScores:
-    """NLL and point CRPS of a predictive distribution on the evaluation targets.
+    """NLL and closed-form CRPS of a predictive distribution on the evaluation targets.
 
     Attributes:
         nll: Mean negative log-likelihood over the whole evaluation grid.
-        crps: Mean point CRPS over the whole evaluation grid.
+        crps: Mean closed-form CRPS over the whole evaluation grid.
         interpolation_nll: NLL inside the training domain.
         interpolation_crps: CRPS inside the training domain.
         extrapolation_nll: NLL outside the training domain.
@@ -398,15 +393,17 @@ def _fork(state: TrainingState) -> TrainingState:
 def _score_suite(
     predictor: GaussianPredictor | PosteriorPredictivePredictor,
 ) -> MetricSuite:
-    """Register the NLL and the point CRPS, reported as ``nll`` and ``crps``."""
+    """Register the NLL and the closed-form CRPS, reported as ``nll`` and ``crps``.
+
+    Both stages are scored with the same exact CRPS, so the difference between them
+    reflects the predictives, not the estimator.
+    """
     return MetricSuite(
         epoch=(
             NegativeLogLikelihood(),
-            PointContinuousRankedProbabilityScore(name="crps"),
+            ClosedFormContinuousRankedProbabilityScore(name="crps"),
         ),
         predictor=predictor,
-        predictive_sample_count=128,
-        evaluation_grid=CRPS_GRID,
     )
 
 

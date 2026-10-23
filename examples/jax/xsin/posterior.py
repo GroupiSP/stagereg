@@ -5,7 +5,7 @@ The VeBNN-style workflow: the mean and Gamma variance stages of
 trained mean with a posterior over mean functions, inferred in turn by Bayes by
 Backprop, pSGLD and MC-Dropout, the last on the mean network with batch-shared
 dropout. All three posterior stages start from the same finalized stages. Each run
-prints the NLL and CRPS of the variance stage's Gaussian and of the posterior
+prints the NLL and closed-form CRPS of the variance stage's Gaussian and of the posterior
 predictive on noisy evaluation targets, and plots the posterior predictive band
 against the variance stage's band.
 

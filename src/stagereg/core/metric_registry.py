@@ -169,6 +169,9 @@ class EpochPredictionData:
             distribution at its target, computed from the distribution's own
             formula (see [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS]).
             Defaults to ``None`` when no metric requires it.
+        closed_form_crps_against_reference: Whether ``closed_form_crps`` scored
+            each unit's reference samples rather than its target. Defaults to
+            ``False``.
     """
 
     targets: FloatArray
@@ -181,6 +184,7 @@ class EpochPredictionData:
     evaluation_grid: EvaluationGrid | None = None
     log_likelihood: FloatArray | None = None
     closed_form_crps: FloatArray | None = None
+    closed_form_crps_against_reference: bool = False
 
     def __post_init__(self) -> None:
         """Validate all fields against the common scoring-unit axis.
@@ -548,7 +552,9 @@ class ClosedFormContinuousRankedProbabilityScore:
 
     Each unit is scored by its predictive distribution's own CRPS formula, so the
     value carries no Monte Carlo noise and needs neither predictive samples nor
-    an evaluation grid. The predictor's distribution must implement
+    an evaluation grid. With ``against_reference`` set, each unit is scored
+    against its reference samples instead of its target, giving the exact
+    expected CRPS under the reference distribution. The predictor's distribution must implement
     [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS]; otherwise the predictor
     raises a ``TypeError`` rather than fall back to a sample estimate (ADR 0015).
     For a distribution without a closed form, use
@@ -557,23 +563,40 @@ class ClosedFormContinuousRankedProbabilityScore:
     Attributes:
         name: Bare metric name the value is reported under. Defaults to
             ``closed_form_crps``.
+        against_reference: Whether to score each unit's reference samples
+            instead of its observed target. The predictor then needs a
+            reference samples extractor. Defaults to ``False``.
     """
 
     name: str = "closed_form_crps"
+    against_reference: bool = False
 
     @property
     def requirements(self) -> MetricRequirements:
-        """Require each scoring unit's closed-form CRPS only."""
-        return MetricRequirements(closed_form_crps=True)
+        """Require the closed-form CRPS, and reference samples to score against."""
+        return MetricRequirements(
+            closed_form_crps=True, reference_samples=self.against_reference
+        )
 
     def __call__(self, data: EpochPredictionData, /) -> float:
         """Average the closed-form CRPS over scoring units.
 
         Raises:
-            ValueError: If the closed-form CRPS is absent.
+            ValueError: If the closed-form CRPS is absent, or scored the target
+                when this metric asks for the reference samples, or the reverse.
         """
         if data.closed_form_crps is None:
             raise ValueError("Closed-form CRPS requires closed_form_crps.")
+        if data.closed_form_crps_against_reference != self.against_reference:
+            scored, wanted = (
+                ("reference samples", "target")
+                if data.closed_form_crps_against_reference
+                else ("target", "reference samples")
+            )
+            raise ValueError(
+                f"closed_form_crps scored the {scored}, but this metric scores "
+                f"the {wanted}."
+            )
         return float(np.mean(data.closed_form_crps))
 
 

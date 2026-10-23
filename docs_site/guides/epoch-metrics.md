@@ -121,7 +121,7 @@ their union:
 | `WeightedSpread(level)` | an interval at `level` and a coordinate |
 | `PointContinuousRankedProbabilityScore` | predictive samples and an evaluation grid |
 | `SampleContinuousRankedProbabilityScore` | predictive samples |
-| `ClosedFormContinuousRankedProbabilityScore` | each target's closed-form CRPS; no samples, no grid |
+| `ClosedFormContinuousRankedProbabilityScore` | each unit's closed-form CRPS, plus reference samples with `against_reference=True`; no predictive samples, no grid |
 | `ContinuousRankedProbabilityScore` | predictive samples, reference samples and an evaluation grid |
 
 Intervals cost nothing to configure: `GaussianPredictor` computes the exact
@@ -172,7 +172,9 @@ reference distribution of the target, which only exists when you know how the
 data were generated, as in a simulated benchmark. Those reference samples come
 from a `reference_samples_extractor` you give the predictor, a
 [`ReferenceSamplesExtractor`][stagereg.jax.ReferenceSamplesExtractor] that maps a
-batch and a key to a `(n_scoring_units, n_samples)` array.
+batch and a key to a `(n_scoring_units, n_samples)` array. A suite whose
+metrics need reference samples fails when it is built if the predictor has no
+extractor.
 
 `SampleContinuousRankedProbabilityScore` (`sample_crps`) scores the same
 pair as `point_crps` but needs no grid: it uses the energy form
@@ -281,6 +283,46 @@ targets = jnp.array([2.0])
 mixture_crps = bimodal.crps(targets)
 summary_crps = bimodal.moment_matched().crps(targets)
 assert mixture_crps < summary_crps
+```
+
+In a simulated benchmark you can score each predictive distribution against
+the reference distribution of its target instead, as
+`ContinuousRankedProbabilityScore` does, but without its grid or predictive
+samples. Set `against_reference=True`: the metric then also asks for reference
+samples, the predictor draws them from its `reference_samples_extractor` under
+the same key as for `ContinuousRankedProbabilityScore`, and the value is the
+exact expected CRPS over those samples. Scoring references is a choice made on
+the metric, never by configuring an extractor. A suite that asks for it from a
+predictor without an extractor fails when it is built, and so does a suite that
+would score the closed-form CRPS against both targets and references, since
+the predictor computes only one of them:
+
+```python
+import jax
+import pytest
+
+from stagereg.core import ClosedFormContinuousRankedProbabilityScore
+from stagereg.core.types import Batch
+from stagereg.jax import GaussianPredictor, MetricSuite
+
+
+def reference_samples(batch: Batch, key: jax.Array) -> jax.Array:
+    """Draw 32 samples per target from the known data-generating noise."""
+    return batch.targets[:, None] + 0.1 * jax.random.normal(
+        key, (batch.targets.shape[0], 32)
+    )
+
+
+reference_crps = ClosedFormContinuousRankedProbabilityScore(
+    name="reference_crps", against_reference=True
+)
+suite = MetricSuite(
+    epoch=(reference_crps,),
+    predictor=GaussianPredictor(reference_samples_extractor=reference_samples),
+)
+
+with pytest.raises(ValueError, match="reference_samples_extractor"):
+    MetricSuite(epoch=(reference_crps,), predictor=GaussianPredictor())
 ```
 
 Outside a training run,

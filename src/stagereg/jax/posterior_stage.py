@@ -17,9 +17,9 @@ from flax.nnx.filterlib import Filter
 from stagereg.core.checkpoints import Checkpoint, CheckpointStore
 from stagereg.core.early_stopping import EarlyStopper
 from stagereg.core.metric_registry import (
+    ClosedFormContinuousRankedProbabilityScore,
     EpochPredictionData,
     NegativeLogLikelihood,
-    SampleContinuousRankedProbabilityScore,
 )
 from stagereg.core.naming import Split, metric_tag
 from stagereg.core.protocols import LoaderFactory, ValidationStrategy
@@ -67,18 +67,15 @@ from stagereg.jax.stage_checkpoints import (
 )
 from stagereg.jax.state import restore_keeping_components
 
-_DEFAULT_PREDICTIVE_SAMPLE_COUNT = 100
-
 
 def _default_validation_metrics() -> MetricSuite:
-    """Score the exact posterior predictive's NLL and its predictive samples' CRPS."""
+    """Score the exact posterior predictive's NLL and its closed-form CRPS."""
     return MetricSuite(
         epoch=(
             NegativeLogLikelihood(),
-            SampleContinuousRankedProbabilityScore(name="crps"),
+            ClosedFormContinuousRankedProbabilityScore(name="crps"),
         ),
         predictor=PosteriorPredictivePredictor(),
-        predictive_sample_count=_DEFAULT_PREDICTIVE_SAMPLE_COUNT,
     )
 
 
@@ -110,10 +107,11 @@ class PosteriorStageOptions:
             [`PosteriorPredictive`][stagereg.jax.PosteriorPredictive], so it is
             normally a
             [`PosteriorPredictivePredictor`][stagereg.jax.PosteriorPredictivePredictor].
-            Defaults to the exact NLL (``nll``) and the CRPS (``crps``) of
-            100 predictive samples per target, scored with
-            [`SampleContinuousRankedProbabilityScore`][stagereg.core.SampleContinuousRankedProbabilityScore],
-            which needs no evaluation grid.
+            Defaults to the exact NLL (``nll``) and the closed-form CRPS
+            (``crps``) of the posterior predictive, scored with
+            [`ClosedFormContinuousRankedProbabilityScore`][stagereg.core.ClosedFormContinuousRankedProbabilityScore]
+            from the mixture's own formula, so it needs neither predictive
+            samples nor an evaluation grid and carries no Monte Carlo noise.
         early_stopper: Optional early-stopping policy. Refused for an inference
             method that does not support early stopping.
         event_sinks: Event consumers notified of ``posterior/...`` events.
@@ -126,7 +124,8 @@ class PosteriorStageOptions:
         validation_key: The typed JAX PRNG key every validation is scored
             under. It is split once into a draw key, which selects the
             posterior's draws, and a metric key, into which the index of each validation
-            batch is folded to draw that batch's predictive samples. Every
+            batch is folded to draw that batch's predictive samples, if the
+            metrics need any. Every
             epoch, and every run under the same key, therefore scores the same
             draws and the same predictive samples, so differences between
             validation metrics reflect the posterior rather than re-drawing.

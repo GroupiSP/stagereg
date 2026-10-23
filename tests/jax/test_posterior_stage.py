@@ -35,6 +35,7 @@ from stagereg.core.checkpoints import (
     finalized_only,
 )
 from stagereg.core.early_stopping import EarlyStopper
+from stagereg.core.metrics import expected_gaussian_mixture_crps
 from stagereg.core.naming import Split, metric_tag
 from stagereg.core.metric_registry import (
     EvaluationGrid,
@@ -543,6 +544,35 @@ def test_the_default_validation_reports_the_nll_and_the_crps_without_a_grid(
         values = history[f"posterior/validation/{name}"]
         assert len(values) == 3
         assert all(math.isfinite(value) and value > 0.0 for value in values)
+
+
+def test_the_default_crps_is_the_closed_form_crps_of_the_posterior_predictive(
+    variance_ready_run: MakeVarianceReadyRun,
+) -> None:
+    run = variance_ready_run()
+    method = GradientAscentMethod()
+    stage = _posterior_stage(method, validation_loader=regression_loader)
+
+    stage.prepare(run.state)
+    stage.train(run.state)
+
+    final = method.posteriors[-1]
+    batches = regression_loader(split="validation", epoch=2)
+    inputs = jnp.concatenate([b.inputs for b in batches])
+    targets = np.asarray(jnp.concatenate([b.targets for b in batches])).reshape(-1)
+    means = final.mean_function(final.parameters, inputs, jax.random.key(0))
+    draws = np.stack([np.asarray(means).reshape(-1) + o for o in (-0.5, 0.5)], 1)
+    variance = np.asarray(run.variance_model(inputs).mean()).reshape(-1)
+    expected = expected_gaussian_mixture_crps(draws, variance, targets[:, None])
+    assert run.state.metric_history["posterior/validation/crps"][-1] == pytest.approx(
+        float(expected.mean()), rel=1e-4
+    )
+
+
+def test_the_default_validation_needs_no_predictive_sample_count() -> None:
+    suite = PosteriorStageOptions(epochs=1).validation_metrics
+
+    assert suite.predictive_sample_count is None
 
 
 def test_an_unlimited_posterior_draws_the_configured_count_with_the_same_key_every_epoch(

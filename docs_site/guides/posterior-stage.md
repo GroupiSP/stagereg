@@ -117,10 +117,14 @@ untouched. To use a different module with the same parameter tree, pass it as
 pass `prior` to change it.
 
 Validation reports two metrics by default: `nll`, the exact negative
-log-likelihood of the posterior predictive, and `crps`, the CRPS of 100
-predictive samples per target, scored by
-[`SampleContinuousRankedProbabilityScore`][stagereg.core.SampleContinuousRankedProbabilityScore]
-without an evaluation grid. To score other metrics, give the options a
+log-likelihood of the posterior predictive, and `crps`, its closed-form CRPS,
+scored by
+[`ClosedFormContinuousRankedProbabilityScore`][stagereg.core.ClosedFormContinuousRankedProbabilityScore].
+The closed-form CRPS evaluates the mixture's own formula rather than predictive
+samples, so the default suite needs neither a predictive sample count nor an
+evaluation grid, and early stopping, checkpoint selection and HPO pruning
+compare an exact score with no Monte Carlo noise and no bias toward narrow
+posteriors. To score other metrics, give the options a
 `validation_metrics` suite with a
 [`PosteriorPredictivePredictor`][stagereg.jax.PosteriorPredictivePredictor];
 [Epoch metrics](epoch-metrics.md) explains how.
@@ -128,9 +132,10 @@ without an evaluation grid. To score other metrics, give the options a
 Every validation is scored under one fixed key, the options' `validation_key`,
 which defaults to `jax.random.key(0)`. It is split once into a draw key, which
 selects the posterior's draws, and a metric key, into which each validation
-batch's index is folded to draw its predictive samples. Every epoch, and every
-run or HPO trial, therefore scores the same draws and the same predictive
-samples, so early stopping, checkpoint selection and a pruner compare
+batch's index is folded to draw its predictive samples when a metric needs
+them; the default suite needs none, so only the draws depend on the key. Every
+epoch, and every run or HPO trial, therefore scores the same draws and the same
+predictive samples, so early stopping, checkpoint selection and a pruner compare
 posteriors rather than re-drawing noise. The same posterior then scores
 identical metrics only if the validation loader yields the same batches in the
 same order every epoch; with a shuffling loader the draws stay fixed and only
@@ -385,7 +390,7 @@ pSGLD and MC-Dropout:
 ## The XSin example
 
 `examples/jax/xsin/posterior.py` runs mean, variance and posterior stages on the
-XSin benchmark with each method, prints the NLL and CRPS of the variance stage
-and of the posterior predictive, and plots the moment-matched predictive band
+XSin benchmark with each method, prints the NLL and closed-form CRPS of the
+variance stage and of the posterior predictive, and plots the moment-matched predictive band
 against the variance stage's band. [Examples](examples.md#xsin-benchmark) lists
 the run command.

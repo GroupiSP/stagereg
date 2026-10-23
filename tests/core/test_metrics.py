@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from statistics import NormalDist
 
 import numpy as np
 import pytest
@@ -11,6 +12,7 @@ from stagereg.core.metrics import (
     cdf,
     coverage,
     crps,
+    expected_gaussian_mixture_crps,
     expected_sample_crps,
     point_crps,
     rmse,
@@ -278,3 +280,167 @@ def test_expected_sample_crps_rejects_malformed_samples(
 ) -> None:
     with pytest.raises(ValueError):
         expected_sample_crps(predictive_samples, reference_samples)
+
+
+def _gaussian_crps(mean: float, scale: float, target: float) -> float:
+    """Return the textbook CRPS of ``N(mean, scale**2)`` at ``target``.
+
+    Gneiting and Raftery (2007), eq. 21: ``s [z (2 Phi(z) - 1) + 2 phi(z) - 1 / sqrt(pi)]``
+    with ``z = (target - mean) / s``.
+    """
+    standard = NormalDist()
+    z = (target - mean) / scale
+    return scale * (
+        z * (2.0 * standard.cdf(z) - 1.0) + 2.0 * standard.pdf(z) - 1.0 / np.sqrt(np.pi)
+    )
+
+
+_scales = st.floats(1e-2, 1e2)
+
+
+@st.composite
+def _mixtures(draw: st.DrawFn) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Draw ``(units, M)`` draw means, ``(units,)`` variances, ``(units, R)``
+    references."""
+    predictive, reference = draw(_sample_matrices())
+    scales = draw(
+        st.lists(_scales, min_size=predictive.shape[0], max_size=predictive.shape[0])
+    )
+    return predictive, np.square(scales), reference
+
+
+@given(mixture=_mixtures())
+def test_expected_gaussian_mixture_crps_of_one_draw_is_the_gaussian_crps(
+    mixture: tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> None:
+    draw_means, variance, reference = mixture
+    draw_means = draw_means[:, :1]
+
+    expected = [
+        np.mean([_gaussian_crps(mean[0], np.sqrt(var), y) for y in targets])
+        for mean, var, targets in zip(draw_means, variance, reference, strict=True)
+    ]
+
+    assert expected_gaussian_mixture_crps(
+        draw_means, variance, reference
+    ) == pytest.approx(expected, rel=1e-6, abs=1e-6)
+
+
+@given(samples=_sample_matrices())
+def test_expected_gaussian_mixture_crps_of_a_vanishing_variance_is_the_sample_crps(
+    samples: tuple[np.ndarray, np.ndarray],
+) -> None:
+    draw_means, reference = samples
+    variance = np.full(draw_means.shape[0], 1e-12)
+
+    assert expected_gaussian_mixture_crps(
+        draw_means, variance, reference
+    ) == pytest.approx(expected_sample_crps(draw_means, reference), abs=1e-4)
+
+
+def test_expected_gaussian_mixture_crps_is_the_limit_of_the_sample_crps_of_its_samples() -> (
+    None
+):
+    rng = np.random.default_rng(0)
+    draw_means = rng.normal(size=(3, 4)) * 2.0
+    variance = np.array([0.25, 1.0, 4.0])
+    reference = rng.normal(size=(3, 5))
+    sample_count = 40_000
+    components = rng.integers(0, draw_means.shape[1], size=(3, sample_count))
+    samples = np.take_along_axis(draw_means, components, axis=1) + np.sqrt(variance)[
+        :, None
+    ] * rng.normal(size=(3, sample_count))
+
+    assert expected_gaussian_mixture_crps(
+        draw_means, variance, reference
+    ) == pytest.approx(expected_sample_crps(samples, reference), rel=2e-2)
+
+
+@given(mixture=_mixtures(), shift=_finite_values)
+def test_expected_gaussian_mixture_crps_is_translation_invariant(
+    mixture: tuple[np.ndarray, np.ndarray, np.ndarray], shift: float
+) -> None:
+    draw_means, variance, reference = mixture
+
+    assert expected_gaussian_mixture_crps(
+        draw_means + shift, variance, reference + shift
+    ) == pytest.approx(
+        expected_gaussian_mixture_crps(draw_means, variance, reference), abs=1e-6
+    )
+
+
+@given(mixture=_mixtures(), scale=st.floats(1e-2, 1e2))
+def test_expected_gaussian_mixture_crps_scales_linearly_under_positive_scaling(
+    mixture: tuple[np.ndarray, np.ndarray, np.ndarray], scale: float
+) -> None:
+    draw_means, variance, reference = mixture
+
+    assert expected_gaussian_mixture_crps(
+        scale * draw_means, scale**2 * variance, scale * reference
+    ) == pytest.approx(
+        scale * expected_gaussian_mixture_crps(draw_means, variance, reference),
+        rel=1e-6,
+        abs=1e-6,
+    )
+
+
+@given(mixture=_mixtures(), seed=st.integers(0, 2**32 - 1))
+def test_expected_gaussian_mixture_crps_ignores_the_order_of_draws_and_references(
+    mixture: tuple[np.ndarray, np.ndarray, np.ndarray], seed: int
+) -> None:
+    draw_means, variance, reference = mixture
+    rng = np.random.default_rng(seed)
+
+    assert expected_gaussian_mixture_crps(
+        rng.permuted(draw_means, axis=1), variance, rng.permuted(reference, axis=1)
+    ) == pytest.approx(
+        expected_gaussian_mixture_crps(draw_means, variance, reference), abs=1e-6
+    )
+
+
+@given(mixture=_mixtures())
+def test_expected_gaussian_mixture_crps_is_non_negative(
+    mixture: tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> None:
+    assert np.all(expected_gaussian_mixture_crps(*mixture) >= -1e-9)
+
+
+@given(mixture=_mixtures(), shift=_finite_values)
+def test_expected_gaussian_mixture_crps_is_least_at_the_matching_location(
+    mixture: tuple[np.ndarray, np.ndarray, np.ndarray], shift: float
+) -> None:
+    # Mirror draws and references about zero: both are then symmetric about the
+    # same centre, and the score is convex and symmetric in a location shift.
+    draw_means, variance, reference = mixture
+    draw_means = np.concatenate([draw_means, -draw_means], axis=1)
+    reference = np.concatenate([reference, -reference], axis=1)
+
+    matched = expected_gaussian_mixture_crps(draw_means, variance, reference)
+    shifted = expected_gaussian_mixture_crps(draw_means + shift, variance, reference)
+
+    assert np.all(shifted >= matched - 1e-6)
+
+
+@pytest.mark.parametrize(
+    ("draw_means", "variance", "reference_samples"),
+    [
+        (np.empty((0, 2)), np.empty(0), np.empty((0, 2))),
+        ([[]], [1.0], [[1.0]]),
+        ([[1.0]], [1.0], [[]]),
+        ([[np.nan]], [1.0], [[1.0]]),
+        ([[1.0]], [1.0], [[np.inf]]),
+        ([[1.0]], [np.nan], [[1.0]]),
+        ([1.0, 2.0], [1.0], [[1.0]]),
+        ([[1.0]], [[1.0]], [[1.0]]),
+        ([[1.0]], [1.0], [[[1.0]]]),
+        ([[1.0], [2.0]], [1.0, 1.0], [[1.0]]),
+        ([[1.0], [2.0]], [1.0], [[1.0], [2.0]]),
+        ([[1.0]], [0.0], [[1.0]]),
+        ([[1.0]], [-1.0], [[1.0]]),
+    ],
+)
+def test_expected_gaussian_mixture_crps_rejects_malformed_inputs(
+    draw_means: object, variance: object, reference_samples: object
+) -> None:
+    with pytest.raises(ValueError):
+        expected_gaussian_mixture_crps(draw_means, variance, reference_samples)

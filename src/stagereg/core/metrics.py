@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
@@ -211,6 +213,78 @@ def expected_sample_crps(
         predictive_count * reference_count
     )
     spread = _mean_pairwise_distance(np.sort(predictive, axis=1))
+    return absolute_error - spread / 2.0
+
+
+_erf = np.vectorize(math.erf, otypes=[np.float64])
+
+
+def _expected_absolute_gaussian(
+    location: NDArray[np.float64], variance: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Return ``E|Z|`` for ``Z ~ N(location, variance)``, elementwise.
+
+    This is ``A(mu, v) = 2 sqrt(v) phi(mu / sqrt(v)) + mu (2 Phi(mu / sqrt(v)) - 1)``,
+    the building block of the Gaussian-mixture CRPS (Grimit et al. 2006).
+    """
+    scale = np.sqrt(variance)
+    z = location / scale
+    density = np.exp(-0.5 * z**2) / math.sqrt(2.0 * math.pi)
+    return 2.0 * scale * density + location * _erf(z / math.sqrt(2.0))
+
+
+def expected_gaussian_mixture_crps(
+    draw_means: ArrayLike, variance: ArrayLike, reference_samples: ArrayLike
+) -> NDArray[np.float64]:
+    """Return the closed-form expected CRPS of each unit's Gaussian mixture.
+
+    Each scoring unit (row) predicts an equally weighted mixture of Gaussians
+    ``N(mu_m, s**2)``, one per draw mean, all sharing the unit's variance
+    ``s**2``. With ``A(mu, v) = E|Z|`` for ``Z ~ N(mu, v)``, its CRPS at a
+    target ``y`` is (Grimit et al. 2006)::
+
+        (1/M) sum_m A(mu_m - y, s**2) - (1/(2 M**2)) sum_{m,m'} A(mu_m - mu_m', 2 s**2)
+
+    and this function returns its mean over the unit's reference samples. A
+    point target is a single reference sample (``R = 1``). With one draw it is
+    the closed-form CRPS of a Gaussian. Unlike
+    [`expected_sample_crps`][stagereg.core.expected_sample_crps] it scores the
+    predictive's own formula rather than samples drawn from it, so it carries no
+    Monte Carlo noise. The cost is ``O(M R + M**2)`` per unit.
+
+    Args:
+        draw_means: Mean of each mixture component, of shape ``(units, M)``.
+        variance: The variance every component of a unit shares, of shape
+            ``(units,)``.
+        reference_samples: Reference samples of shape ``(units, R)``, such as
+            the observed target (``R = 1``) or draws from a simulator.
+
+    Returns:
+        The expected CRPS of each unit, of shape ``(units,)``.
+
+    Raises:
+        ValueError: If an input is empty or non-finite, if ``draw_means`` or
+            ``reference_samples`` is not two-dimensional, if ``variance`` is
+            not one-dimensional or not positive, or if the numbers of units
+            differ.
+    """
+    means = _as_nonempty_matrix(draw_means, name="draw_means")
+    reference = _as_nonempty_matrix(reference_samples, name="reference_samples")
+    shared_variance = _as_nonempty_vector(variance, name="variance")
+    if not means.shape[0] == reference.shape[0] == shared_variance.shape[0]:
+        raise ValueError(
+            "draw_means, variance and reference_samples must have the same number "
+            "of units."
+        )
+    if np.any(shared_variance <= 0.0):
+        raise ValueError("variance must be positive.")
+    unit_variance = shared_variance[:, None, None]
+    absolute_error = _expected_absolute_gaussian(
+        means[:, :, None] - reference[:, None, :], unit_variance
+    ).mean(axis=(1, 2))
+    spread = _expected_absolute_gaussian(
+        means[:, :, None] - means[:, None, :], 2.0 * unit_variance
+    ).mean(axis=(1, 2))
     return absolute_error - spread / 2.0
 
 

@@ -7,7 +7,7 @@ authors:
     family-names: Tosti Balducci
     email: g.b.l.tostibalducci@tudelft.nl
   - name: "Intelligent System Prognostics for Operations & Maintenance Research Group"
-version: 0.4.0
+version: 0.5.0
 license: BSD-3-Clause
 repository-code: "https://github.com/GroupiSP/stagereg"
 url: "https://groupisp.github.io/stagereg/"

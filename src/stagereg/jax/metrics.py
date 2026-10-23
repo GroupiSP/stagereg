@@ -391,13 +391,17 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
     )
 
 
-def _require_closed_form_crps(prediction: object) -> None:
-    """Refuse a prediction that offers no closed-form CRPS.
+def _require_closed_form_crps(prediction: object) -> ClosedFormCRPS:
+    """Return ``prediction`` narrowed to a closed-form CRPS, or refuse it.
 
     The closed-form CRPS never falls back to a sample estimate (ADR 0015).
 
     Args:
         prediction: The predictive distribution to be scored.
+
+    Returns:
+        ``prediction`` itself, typed as
+        [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
 
     Raises:
         TypeError: If ``prediction`` does not implement
@@ -409,6 +413,7 @@ def _require_closed_form_crps(prediction: object) -> None:
             "implement ClosedFormCRPS (a crps method). Score it with "
             "SampleContinuousRankedProbabilityScore instead, or implement crps."
         )
+    return prediction
 
 
 def _device_fields(
@@ -442,6 +447,13 @@ def _device_fields(
     Returns:
         The mean, and each requested field under its ``EpochPredictionData``
         name.
+
+    Raises:
+        ValueError: If a requested field has nothing to score: the
+            log-likelihood without ``targets``, or the closed-form CRPS
+            without ``targets`` or ``references``.
+        TypeError: If the closed-form CRPS is requested and ``prediction``
+            does not implement [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
     """
     computed = {"mean": prediction.mean()}
     if variance:
@@ -451,12 +463,16 @@ def _device_fields(
             jax.random.fold_in(key, 0), sample_shape=(sample_count,)
         )
     if log_likelihood:
-        assert targets is not None
+        if targets is None:
+            raise ValueError("the log-likelihood requires targets.")
         computed["log_likelihood"] = prediction.log_prob(targets)
     if closed_form_crps:
         scored = targets if references is None else references
-        assert scored is not None and isinstance(prediction, ClosedFormCRPS)
-        computed["closed_form_crps"] = prediction.crps(scored)
+        if scored is None:
+            raise ValueError("the closed-form CRPS requires targets or references.")
+        computed["closed_form_crps"] = _require_closed_form_crps(prediction).crps(
+            scored
+        )
     return computed
 
 

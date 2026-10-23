@@ -582,6 +582,13 @@ class ClosedFormContinuousRankedProbabilityScore:
     def __call__(self, data: EpochPredictionData, /) -> float:
         """Average the closed-form CRPS over scoring units.
 
+        Args:
+            data: The epoch's prediction data, carrying each scoring unit's
+                closed-form CRPS.
+
+        Returns:
+            The mean closed-form CRPS across scoring units.
+
         Raises:
             ValueError: If the closed-form CRPS is absent, or scored the target
                 when this metric asks for the reference samples, or the reverse.

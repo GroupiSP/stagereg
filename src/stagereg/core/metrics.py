@@ -226,6 +226,14 @@ def _expected_absolute_gaussian(
 
     This is ``A(mu, v) = 2 sqrt(v) phi(mu / sqrt(v)) + mu (2 Phi(mu / sqrt(v)) - 1)``,
     the building block of the Gaussian-mixture CRPS (Grimit et al. 2006).
+
+    Args:
+        location: The mean of ``Z``.
+        variance: The variance of ``Z``, positive and broadcastable against
+            ``location``.
+
+    Returns:
+        ``E|Z|``, shaped like ``location`` and ``variance`` broadcast together.
     """
     scale = np.sqrt(variance)
     z = location / scale

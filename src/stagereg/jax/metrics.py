@@ -396,6 +396,9 @@ def _require_closed_form_crps(prediction: object) -> None:
 
     The closed-form CRPS never falls back to a sample estimate (ADR 0015).
 
+    Args:
+        prediction: The predictive distribution to be scored.
+
     Raises:
         TypeError: If ``prediction`` does not implement
             [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
@@ -570,6 +573,14 @@ def _rows_to_samples(
     """Convert host scoring-unit rows to JAX sample-first samples.
 
     ``device_put`` rather than ``jnp.asarray``, which compiles a copy per shape.
+
+    Args:
+        rows: Samples per scoring unit, shaped ``(units, R)`` with ``units``
+            the product of ``batch_shape``.
+        batch_shape: The prediction's batch shape.
+
+    Returns:
+        The samples on the device, shaped ``[R, *batch]``.
     """
     return jax.device_put(rows.T.reshape(rows.shape[1], *batch_shape))
 
@@ -832,6 +843,12 @@ def merge_epoch_prediction_data(
 
 def _merge_closed_form_crps_scoring(parts: Sequence[EpochPredictionData]) -> bool:
     """Return whether every part's closed-form CRPS scored reference samples.
+
+    Args:
+        parts: The per-batch prediction data being merged, at least one.
+
+    Returns:
+        The parts' shared ``closed_form_crps_against_reference`` flag.
 
     Raises:
         ValueError: If some parts scored the target and others the references.

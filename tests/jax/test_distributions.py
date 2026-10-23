@@ -566,15 +566,27 @@ def gaussians_and_references(
     return Gaussian(loc=jnp.asarray(loc), scale=jnp.asarray(scale)), references
 
 
-def _core_gaussian_crps(gaussian: Gaussian, references: np.ndarray) -> np.ndarray:
-    """Score ``[R, *batch]`` references with the core function, shaped ``[*batch]``."""
-    batch_shape = gaussian.batch_shape
+def _core_crps(draw_means: Any, variance: Any, references: np.ndarray) -> np.ndarray:
+    """Score references with the core function as the oracle, in float64.
+
+    Takes the JAX layout, ``[M, *batch]`` draw means, ``[*batch]`` variances and
+    ``[R, *batch]`` references, and returns ``[*batch]`` scores.
+    """
+    draw_means = np.asarray(draw_means, dtype=np.float64)
+    variance = np.asarray(variance, dtype=np.float64)
+    references = np.asarray(references, dtype=np.float64)
     scores = expected_gaussian_mixture_crps(
-        np.asarray(gaussian.loc, dtype=np.float64).reshape(-1, 1),
-        np.square(np.asarray(gaussian.scale, dtype=np.float64)).reshape(-1),
-        np.asarray(references, dtype=np.float64).reshape(references.shape[0], -1).T,
+        draw_means.reshape(draw_means.shape[0], -1).T,
+        variance.reshape(-1),
+        references.reshape(references.shape[0], -1).T,
     )
-    return scores.reshape(batch_shape)
+    return scores.reshape(variance.shape)
+
+
+def _core_gaussian_crps(gaussian: Gaussian, references: np.ndarray) -> np.ndarray:
+    """Score ``[R, *batch]`` references against ``gaussian`` with the core function."""
+    scale = np.asarray(gaussian.scale, dtype=np.float64)
+    return _core_crps(np.asarray(gaussian.loc)[None], np.square(scale), references)
 
 
 @settings(deadline=None)
@@ -655,17 +667,6 @@ def posterior_predictives_and_references(
     return mixture, references
 
 
-def _core_mixture_crps(
-    draw_means: np.ndarray, variance: np.ndarray, references: np.ndarray
-) -> np.ndarray:
-    """Score ``[R, B]`` references against ``[M, B]`` draws with the core function."""
-    return expected_gaussian_mixture_crps(
-        np.asarray(draw_means, dtype=np.float64).T,
-        np.asarray(variance, dtype=np.float64),
-        np.asarray(references, dtype=np.float64).T,
-    )
-
-
 @settings(deadline=None, max_examples=25)
 @given(posterior_predictives_and_references(), st.booleans())
 def test_posterior_predictive_crps_matches_the_core_function(
@@ -678,7 +679,7 @@ def test_posterior_predictive_crps_matches_the_core_function(
 
     np.testing.assert_allclose(
         mixture.crps(jnp.asarray(targets)),
-        _core_mixture_crps(mixture.draws, mixture.aleatoric_variance, references),
+        _core_crps(mixture.draws, mixture.aleatoric_variance, references),
         rtol=1e-4,
         atol=1e-4,
     )
@@ -730,7 +731,7 @@ def test_moment_matched_crps_matches_the_core_function(
 
     np.testing.assert_allclose(
         summary.crps(jnp.asarray(targets)),
-        _core_mixture_crps(summary.loc[None], summary.variance(), references),
+        _core_crps(summary.loc[None], summary.variance(), references),
         rtol=1e-4,
         atol=1e-4,
     )

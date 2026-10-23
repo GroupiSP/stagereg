@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from types import ModuleType
+from typing import Any
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -219,26 +222,58 @@ def expected_sample_crps(
 _erf = np.vectorize(math.erf, otypes=[np.float64])
 
 
-def _expected_absolute_gaussian(
-    location: NDArray[np.float64], variance: NDArray[np.float64]
-) -> NDArray[np.float64]:
-    """Return ``E|Z|`` for ``Z ~ N(location, variance)``, elementwise.
+def gaussian_mixture_crps_kernel(
+    xp: ModuleType,
+    erf: Callable[[Any], Any],
+    draw_means: Any,
+    variance: Any,
+    references: Any,
+    weights: Any,
+) -> Any:
+    """Return the closed-form expected CRPS of a weighted Gaussian mixture.
 
-    This is ``A(mu, v) = 2 sqrt(v) phi(mu / sqrt(v)) + mu (2 Phi(mu / sqrt(v)) - 1)``,
-    the building block of the Gaussian-mixture CRPS (Grimit et al. 2006).
+    The one implementation of the Grimit et al. (2006) formula, written against
+    an array module so that the core stays free of any backend (ADR 0012): the
+    core passes NumPy, and the JAX backend passes ``jax.numpy``, which keeps the
+    result traceable under ``jax.jit``. It does no validation; callers check
+    their inputs. With ``A(mu, v) = E|Z|`` for ``Z ~ N(mu, v)``, the CRPS of a
+    mixture with component weights ``w_m`` at a target ``y`` is::
+
+        sum_m w_m A(mu_m - y, s**2) - (1/2) sum_{m,m'} w_m w_m' A(mu_m - mu_m', 2 s**2)
 
     Args:
-        location: The mean of ``Z``.
-        variance: The variance of ``Z``, positive and broadcastable against
-            ``location``.
+        xp: The array module, ``numpy`` or ``jax.numpy``.
+        erf: The error function matching ``xp``.
+        draw_means: Component means, shaped ``[M, *batch]``; all must be finite.
+        variance: The positive variance every component shares, shaped
+            ``[*batch]``.
+        references: Reference samples, shaped ``[R, *batch]``.
+        weights: Component weights summing to one, shaped ``[M]``.
 
     Returns:
-        ``E|Z|``, shaped like ``location`` and ``variance`` broadcast together.
+        The CRPS averaged over each unit's reference samples, shaped
+        ``[*batch]``.
     """
-    scale = np.sqrt(variance)
-    z = location / scale
-    density = np.exp(-0.5 * z**2) / math.sqrt(2.0 * math.pi)
-    return 2.0 * scale * density + location * _erf(z / math.sqrt(2.0))
+
+    def expected_absolute(location: Any, location_variance: Any) -> Any:
+        scale = xp.sqrt(location_variance)
+        z = location / scale
+        density = xp.exp(-0.5 * z**2) / math.sqrt(2.0 * math.pi)
+        return 2.0 * scale * density + location * erf(z / math.sqrt(2.0))
+
+    weights = xp.reshape(weights, (-1,) + (1,) * (draw_means.ndim - 1))
+    absolute_error = xp.sum(
+        weights
+        * expected_absolute(draw_means[:, None] - references[None, :], variance).mean(
+            axis=1
+        ),
+        axis=0,
+    )
+    pairwise = expected_absolute(
+        draw_means[:, None] - draw_means[None, :], 2.0 * variance
+    )
+    spread = xp.sum(weights[:, None] * weights[None, :] * pairwise, axis=(0, 1))
+    return absolute_error - spread / 2.0
 
 
 def expected_gaussian_mixture_crps(
@@ -286,14 +321,10 @@ def expected_gaussian_mixture_crps(
         )
     if np.any(shared_variance <= 0.0):
         raise ValueError("variance must be positive.")
-    unit_variance = shared_variance[:, None, None]
-    absolute_error = _expected_absolute_gaussian(
-        means[:, :, None] - reference[:, None, :], unit_variance
-    ).mean(axis=(1, 2))
-    spread = _expected_absolute_gaussian(
-        means[:, :, None] - means[:, None, :], 2.0 * unit_variance
-    ).mean(axis=(1, 2))
-    return absolute_error - spread / 2.0
+    draws = means.shape[1]
+    return gaussian_mixture_crps_kernel(
+        np, _erf, means.T, shared_variance, reference.T, np.full(draws, 1.0 / draws)
+    )
 
 
 def rmse(y_true: ArrayLike, y_pred: ArrayLike) -> float:

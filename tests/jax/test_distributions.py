@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any
 
 import jax
@@ -615,6 +616,30 @@ def test_gaussian_crps_of_reference_samples_matches_the_core_function(
     np.testing.assert_allclose(
         gaussian.crps(jnp.asarray(references)),
         _core_gaussian_crps(gaussian, references),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None)
+@given(gaussians_and_references())
+def test_gaussian_crps_is_the_textbook_gaussian_crps(
+    case: tuple[Gaussian, np.ndarray],
+) -> None:
+    # The core function shares the JAX formula, so it cannot catch an error in
+    # it; Gneiting and Raftery's (2007) Gaussian CRPS is independent of it.
+    gaussian, references = case
+    loc = np.asarray(gaussian.loc, dtype=np.float64)
+    scale = np.asarray(gaussian.scale, dtype=np.float64)
+    standard = NormalDist()
+    z = (references.astype(np.float64) - loc) / scale
+    cdf = np.vectorize(standard.cdf)(z)
+    pdf = np.vectorize(standard.pdf)(z)
+    expected = scale * (z * (2.0 * cdf - 1.0) + 2.0 * pdf - 1.0 / math.sqrt(math.pi))
+
+    np.testing.assert_allclose(
+        gaussian.crps(jnp.asarray(references)),
+        expected.mean(axis=0),
         rtol=1e-4,
         atol=1e-4,
     )

@@ -24,6 +24,8 @@ import jax.scipy.special as jsp
 import jax.scipy.stats as jstats
 from flax import nnx
 
+from stagereg.core.metrics import gaussian_mixture_crps_kernel
+
 # Halvings of the quantile bracket; enough to reach float32 resolution.
 _BISECTION_STEPS = 64
 
@@ -65,25 +67,6 @@ def _register_pytree(cls: type[_Distribution]) -> type[_Distribution]:
     return cls
 
 
-def _expected_absolute_gaussian(location: jax.Array, variance: jax.Array) -> jax.Array:
-    """Return ``E|Z|`` for ``Z ~ N(location, variance)``, elementwise.
-
-    This is ``A(mu, v) = 2 sqrt(v) phi(mu / sqrt(v)) + mu (2 Phi(mu / sqrt(v)) - 1)``,
-    the building block of the Gaussian-mixture CRPS (Grimit et al. 2006).
-
-    Args:
-        location: The mean of ``Z``.
-        variance: The variance of ``Z``, positive and broadcastable against
-            ``location``.
-
-    Returns:
-        ``E|Z|``, shaped like ``location`` and ``variance`` broadcast together.
-    """
-    scale = jnp.sqrt(variance)
-    z = location / scale
-    return 2.0 * scale * jstats.norm.pdf(z) + location * jsp.erf(z / math.sqrt(2.0))
-
-
 def _reference_axis(targets: jax.Array, batch_shape: tuple[int, ...]) -> jax.Array:
     """Return ``targets`` with a leading reference axis, shaped ``[R, *batch]``.
 
@@ -114,9 +97,9 @@ def _gaussian_mixture_crps(
 ) -> jax.Array:
     """Return the closed-form expected CRPS of a Gaussian mixture.
 
-    The JAX counterpart of
-    [`expected_gaussian_mixture_crps`][stagereg.core.expected_gaussian_mixture_crps],
-    with the draw and reference axes leading rather than trailing.
+    Runs the core's backend-generic Grimit et al. (2006) formula, the one
+    [`expected_gaussian_mixture_crps`][stagereg.core.expected_gaussian_mixture_crps]
+    uses, on ``jax.numpy``.
 
     Args:
         draw_means: Component means, shaped ``[M, *batch]``; all must be finite.
@@ -130,19 +113,9 @@ def _gaussian_mixture_crps(
     """
     if weights is None:
         weights = jnp.full(draw_means.shape[:1], 1.0 / draw_means.shape[0])
-    weights = jnp.reshape(weights, (-1,) + (1,) * (draw_means.ndim - 1))
-    absolute_error = jnp.sum(
-        weights
-        * _expected_absolute_gaussian(
-            draw_means[:, None] - references[None, :], variance
-        ).mean(axis=1),
-        axis=0,
+    return gaussian_mixture_crps_kernel(
+        jnp, jsp.erf, draw_means, variance, references, weights
     )
-    pairwise = _expected_absolute_gaussian(
-        draw_means[:, None] - draw_means[None, :], 2.0 * variance
-    )
-    spread = jnp.sum(weights[:, None] * weights[None, :] * pairwise, axis=(0, 1))
-    return absolute_error - spread / 2.0
 
 
 @_register_pytree

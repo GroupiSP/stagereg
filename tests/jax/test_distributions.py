@@ -21,7 +21,7 @@ from stagereg.jax.distributions import (
     MomentMatchedPredictive,
     PosteriorPredictive,
 )
-from stagereg.core import Batch
+from stagereg.core import Batch, ClosedFormCRPS, expected_gaussian_mixture_crps
 
 _FINITE = st.floats(min_value=-10.0, max_value=10.0, width=32)
 _POSITIVE = st.floats(min_value=0.0625, max_value=10.0, width=32)
@@ -549,3 +549,91 @@ def test_batch_stays_a_single_pytree_leaf() -> None:
     batch = Batch(inputs=jnp.zeros((2, 1)), targets=jnp.ones((2,)))
 
     assert jax.tree.leaves(batch) == [batch]
+
+
+@st.composite
+def gaussians_and_references(
+    draw: st.DrawFn,
+) -> tuple[Gaussian, np.ndarray]:
+    """Draw a Gaussian of batch rank 1 or 2 and ``[R, *batch]`` references."""
+    batch_shape = draw(st.lists(st.integers(1, 3), min_size=1, max_size=2).map(tuple))
+    reference_count = draw(st.integers(1, 4))
+    loc = draw(arrays(np.float32, batch_shape, elements=_FINITE))
+    scale = draw(arrays(np.float32, batch_shape, elements=_POSITIVE))
+    references = draw(
+        arrays(np.float32, (reference_count, *batch_shape), elements=_FINITE)
+    )
+    return Gaussian(loc=jnp.asarray(loc), scale=jnp.asarray(scale)), references
+
+
+def _core_gaussian_crps(gaussian: Gaussian, references: np.ndarray) -> np.ndarray:
+    """Score ``[R, *batch]`` references with the core function, shaped ``[*batch]``."""
+    batch_shape = gaussian.batch_shape
+    scores = expected_gaussian_mixture_crps(
+        np.asarray(gaussian.loc, dtype=np.float64).reshape(-1, 1),
+        np.square(np.asarray(gaussian.scale, dtype=np.float64)).reshape(-1),
+        np.asarray(references, dtype=np.float64).reshape(references.shape[0], -1).T,
+    )
+    return scores.reshape(batch_shape)
+
+
+@settings(deadline=None)
+@given(gaussians_and_references())
+def test_gaussian_crps_of_one_target_per_unit_matches_the_core_function(
+    case: tuple[Gaussian, np.ndarray],
+) -> None:
+    gaussian, references = case
+    targets = references[0]
+
+    np.testing.assert_allclose(
+        gaussian.crps(jnp.asarray(targets)),
+        _core_gaussian_crps(gaussian, references[:1]),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None)
+@given(gaussians_and_references())
+def test_gaussian_crps_of_reference_samples_matches_the_core_function(
+    case: tuple[Gaussian, np.ndarray],
+) -> None:
+    gaussian, references = case
+
+    np.testing.assert_allclose(
+        gaussian.crps(jnp.asarray(references)),
+        _core_gaussian_crps(gaussian, references),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None)
+@given(gaussians_and_references())
+def test_gaussian_crps_is_the_same_under_jit(
+    case: tuple[Gaussian, np.ndarray],
+) -> None:
+    gaussian, references = case
+    targets = jnp.asarray(references)
+
+    np.testing.assert_allclose(
+        jax.jit(Gaussian.crps)(gaussian, targets),
+        gaussian.crps(targets),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_gaussian_crps_rejects_targets_of_another_rank() -> None:
+    gaussian = Gaussian(loc=jnp.zeros(3), scale=jnp.ones(3))
+
+    with pytest.raises(ValueError, match="targets"):
+        gaussian.crps(jnp.zeros((2, 2, 3)))
+
+
+def test_only_distributions_with_a_closed_form_offer_the_closed_form_crps() -> None:
+    gaussian = Gaussian(loc=jnp.zeros(2), scale=jnp.ones(2))
+    gamma = Gamma(concentration=jnp.ones(2), rate=jnp.ones(2))
+
+    assert isinstance(gaussian, ClosedFormCRPS)
+    assert not isinstance(gamma, ClosedFormCRPS)

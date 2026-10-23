@@ -65,6 +65,65 @@ def _register_pytree(cls: type[_Distribution]) -> type[_Distribution]:
     return cls
 
 
+def _expected_absolute_gaussian(location: jax.Array, variance: jax.Array) -> jax.Array:
+    """Return ``E|Z|`` for ``Z ~ N(location, variance)``, elementwise.
+
+    This is ``A(mu, v) = 2 sqrt(v) phi(mu / sqrt(v)) + mu (2 Phi(mu / sqrt(v)) - 1)``,
+    the building block of the Gaussian-mixture CRPS (Grimit et al. 2006).
+    """
+    scale = jnp.sqrt(variance)
+    z = location / scale
+    return 2.0 * scale * jstats.norm.pdf(z) + location * jsp.erf(z / math.sqrt(2.0))
+
+
+def _reference_axis(targets: jax.Array, batch_shape: tuple[int, ...]) -> jax.Array:
+    """Return ``targets`` with a leading reference axis, shaped ``[R, *batch]``.
+
+    Args:
+        targets: One target per scoring unit, ``[*batch]``, or reference
+            samples, ``[R, *batch]``.
+        batch_shape: The distribution's batch shape.
+
+    Returns:
+        The targets shaped ``[R, *batch]``; a point target gives ``R = 1``.
+
+    Raises:
+        ValueError: If ``targets`` has neither rank.
+    """
+    targets = jnp.asarray(targets)
+    if targets.ndim == len(batch_shape):
+        targets = targets[None]
+    elif targets.ndim != len(batch_shape) + 1:
+        raise ValueError("crps targets must be shaped [*batch] or [R, *batch].")
+    return jnp.broadcast_to(targets, (targets.shape[0], *batch_shape))
+
+
+def _gaussian_mixture_crps(
+    draw_means: jax.Array, variance: jax.Array, references: jax.Array
+) -> jax.Array:
+    """Return the closed-form expected CRPS of an equally weighted Gaussian mixture.
+
+    The JAX counterpart of
+    [`expected_gaussian_mixture_crps`][stagereg.core.expected_gaussian_mixture_crps],
+    with the draw and reference axes leading rather than trailing.
+
+    Args:
+        draw_means: Component means, shaped ``[M, *batch]``.
+        variance: The variance every component shares, shaped ``[*batch]``.
+        references: Reference samples, shaped ``[R, *batch]``.
+
+    Returns:
+        The expected CRPS of each scoring unit, shaped ``[*batch]``.
+    """
+    absolute_error = _expected_absolute_gaussian(
+        draw_means[:, None] - references[None, :], variance
+    ).mean(axis=(0, 1))
+    spread = _expected_absolute_gaussian(
+        draw_means[:, None] - draw_means[None, :], 2.0 * variance
+    ).mean(axis=(0, 1))
+    return absolute_error - spread / 2.0
+
+
 @_register_pytree
 @dataclass(frozen=True)
 class Gaussian:
@@ -126,6 +185,33 @@ class Gaussian:
     def variance(self) -> jax.Array:
         """Return the elementwise variance, i.e. ``scale ** 2``."""
         return jnp.square(self.scale)
+
+    def crps(self, targets: jax.Array) -> jax.Array:
+        """Return the closed-form expected CRPS of each scoring unit.
+
+        Implements [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS]. It is the
+        one-draw case of
+        [`expected_gaussian_mixture_crps`][stagereg.core.expected_gaussian_mixture_crps].
+
+        Args:
+            targets: One target per scoring unit, shaped ``[*batch]``, or
+                ``R`` reference samples per scoring unit, shaped
+                ``[R, *batch]``.
+
+        Returns:
+            The CRPS averaged over each unit's reference samples, shaped
+            ``[*batch]``.
+
+        Raises:
+            ValueError: If ``targets`` is shaped neither ``[*batch]`` nor
+                ``[R, *batch]``.
+        """
+        batch_shape = self.batch_shape
+        return _gaussian_mixture_crps(
+            jnp.broadcast_to(self.loc, batch_shape)[None],
+            jnp.broadcast_to(self.variance(), batch_shape),
+            _reference_axis(targets, batch_shape),
+        )
 
 
 @_register_pytree

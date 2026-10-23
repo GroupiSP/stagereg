@@ -13,6 +13,7 @@ from stagereg.core.checkpoints import (
     is_finalized,
 )
 from stagereg.core.distributions import (
+    ClosedFormCRPS,
     DistributionHead,
     DistributionLoss,
     Likelihood,
@@ -100,6 +101,7 @@ __all__ = [
     "Checkpoint",
     "CheckpointRef",
     "CheckpointStore",
+    "ClosedFormCRPS",
     "ContinuousRankedProbabilityScore",
     "Dataset",
     "Decision",

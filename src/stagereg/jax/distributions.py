@@ -99,28 +99,41 @@ def _reference_axis(targets: jax.Array, batch_shape: tuple[int, ...]) -> jax.Arr
 
 
 def _gaussian_mixture_crps(
-    draw_means: jax.Array, variance: jax.Array, references: jax.Array
+    draw_means: jax.Array,
+    variance: jax.Array,
+    references: jax.Array,
+    weights: jax.Array | None = None,
 ) -> jax.Array:
-    """Return the closed-form expected CRPS of an equally weighted Gaussian mixture.
+    """Return the closed-form expected CRPS of a Gaussian mixture.
 
     The JAX counterpart of
     [`expected_gaussian_mixture_crps`][stagereg.core.expected_gaussian_mixture_crps],
     with the draw and reference axes leading rather than trailing.
 
     Args:
-        draw_means: Component means, shaped ``[M, *batch]``.
+        draw_means: Component means, shaped ``[M, *batch]``; all must be finite.
         variance: The variance every component shares, shaped ``[*batch]``.
         references: Reference samples, shaped ``[R, *batch]``.
+        weights: Component weights summing to one, shaped ``[M]``. Defaults
+            to ``None``, which weights every component equally.
 
     Returns:
         The expected CRPS of each scoring unit, shaped ``[*batch]``.
     """
-    absolute_error = _expected_absolute_gaussian(
-        draw_means[:, None] - references[None, :], variance
-    ).mean(axis=(0, 1))
-    spread = _expected_absolute_gaussian(
+    if weights is None:
+        weights = jnp.full(draw_means.shape[:1], 1.0 / draw_means.shape[0])
+    weights = jnp.reshape(weights, (-1,) + (1,) * (draw_means.ndim - 1))
+    absolute_error = jnp.sum(
+        weights
+        * _expected_absolute_gaussian(
+            draw_means[:, None] - references[None, :], variance
+        ).mean(axis=1),
+        axis=0,
+    )
+    pairwise = _expected_absolute_gaussian(
         draw_means[:, None] - draw_means[None, :], 2.0 * variance
-    ).mean(axis=(0, 1))
+    )
+    spread = jnp.sum(weights[:, None] * weights[None, :] * pairwise, axis=(0, 1))
     return absolute_error - spread / 2.0
 
 
@@ -352,6 +365,28 @@ class MomentMatchedPredictive:
         """Return the aleatoric plus the epistemic variance."""
         return self.aleatoric_variance + self.epistemic_variance
 
+    def crps(self, targets: jax.Array) -> jax.Array:
+        """Return the closed-form expected CRPS of the moment-matched Gaussian.
+
+        Implements [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS]. Comparing
+        it with [`PosteriorPredictive.crps`][stagereg.jax.PosteriorPredictive.crps]
+        measures what the single-Gaussian summary loses against the mixture.
+
+        Args:
+            targets: One target per scoring unit, shaped ``[*batch]``, or
+                ``R`` reference samples per scoring unit, shaped
+                ``[R, *batch]``.
+
+        Returns:
+            The CRPS averaged over each unit's reference samples, shaped
+            ``[*batch]``.
+
+        Raises:
+            ValueError: If ``targets`` is shaped neither ``[*batch]`` nor
+                ``[R, *batch]``.
+        """
+        return self._gaussian().crps(targets)
+
 
 @_register_pytree
 @dataclass(frozen=True)
@@ -537,6 +572,43 @@ class PosteriorPredictive:
         if not 0.0 < probability < 1.0:
             raise ValueError("probability must be strictly between 0 and 1.")
         return self._bisect_quantile(probability, NormalDist().inv_cdf(probability))
+
+    def crps(self, targets: jax.Array) -> jax.Array:
+        """Return the closed-form expected CRPS of the mixture for each scoring unit.
+
+        Implements [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS] with the
+        Gaussian-mixture formula of Grimit et al. (2006), as
+        [`expected_gaussian_mixture_crps`][stagereg.core.expected_gaussian_mixture_crps]
+        does.
+
+        Args:
+            targets: One target per scoring unit, shaped ``[*batch]``, or
+                ``R`` reference samples per scoring unit, shaped
+                ``[R, *batch]``.
+
+        Returns:
+            The CRPS averaged over each unit's reference samples, shaped
+            ``[*batch]``.
+
+        Raises:
+            ValueError: If ``targets`` is shaped neither ``[*batch]`` nor
+                ``[R, *batch]``.
+        """
+        batch_shape = self.batch_shape
+        loc, _ = self._components()
+        weights = None
+        if self.draw_mask is not None:
+            # Excluded means may be anything, even inf or NaN; the included
+            # draws' average keeps every difference finite before weighting.
+            mask = jnp.reshape(self.draw_mask, (-1,) + (1,) * len(batch_shape))
+            loc = jnp.where(mask, loc, self.mean())
+            weights = self.draw_mask / self._included_count()
+        return _gaussian_mixture_crps(
+            loc,
+            jnp.broadcast_to(self.aleatoric_variance, batch_shape),
+            _reference_axis(targets, batch_shape),
+            weights,
+        )
 
     def moment_matched(self) -> MomentMatchedPredictive:
         """Summarize the mixture by the Gaussian with its mean and variance.

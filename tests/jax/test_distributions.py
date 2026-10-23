@@ -637,3 +637,132 @@ def test_only_distributions_with_a_closed_form_offer_the_closed_form_crps() -> N
 
     assert isinstance(gaussian, ClosedFormCRPS)
     assert not isinstance(gamma, ClosedFormCRPS)
+
+
+@st.composite
+def posterior_predictives_and_references(
+    draw: st.DrawFn,
+) -> tuple[PosteriorPredictive, np.ndarray]:
+    """Draw a mixture over a ``[B]`` batch and ``[R, B]`` reference samples."""
+    means, variance = draw(posterior_predictives())
+    reference_count = draw(st.integers(1, 4))
+    references = draw(
+        arrays(np.float32, (reference_count, means.shape[1]), elements=_FINITE)
+    )
+    mixture = PosteriorPredictive(
+        draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variance)
+    )
+    return mixture, references
+
+
+def _core_mixture_crps(
+    draw_means: np.ndarray, variance: np.ndarray, references: np.ndarray
+) -> np.ndarray:
+    """Score ``[R, B]`` references against ``[M, B]`` draws with the core function."""
+    return expected_gaussian_mixture_crps(
+        np.asarray(draw_means, dtype=np.float64).T,
+        np.asarray(variance, dtype=np.float64),
+        np.asarray(references, dtype=np.float64).T,
+    )
+
+
+@settings(deadline=None, max_examples=25)
+@given(posterior_predictives_and_references(), st.booleans())
+def test_posterior_predictive_crps_matches_the_core_function(
+    case: tuple[PosteriorPredictive, np.ndarray], one_target_per_unit: bool
+) -> None:
+    mixture, references = case
+    if one_target_per_unit:
+        references = references[:1]
+    targets = references[0] if one_target_per_unit else references
+
+    np.testing.assert_allclose(
+        mixture.crps(jnp.asarray(targets)),
+        _core_mixture_crps(mixture.draws, mixture.aleatoric_variance, references),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None, max_examples=25)
+@given(mixtures=padded_posterior_predictives(), targets=_FINITE)
+def test_a_draw_mask_excludes_its_slots_from_the_crps(
+    mixtures: tuple[PosteriorPredictive, PosteriorPredictive], targets: float
+) -> None:
+    masked, exact = mixtures
+
+    np.testing.assert_allclose(
+        masked.crps(jnp.full(masked.batch_shape, targets)),
+        exact.crps(jnp.full(exact.batch_shape, targets)),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@pytest.mark.parametrize("extreme", [3e38, -3e38, float("inf"), float("nan")])
+def test_extreme_means_in_excluded_slots_leave_the_crps_finite(extreme: float) -> None:
+    included = jnp.array([[0.5, -1.0], [2.0, 0.0]])
+    masked = PosteriorPredictive(
+        draws=jnp.concatenate([included, jnp.full((1, 2), extreme)]),
+        aleatoric_variance=jnp.array([0.5, 2.0]),
+        draw_mask=jnp.array([True, True, False]),
+    )
+    exact = PosteriorPredictive(
+        draws=included, aleatoric_variance=jnp.array([0.5, 2.0])
+    )
+    references = jnp.array([[0.0, 1.0], [3.0, -2.0]])
+
+    np.testing.assert_allclose(
+        masked.crps(references), exact.crps(references), rtol=1e-5, atol=1e-6
+    )
+
+
+@settings(deadline=None, max_examples=25)
+@given(posterior_predictives_and_references(), st.booleans())
+def test_moment_matched_crps_matches_the_core_function(
+    case: tuple[PosteriorPredictive, np.ndarray], one_target_per_unit: bool
+) -> None:
+    mixture, references = case
+    if one_target_per_unit:
+        references = references[:1]
+    targets = references[0] if one_target_per_unit else references
+    summary = mixture.moment_matched()
+
+    np.testing.assert_allclose(
+        summary.crps(jnp.asarray(targets)),
+        _core_mixture_crps(summary.loc[None], summary.variance(), references),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None, max_examples=15)
+@given(mixtures=padded_posterior_predictives(), references=_FINITE)
+def test_posterior_crps_is_the_same_under_jit(
+    mixtures: tuple[PosteriorPredictive, PosteriorPredictive], references: float
+) -> None:
+    masked, _ = mixtures
+    targets = jnp.full((2, *masked.batch_shape), references)
+    summary = masked.moment_matched()
+
+    np.testing.assert_allclose(
+        jax.jit(PosteriorPredictive.crps)(masked, targets),
+        masked.crps(targets),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        jax.jit(MomentMatchedPredictive.crps)(summary, targets),
+        summary.crps(targets),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_the_posterior_predictive_and_its_summary_offer_the_closed_form_crps() -> None:
+    mixture = PosteriorPredictive(
+        draws=jnp.zeros((2, 3)), aleatoric_variance=jnp.ones(3)
+    )
+
+    assert isinstance(mixture, ClosedFormCRPS)
+    assert isinstance(mixture.moment_matched(), ClosedFormCRPS)

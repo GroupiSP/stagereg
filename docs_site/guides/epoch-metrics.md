@@ -243,13 +243,47 @@ A distribution offers the closed form by implementing the optional
 method that takes one target per scoring unit, shaped `[*batch]`, or `R`
 reference samples per scoring unit, shaped `[R, *batch]`, and returns each
 unit's expected CRPS, shaped `[*batch]`.
-[`Gaussian`][stagereg.jax.Gaussian] implements it;
+[`Gaussian`][stagereg.jax.Gaussian],
+[`PosteriorPredictive`][stagereg.jax.PosteriorPredictive] and
+[`MomentMatchedPredictive`][stagereg.jax.MomentMatchedPredictive] implement it;
+[`Gamma`][stagereg.jax.Gamma] does not, and
 [`PredictiveDistribution`][stagereg.core.PredictiveDistribution] does not
 require it. When the model's distribution has no `crps` method, the predictor
 raises a `TypeError` that names the distribution's class and points to
 `SampleContinuousRankedProbabilityScore`. It never falls back to a sample
 estimate, so a value reported as `closed_form_crps` is always the exact score
 ([ADR 0015](https://github.com/GroupiSP/stagereg/blob/main/docs/adr/0015-the-closed-form-crps-never-falls-back-to-sampling.md)).
+
+For a posterior stage, register the metric on a
+[`PosteriorPredictivePredictor`][stagereg.jax.PosteriorPredictivePredictor].
+It scores the exact mixture over the draws (Grimit et al. 2006), not its
+moment-matched Gaussian, and slots that the
+[`draw_mask`][stagereg.jax.PosteriorPredictive] excludes do not contribute, so
+the score equals that of the mixture over the included draws alone. One draw
+scores exactly as a `GaussianPredictor` does, so a variance stage and a
+posterior stage report comparable values. To see what the single-Gaussian
+summary loses, compare the mixture's `crps` with that of its
+[`moment_matched`][stagereg.jax.PosteriorPredictive.moment_matched] summary:
+
+```python
+import jax.numpy as jnp
+
+from stagereg.core import ClosedFormContinuousRankedProbabilityScore
+from stagereg.jax import MetricSuite, PosteriorPredictive, PosteriorPredictivePredictor
+
+suite = MetricSuite(
+    epoch=(ClosedFormContinuousRankedProbabilityScore(),),
+    predictor=PosteriorPredictivePredictor(),
+)
+
+bimodal = PosteriorPredictive(
+    draws=jnp.array([[-2.0], [2.0]]), aleatoric_variance=jnp.array([0.1])
+)
+targets = jnp.array([2.0])
+mixture_crps = bimodal.crps(targets)
+summary_crps = bimodal.moment_matched().crps(targets)
+assert mixture_crps < summary_crps
+```
 
 In a simulated benchmark you can score each predictive distribution against
 the reference distribution of its target instead, as

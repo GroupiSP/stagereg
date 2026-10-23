@@ -123,7 +123,7 @@ scored by
 The closed-form CRPS evaluates the mixture's own formula rather than predictive
 samples, so the default suite needs neither a predictive sample count nor an
 evaluation grid, and early stopping, checkpoint selection and HPO pruning
-compare an exact score with no Monte Carlo noise and no bias toward narrow
+compare a closed-form score with no Monte Carlo noise and no bias toward narrow
 posteriors. To score other metrics, give the options a
 `validation_metrics` suite with a
 [`PosteriorPredictivePredictor`][stagereg.jax.PosteriorPredictivePredictor];

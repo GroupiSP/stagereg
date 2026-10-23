@@ -395,8 +395,8 @@ def _score_suite(
 ) -> MetricSuite:
     """Register the NLL and the closed-form CRPS, reported as ``nll`` and ``crps``.
 
-    Both stages are scored with the same exact CRPS, so the difference between them
-    reflects the predictives, not the estimator.
+    Both stages are scored with the same closed-form CRPS, so the difference between
+    them reflects the predictives, not the estimator.
     """
     return MetricSuite(
         epoch=(

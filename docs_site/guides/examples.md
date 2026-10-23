@@ -73,7 +73,7 @@ uv run --extra jax --extra plot python examples/jax/xsin/posterior.py
 For each inference method it prints the NLL and the closed-form CRPS of the
 variance stage's Gaussian and of the posterior predictive, scored on one noisy
 observation per evaluation point, overall, inside the training domain and
-outside it. Both stages use the same exact CRPS, computed from each predictive's
+outside it. Both stages use the same closed-form CRPS, computed from each predictive's
 own formula, so their difference reflects the predictives rather than the
 estimator. It plots the moment-matched predictive's 95% band over the variance
 stage's band, with the aleatoric and epistemic variance below.

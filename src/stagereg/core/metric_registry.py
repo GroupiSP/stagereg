@@ -553,8 +553,9 @@ class ClosedFormContinuousRankedProbabilityScore:
     Each unit is scored by its predictive distribution's own CRPS formula, so the
     value carries no Monte Carlo noise and needs neither predictive samples nor
     an evaluation grid. With ``against_reference`` set, each unit is scored
-    against its reference samples instead of its target, giving the exact
-    expected CRPS under the reference distribution. The predictor's distribution must implement
+    against its reference samples instead of its target, giving the mean
+    closed-form CRPS over the reference distribution. The predictor's
+    distribution must implement
     [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS]; otherwise the predictor
     raises a ``TypeError`` rather than fall back to a sample estimate (ADR 0015).
     For a distribution without a closed form, use

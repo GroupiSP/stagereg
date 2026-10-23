@@ -8,7 +8,7 @@ All notable changes to `stagereg` are recorded here. The format follows
 ## [0.5.0] - 2026-10-23
 
 Closed-form CRPS release (#143): Gaussian and Gaussian-mixture predictives
-score their CRPS exactly, with no Monte Carlo noise and no evaluation grid.
+score their closed-form CRPS, with no Monte Carlo noise and no evaluation grid.
 
 ### Breaking changes
 
@@ -28,7 +28,7 @@ score their CRPS exactly, with no Monte Carlo noise and no evaluation grid.
 
 ### Added
 
-- `expected_gaussian_mixture_crps`: the exact expected CRPS of an equally
+- `expected_gaussian_mixture_crps`: the closed-form CRPS of an equally
   weighted Gaussian mixture, in `stagereg.core` (#144).
 - `ClosedFormCRPS`: an optional protocol for predictive distributions with a
   closed-form CRPS. A metric that asks for it never falls back to sampling
@@ -39,7 +39,7 @@ score their CRPS exactly, with no Monte Carlo noise and no evaluation grid.
 - `ClosedFormContinuousRankedProbabilityScore`: an epoch metric averaging the
   predictive distribution's closed-form CRPS. With `against_reference=True` it
   scores each unit's reference samples instead of its target, giving the
-  exact expected CRPS under the reference distribution (#144, #146).
+  mean closed-form CRPS over the reference distribution (#144, #146).
 
 ## [0.4.0] - 2026-10-21
 

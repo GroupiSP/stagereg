@@ -251,7 +251,7 @@ unit's expected CRPS, shaped `[*batch]`.
 require it. When the model's distribution has no `crps` method, the predictor
 raises a `TypeError` that names the distribution's class and points to
 `SampleContinuousRankedProbabilityScore`. It never falls back to a sample
-estimate, so a value reported as `closed_form_crps` is always the exact score
+estimate, so a value reported as `closed_form_crps` is always the closed-form CRPS
 ([ADR 0015](https://github.com/GroupiSP/stagereg/blob/main/docs/adr/0015-the-closed-form-crps-never-falls-back-to-sampling.md)).
 
 For a posterior stage, register the metric on a
@@ -291,7 +291,7 @@ the reference distribution of its target instead, as
 samples. Set `against_reference=True`: the metric then also asks for reference
 samples, the predictor draws them from its `reference_samples_extractor` under
 the same key as for `ContinuousRankedProbabilityScore`, and the value is the
-exact expected CRPS over those samples. Scoring references is a choice made on
+mean closed-form CRPS over those samples. Scoring references is a choice made on
 the metric, never by configuring an extractor. A suite that asks for it from a
 predictor without an extractor fails when it is built, and so does a suite that
 would score the closed-form CRPS against both targets and references, since

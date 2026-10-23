@@ -310,7 +310,9 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
     """Materialize the requested fields of one scalar-event prediction.
 
     The mean, variance, predictive samples, log-likelihood and closed-form CRPS
-    are computed by one compiled call and copied to the host together.
+    are computed by one compiled call and copied to the host together. When
+    reference samples are requested they are extracted before that call, so
+    the closed-form CRPS can score them on the device.
 
     Raises:
         TypeError: If the closed-form CRPS is requested and ``prediction`` does
@@ -319,6 +321,15 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
     fields = requirements.fields
     if fields.closed_form_crps:
         _require_closed_form_crps(prediction)
+    batch_shape = prediction.batch_shape
+    reference_samples = _materialize_reference_samples(
+        reference_samples_extractor,
+        batch=batch,
+        key=key,
+        n_scoring_units=math.prod(jnp.shape(targets)),
+        required=fields.reference_samples,
+    )
+    against_reference = fields.closed_form_crps and reference_samples is not None
     sample_count = (
         requirements.predictive_sample_count if fields.predictive_samples else None
     )
@@ -333,7 +344,13 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
             prediction,
             (
                 jnp.asarray(targets)
-                if fields.log_likelihood or fields.closed_form_crps
+                if fields.log_likelihood
+                or (fields.closed_form_crps and not against_reference)
+                else None
+            ),
+            (
+                _rows_to_samples(reference_samples, batch_shape)
+                if against_reference
                 else None
             ),
             key,
@@ -343,7 +360,6 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
             closed_form_crps=fields.closed_form_crps,
         )
     )
-    batch_shape = prediction.batch_shape
     mean, target_values = _host_mean_and_targets(device["mean"], targets, batch_shape)
     return EpochPredictionData(
         targets=target_values,
@@ -358,13 +374,7 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
                 name="predictive_samples",
             )
         ),
-        reference_samples=_materialize_reference_samples(
-            reference_samples_extractor,
-            batch=batch,
-            key=key,
-            n_scoring_units=target_values.size,
-            required=fields.reference_samples,
-        ),
+        reference_samples=reference_samples,
         intervals=tuple(
             interval(prediction, level) for level in sorted(fields.interval_levels)
         ),
@@ -376,6 +386,7 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
         evaluation_grid=_required_evaluation_grid(requirements),
         log_likelihood=_host_per_unit(device.get("log_likelihood"), batch_shape),
         closed_form_crps=_host_per_unit(device.get("closed_form_crps"), batch_shape),
+        closed_form_crps_against_reference=against_reference,
     )
 
 
@@ -399,6 +410,7 @@ def _require_closed_form_crps(prediction: object) -> None:
 def _device_fields(
     prediction: PredictiveDistribution,
     targets: jax.Array | None,
+    references: jax.Array | None,
     key: jax.Array,
     *,
     variance: bool,
@@ -411,14 +423,16 @@ def _device_fields(
     Args:
         prediction: The predictive distribution.
         targets: The observed targets, shaped like the prediction's batch,
-            or ``None`` when neither the log-likelihood nor the closed-form
-            CRPS is requested.
+            or ``None`` when no field needs them.
+        references: Reference samples shaped ``[R, *batch]`` for the
+            closed-form CRPS to score instead of ``targets``, or ``None``.
         key: The metric key; predictive samples use ``fold_in(key, 0)``.
         variance: Whether to compute the predictive variance.
         sample_count: The number of predictive samples, or ``None`` for none.
         log_likelihood: Whether to compute the targets' log-density.
-        closed_form_crps: Whether to compute the targets' closed-form CRPS;
-            ``prediction`` must then implement
+        closed_form_crps: Whether to compute the closed-form CRPS of the
+            references, or of the targets without references; ``prediction``
+            must then implement
             [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
 
     Returns:
@@ -436,8 +450,9 @@ def _device_fields(
         assert targets is not None
         computed["log_likelihood"] = prediction.log_prob(targets)
     if closed_form_crps:
-        assert targets is not None and isinstance(prediction, ClosedFormCRPS)
-        computed["closed_form_crps"] = prediction.crps(targets)
+        scored = targets if references is None else references
+        assert scored is not None and isinstance(prediction, ClosedFormCRPS)
+        computed["closed_form_crps"] = prediction.crps(scored)
     return computed
 
 
@@ -546,6 +561,13 @@ def _samples_to_rows(
     if array.ndim != len(prediction_shape) + 1 or array.shape[1:] != prediction_shape:
         raise ValueError(f"{name} must have shape (n_samples, *prediction_shape).")
     return np.moveaxis(array, 0, -1).reshape(-1, array.shape[0])
+
+
+def _rows_to_samples(
+    rows: NDArray[np.float64], batch_shape: tuple[int, ...]
+) -> jax.Array:
+    """Convert host scoring-unit rows to JAX sample-first samples."""
+    return jnp.asarray(rows.T.reshape(rows.shape[1], *batch_shape))
 
 
 def _gaussian_interval(prediction: Gaussian, level: float) -> PredictionInterval:
@@ -777,7 +799,23 @@ def merge_epoch_prediction_data(
         evaluation_grid=_merge_grid(parts),
         log_likelihood=_concat_optional_vectors(parts, "log_likelihood"),
         closed_form_crps=_concat_optional_vectors(parts, "closed_form_crps"),
+        closed_form_crps_against_reference=_merge_closed_form_crps_scoring(parts),
     )
+
+
+def _merge_closed_form_crps_scoring(parts: Sequence[EpochPredictionData]) -> bool:
+    """Return whether every part's closed-form CRPS scored reference samples.
+
+    Raises:
+        ValueError: If some parts scored the target and others the references.
+    """
+    scoring = {part.closed_form_crps_against_reference for part in parts}
+    if len(scoring) > 1:
+        raise ValueError(
+            "closed_form_crps must score the target in all batches or the "
+            "reference samples in all batches."
+        )
+    return scoring.pop()
 
 
 def _concat_optional_vectors(

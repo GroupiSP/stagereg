@@ -764,3 +764,31 @@ def test_the_closed_form_crps_is_computed_in_the_same_compiled_call(
     assert data.closed_form_crps is not None
     assert data.closed_form_crps.shape == (11,)
     assert data.log_likelihood is not None
+
+
+_REFERENCE_BATCH = Batch(
+    inputs=jnp.array([[-1.0], [0.0], [0.5], [2.0]]),
+    targets=jnp.array([[-0.5], [0.3], [1.5], [1.0]]),
+    metadata={
+        "reference_samples": jnp.array(
+            [[-3.0, 1.0, 0.0], [2.0, 2.5, 4.0], [0.5, -1.0, 1.5], [3.0, 2.0, 2.2]]
+        )
+    },
+)
+
+
+def test_closed_form_crps_against_reference_scores_the_extractor_samples() -> None:
+    suite = MetricSuite(
+        epoch=(ClosedFormContinuousRankedProbabilityScore(against_reference=True),),
+        predictor=GaussianPredictor(reference_samples_extractor=reference_from_batch),
+    )
+    model = ShiftedGaussianModel(0.5, variance=0.25)
+
+    scores = _scores(suite, model, _REFERENCE_BATCH)
+
+    inputs = np.asarray(_REFERENCE_BATCH.inputs, np.float64).reshape(-1)
+    references = np.asarray(_REFERENCE_BATCH.metadata["reference_samples"])
+    expected = expected_gaussian_mixture_crps(
+        (inputs + 0.5)[:, None], np.full(inputs.size, 0.25), references
+    )
+    assert scores == {"closed_form_crps": pytest.approx(np.mean(expected), rel=1e-5)}

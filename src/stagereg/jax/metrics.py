@@ -23,7 +23,7 @@ from stagereg.core.metric_registry import (
     MetricRequirements,
     PredictionInterval,
 )
-from stagereg.core.distributions import PredictiveDistribution
+from stagereg.core.distributions import ClosedFormCRPS, PredictiveDistribution
 from stagereg.core.types import Batch, PyTree
 from stagereg.jax.distributions import Gaussian, PosteriorPredictive
 
@@ -309,10 +309,16 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
 ) -> EpochPredictionData:
     """Materialize the requested fields of one scalar-event prediction.
 
-    The mean, variance, predictive samples and log-likelihood are computed by one
-    compiled call and copied to the host together.
+    The mean, variance, predictive samples, log-likelihood and closed-form CRPS
+    are computed by one compiled call and copied to the host together.
+
+    Raises:
+        TypeError: If the closed-form CRPS is requested and ``prediction`` does
+            not implement [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
     """
     fields = requirements.fields
+    if fields.closed_form_crps:
+        _require_closed_form_crps(prediction)
     sample_count = (
         requirements.predictive_sample_count if fields.predictive_samples else None
     )
@@ -325,10 +331,16 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
     device = jax.device_get(
         compute(
             prediction,
-            jnp.asarray(targets) if fields.log_likelihood else None,
+            (
+                jnp.asarray(targets)
+                if fields.log_likelihood or fields.closed_form_crps
+                else None
+            ),
             key,
             variance=fields.variance,
             sample_count=sample_count,
+            log_likelihood=fields.log_likelihood,
+            closed_form_crps=fields.closed_form_crps,
         )
     )
     batch_shape = prediction.batch_shape
@@ -363,7 +375,25 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
         ),
         evaluation_grid=_required_evaluation_grid(requirements),
         log_likelihood=_host_per_unit(device.get("log_likelihood"), batch_shape),
+        closed_form_crps=_host_per_unit(device.get("closed_form_crps"), batch_shape),
     )
+
+
+def _require_closed_form_crps(prediction: object) -> None:
+    """Refuse a prediction that offers no closed-form CRPS.
+
+    The closed-form CRPS never falls back to a sample estimate (ADR 0015).
+
+    Raises:
+        TypeError: If ``prediction`` does not implement
+            [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
+    """
+    if not isinstance(prediction, ClosedFormCRPS):
+        raise TypeError(
+            f"{type(prediction).__name__} has no closed-form CRPS: it does not "
+            "implement ClosedFormCRPS (a crps method). Score it with "
+            "SampleContinuousRankedProbabilityScore instead, or implement crps."
+        )
 
 
 def _device_fields(
@@ -373,16 +403,23 @@ def _device_fields(
     *,
     variance: bool,
     sample_count: int | None,
+    log_likelihood: bool,
+    closed_form_crps: bool,
 ) -> dict[str, jax.Array]:
     """Compute a prediction's requested device fields.
 
     Args:
         prediction: The predictive distribution.
-        targets: The targets to score the log-density of, or ``None`` when
-            the log-likelihood is not requested.
+        targets: The observed targets, shaped like the prediction's batch,
+            or ``None`` when neither the log-likelihood nor the closed-form
+            CRPS is requested.
         key: The metric key; predictive samples use ``fold_in(key, 0)``.
         variance: Whether to compute the predictive variance.
         sample_count: The number of predictive samples, or ``None`` for none.
+        log_likelihood: Whether to compute the targets' log-density.
+        closed_form_crps: Whether to compute the targets' closed-form CRPS;
+            ``prediction`` must then implement
+            [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
 
     Returns:
         The mean, and each requested field under its ``EpochPredictionData``
@@ -395,13 +432,18 @@ def _device_fields(
         computed["predictive_samples"] = prediction.sample(
             jax.random.fold_in(key, 0), sample_shape=(sample_count,)
         )
-    if targets is not None:
+    if log_likelihood:
+        assert targets is not None
         computed["log_likelihood"] = prediction.log_prob(targets)
+    if closed_form_crps:
+        assert targets is not None and isinstance(prediction, ClosedFormCRPS)
+        computed["closed_form_crps"] = prediction.crps(targets)
     return computed
 
 
 _compiled_device_fields = jax.jit(
-    _device_fields, static_argnames=("variance", "sample_count")
+    _device_fields,
+    static_argnames=("variance", "sample_count", "log_likelihood", "closed_form_crps"),
 )
 
 
@@ -734,6 +776,7 @@ def merge_epoch_prediction_data(
         coordinate=_concat_optional_vectors(parts, "coordinate"),
         evaluation_grid=_merge_grid(parts),
         log_likelihood=_concat_optional_vectors(parts, "log_likelihood"),
+        closed_form_crps=_concat_optional_vectors(parts, "closed_form_crps"),
     )
 
 

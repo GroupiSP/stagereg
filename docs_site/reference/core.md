@@ -87,6 +87,8 @@ grouped by the module that defines it.
 
 ::: stagereg.core.SampleContinuousRankedProbabilityScore
 
+::: stagereg.core.ClosedFormContinuousRankedProbabilityScore
+
 ::: stagereg.core.ContinuousRankedProbabilityScore
 
 ## `stagereg.core.metrics`

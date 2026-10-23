@@ -14,6 +14,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from stagereg.core.metric_registry import (
+    ClosedFormContinuousRankedProbabilityScore,
     ContinuousRankedProbabilityScore,
     EpochPredictionData,
     EvaluationGrid,
@@ -25,6 +26,7 @@ from stagereg.core.metric_registry import (
     RootMeanSquaredError,
     WeightedSpread,
 )
+from stagereg.core.metrics import expected_gaussian_mixture_crps
 from stagereg.core.types import Batch
 from stagereg.jax.distributions import Gaussian, GaussianHead, PosteriorPredictive
 from stagereg.jax.metrics import (
@@ -677,3 +679,88 @@ def test_a_predictor_materializes_a_prediction_in_one_compiled_call(
     assert data.log_likelihood is not None and data.log_likelihood.shape == (11,)
     assert data.predictive_samples is not None
     assert data.predictive_samples.shape == (11, 16)
+
+
+class GaussianWithoutClosedFormCRPS(Gaussian):
+    """A Gaussian that, like a user distribution, offers no ``crps`` method."""
+
+    crps = None  # type: ignore[assignment]
+
+
+def test_closed_form_crps_scores_the_gaussian_without_samples_or_a_grid() -> None:
+    suite = MetricSuite(
+        epoch=(ClosedFormContinuousRankedProbabilityScore(),),
+        predictor=GaussianPredictor(),
+    )
+    model = ShiftedGaussianModel(0.5, variance=0.25)
+
+    scores = _scores(suite, model, _MIXTURE_BATCH)
+
+    inputs = np.asarray(_MIXTURE_BATCH.inputs, np.float64).reshape(-1)
+    targets = np.asarray(_MIXTURE_BATCH.targets, np.float64).reshape(-1, 1)
+    expected = expected_gaussian_mixture_crps(
+        (inputs + 0.5)[:, None], np.full(inputs.size, 0.25), targets
+    )
+    assert suite.prediction_requirements.predictive_sample_count is None
+    assert suite.prediction_requirements.evaluation_grid is None
+    assert scores == {"closed_form_crps": pytest.approx(np.mean(expected), rel=1e-5)}
+
+
+def test_closed_form_crps_refuses_a_prediction_without_a_closed_form() -> None:
+    suite = MetricSuite(
+        epoch=(ClosedFormContinuousRankedProbabilityScore(),),
+        predictor=GaussianPredictor(),
+    )
+    prediction = GaussianWithoutClosedFormCRPS(loc=jnp.zeros(4), scale=jnp.ones(4))
+
+    with pytest.raises(
+        TypeError,
+        match="GaussianWithoutClosedFormCRPS.*SampleContinuousRankedProbabilityScore",
+    ):
+        resolve_epoch_prediction_data(
+            suite=suite,
+            model=FixedPredictionModel(prediction),
+            batch=Batch(inputs=jnp.zeros((4, 1)), targets=jnp.zeros(4)),
+            key=jax.random.key(0),
+        )
+
+
+def test_merge_concatenates_closed_form_crps_across_batches() -> None:
+    parts = [
+        EpochPredictionData(
+            targets=np.zeros(n), mean=np.zeros(n), closed_form_crps=np.full(n, float(n))
+        )
+        for n in (1, 2)
+    ]
+
+    merged = merge_epoch_prediction_data(parts)
+
+    assert np.array_equal(merged.closed_form_crps, np.array([1.0, 2.0, 2.0]))
+
+
+def test_the_closed_form_crps_is_computed_in_the_same_compiled_call(
+    compile_counter: Callable[[], Any],
+) -> None:
+    batch = Batch(inputs=jnp.zeros((11, 1)), targets=jnp.linspace(0.0, 2.0, 11))
+    model = FixedPredictionModel(
+        Gaussian(loc=jnp.linspace(0.0, 1.0, 11), scale=jnp.full(11, 0.5))
+    )
+    requirements = PredictionRequirements(
+        fields=MetricRequirements(
+            variance=True,
+            predictive_samples=True,
+            log_likelihood=True,
+            closed_form_crps=True,
+        ),
+        predictive_sample_count=16,
+    )
+
+    with compile_counter() as counter:
+        data = GaussianPredictor()(
+            model, batch, requirements, metric_key(jax.random.key(0))
+        )
+
+    assert counter.total == 1
+    assert data.closed_form_crps is not None
+    assert data.closed_form_crps.shape == (11,)
+    assert data.log_likelihood is not None

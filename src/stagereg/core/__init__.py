@@ -35,6 +35,7 @@ from stagereg.core.losses import (
     add_epsilon,
 )
 from stagereg.core.metric_registry import (
+    ClosedFormContinuousRankedProbabilityScore,
     ContinuousRankedProbabilityScore,
     EpochMetric,
     EpochPredictionData,
@@ -102,6 +103,7 @@ __all__ = [
     "CheckpointRef",
     "CheckpointStore",
     "ClosedFormCRPS",
+    "ClosedFormContinuousRankedProbabilityScore",
     "ContinuousRankedProbabilityScore",
     "Dataset",
     "Decision",

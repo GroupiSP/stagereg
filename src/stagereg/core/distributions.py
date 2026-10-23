@@ -36,8 +36,9 @@ class ClosedFormCRPS(Protocol):
 
     This protocol is optional: a
     [`PredictiveDistribution`][stagereg.core.PredictiveDistribution] need not
-    implement it. A distribution that does can be scored by the closed-form
-    CRPS epoch metric, which never falls back to a sample estimate (ADR 0015). ``isinstance`` checks
+    implement it. A distribution that does can be scored by
+    [`ClosedFormContinuousRankedProbabilityScore`][stagereg.core.ClosedFormContinuousRankedProbabilityScore],
+    which never falls back to a sample estimate (ADR 0015). ``isinstance`` checks
     only that a ``crps`` method exists.
     """
 

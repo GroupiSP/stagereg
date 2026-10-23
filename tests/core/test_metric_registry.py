@@ -6,6 +6,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from stagereg.core.metric_registry import (
+    ClosedFormContinuousRankedProbabilityScore,
     ContinuousRankedProbabilityScore,
     EpochPredictionData,
     EvaluationGrid,
@@ -27,6 +28,7 @@ AdapterType = type[
     | PointContinuousRankedProbabilityScore
     | ContinuousRankedProbabilityScore
     | SampleContinuousRankedProbabilityScore
+    | ClosedFormContinuousRankedProbabilityScore
 ]
 
 
@@ -231,6 +233,7 @@ _ADAPTER_DEFAULT_NAMES: list[tuple[AdapterType, str]] = [
     (PointContinuousRankedProbabilityScore, "point_crps"),
     (ContinuousRankedProbabilityScore, "crps"),
     (SampleContinuousRankedProbabilityScore, "sample_crps"),
+    (ClosedFormContinuousRankedProbabilityScore, "closed_form_crps"),
 ]
 
 
@@ -373,3 +376,44 @@ def test_log_likelihood_requirement_survives_union() -> None:
 
     assert combined.log_likelihood
     assert not MetricRequirements().log_likelihood
+
+
+def test_closed_form_crps_averages_the_scoring_units_closed_form_crps() -> None:
+    data = EpochPredictionData(
+        targets=np.zeros(3),
+        mean=np.zeros(3),
+        closed_form_crps=np.array([0.5, 1.0, 3.0]),
+    )
+
+    assert ClosedFormContinuousRankedProbabilityScore()(data) == pytest.approx(1.5)
+
+
+def test_closed_form_crps_needs_neither_samples_nor_a_grid() -> None:
+    requirements = ClosedFormContinuousRankedProbabilityScore().requirements
+
+    assert requirements == MetricRequirements(closed_form_crps=True)
+
+
+def test_closed_form_crps_requires_the_closed_form_crps_field() -> None:
+    data = EpochPredictionData(targets=np.array([0.0]), mean=np.array([0.0]))
+
+    with pytest.raises(ValueError, match="closed_form_crps"):
+        ClosedFormContinuousRankedProbabilityScore()(data)
+
+
+def test_closed_form_crps_must_match_the_scoring_units_and_be_finite() -> None:
+    with pytest.raises(ValueError, match="closed_form_crps must match"):
+        EpochPredictionData(
+            targets=np.zeros(2), mean=np.zeros(2), closed_form_crps=np.zeros(3)
+        )
+    with pytest.raises(ValueError, match="finite"):
+        EpochPredictionData(
+            targets=np.zeros(1), mean=np.zeros(1), closed_form_crps=np.array([np.nan])
+        )
+
+
+def test_closed_form_crps_requirement_survives_union() -> None:
+    combined = MetricRequirements().union(MetricRequirements(closed_form_crps=True))
+
+    assert combined.closed_form_crps
+    assert not MetricRequirements().closed_form_crps

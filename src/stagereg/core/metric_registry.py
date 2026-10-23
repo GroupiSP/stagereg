@@ -165,6 +165,10 @@ class EpochPredictionData:
         log_likelihood: Log-density of each scoring unit's target under the
             predictive distribution. Defaults to ``None`` when no metric
             requires it.
+        closed_form_crps: Closed-form CRPS of each scoring unit's predictive
+            distribution at its target, computed from the distribution's own
+            formula (see [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS]).
+            Defaults to ``None`` when no metric requires it.
     """
 
     targets: FloatArray
@@ -176,6 +180,7 @@ class EpochPredictionData:
     coordinate: FloatArray | None = None
     evaluation_grid: EvaluationGrid | None = None
     log_likelihood: FloatArray | None = None
+    closed_form_crps: FloatArray | None = None
 
     def __post_init__(self) -> None:
         """Validate all fields against the common scoring-unit axis.
@@ -233,11 +238,14 @@ class EpochPredictionData:
                 raise ValueError("coordinate must match the scoring-unit shape.")
             object.__setattr__(self, "coordinate", coordinate)
 
-        if self.log_likelihood is not None:
-            log_likelihood = _vector(self.log_likelihood, name="log_likelihood")
-            if log_likelihood.shape != targets.shape:
-                raise ValueError("log_likelihood must match the scoring-unit shape.")
-            object.__setattr__(self, "log_likelihood", log_likelihood)
+        for field_name in ("log_likelihood", "closed_form_crps"):
+            values = getattr(self, field_name)
+            if values is None:
+                continue
+            per_unit = _vector(values, name=field_name)
+            if per_unit.shape != targets.shape:
+                raise ValueError(f"{field_name} must match the scoring-unit shape.")
+            object.__setattr__(self, field_name, per_unit)
 
     def interval(self, level: float) -> PredictionInterval:
         """Return the prediction interval registered at exactly ``level``.
@@ -279,6 +287,8 @@ class MetricRequirements:
             to ``False``.
         log_likelihood: Whether each target's predictive log-density is
             required. Defaults to ``False``.
+        closed_form_crps: Whether each scoring unit's closed-form CRPS is
+            required. Defaults to ``False``.
     """
 
     variance: bool = False
@@ -288,6 +298,7 @@ class MetricRequirements:
     coordinate: bool = False
     evaluation_grid: bool = False
     log_likelihood: bool = False
+    closed_form_crps: bool = False
 
     def __post_init__(self) -> None:
         """Validate requested interval levels.
@@ -320,6 +331,7 @@ class MetricRequirements:
             coordinate=self.coordinate or other.coordinate,
             evaluation_grid=self.evaluation_grid or other.evaluation_grid,
             log_likelihood=self.log_likelihood or other.log_likelihood,
+            closed_form_crps=self.closed_form_crps or other.closed_form_crps,
         )
 
 
@@ -528,6 +540,41 @@ class SampleContinuousRankedProbabilityScore:
             raise ValueError("Sample CRPS requires predictive_samples.")
         scores = expected_sample_crps(data.predictive_samples, data.targets[:, None])
         return float(np.mean(scores))
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedFormContinuousRankedProbabilityScore:
+    """Mean closed-form CRPS of the predictive distribution across scoring units.
+
+    Each unit is scored by its predictive distribution's own CRPS formula, so the
+    value carries no Monte Carlo noise and needs neither predictive samples nor
+    an evaluation grid. The predictor's distribution must implement
+    [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS]; otherwise the predictor
+    raises a ``TypeError`` rather than fall back to a sample estimate (ADR 0015).
+    For a distribution without a closed form, use
+    [`SampleContinuousRankedProbabilityScore`][stagereg.core.SampleContinuousRankedProbabilityScore].
+
+    Attributes:
+        name: Bare metric name the value is reported under. Defaults to
+            ``closed_form_crps``.
+    """
+
+    name: str = "closed_form_crps"
+
+    @property
+    def requirements(self) -> MetricRequirements:
+        """Require each scoring unit's closed-form CRPS only."""
+        return MetricRequirements(closed_form_crps=True)
+
+    def __call__(self, data: EpochPredictionData, /) -> float:
+        """Average the closed-form CRPS over scoring units.
+
+        Raises:
+            ValueError: If the closed-form CRPS is absent.
+        """
+        if data.closed_form_crps is None:
+            raise ValueError("Closed-form CRPS requires closed_form_crps.")
+        return float(np.mean(data.closed_form_crps))
 
 
 @dataclass(frozen=True, slots=True)

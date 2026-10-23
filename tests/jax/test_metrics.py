@@ -820,3 +820,68 @@ def test_a_suite_cannot_score_the_closed_form_crps_of_targets_and_references() -
             predictive_sample_count=3,
             evaluation_grid=EvaluationGrid(np.linspace(-3.0, 3.0, 31)),
         )
+
+
+def test_closed_form_crps_against_reference_is_computed_in_one_compiled_call(
+    compile_counter: Callable[[], Any],
+) -> None:
+    def model_and_batch(n_units: int) -> tuple[nnx.Module, Batch]:
+        model = FixedPredictionModel(
+            Gaussian(loc=jnp.linspace(0.0, 1.0, n_units), scale=jnp.full(n_units, 0.5))
+        )
+        batch = Batch(
+            inputs=jnp.zeros((n_units, 1)),
+            targets=jnp.zeros(n_units),
+            metadata={"reference_samples": jnp.ones((n_units, 3))},
+        )
+        return model, batch
+
+    predictor = GaussianPredictor(reference_samples_extractor=reference_from_batch)
+    suite = MetricSuite(
+        epoch=(
+            NegativeLogLikelihood(),
+            ClosedFormContinuousRankedProbabilityScore(against_reference=True),
+        ),
+        predictor=predictor,
+    )
+    key = metric_key(jax.random.key(0))
+    # Compile the shape-independent eager key operations on another shape first.
+    predictor(*model_and_batch(3), suite.prediction_requirements, key)
+    model, batch = model_and_batch(4)
+
+    with compile_counter() as counter:
+        data = predictor(model, batch, suite.prediction_requirements, key)
+
+    assert counter.total == 1
+    assert data.closed_form_crps is not None and data.closed_form_crps.shape == (4,)
+    assert data.closed_form_crps_against_reference
+
+
+def keyed_reference_samples(batch: Batch, key: jax.Array) -> jax.Array:
+    assert batch.targets is not None
+    return jax.random.normal(key, (batch.targets.shape[0], 5))
+
+
+def test_reference_samples_come_from_the_extractor_under_the_folded_key() -> None:
+    batch = Batch(inputs=jnp.array([[0.0], [1.0], [2.0]]), targets=jnp.zeros((3, 1)))
+    suite = MetricSuite(
+        epoch=(
+            ContinuousRankedProbabilityScore(),
+            ClosedFormContinuousRankedProbabilityScore(
+                name="reference_crps", against_reference=True
+            ),
+        ),
+        predictor=GaussianPredictor(
+            reference_samples_extractor=keyed_reference_samples
+        ),
+        predictive_sample_count=4,
+        evaluation_grid=EvaluationGrid(np.linspace(-5.0, 5.0, 51)),
+    )
+    key = metric_key(jax.random.key(7))
+
+    data = resolve_epoch_prediction_data(
+        suite=suite, model=GaussianModel(), batch=batch, key=key
+    )
+
+    expected = keyed_reference_samples(batch, jax.random.fold_in(key, 1))
+    assert np.array_equal(data.reference_samples, np.asarray(expected, np.float64))

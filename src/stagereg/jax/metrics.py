@@ -566,8 +566,11 @@ def _samples_to_rows(
 def _rows_to_samples(
     rows: NDArray[np.float64], batch_shape: tuple[int, ...]
 ) -> jax.Array:
-    """Convert host scoring-unit rows to JAX sample-first samples."""
-    return jnp.asarray(rows.T.reshape(rows.shape[1], *batch_shape))
+    """Convert host scoring-unit rows to JAX sample-first samples.
+
+    ``device_put`` rather than ``jnp.asarray``, which compiles a copy per shape.
+    """
+    return jax.device_put(rows.T.reshape(rows.shape[1], *batch_shape))
 
 
 def _gaussian_interval(prediction: Gaussian, level: float) -> PredictionInterval:

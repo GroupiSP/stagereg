@@ -792,3 +792,16 @@ def test_closed_form_crps_against_reference_scores_the_extractor_samples() -> No
         (inputs + 0.5)[:, None], np.full(inputs.size, 0.25), references
     )
     assert scores == {"closed_form_crps": pytest.approx(np.mean(expected), rel=1e-5)}
+
+
+@pytest.mark.parametrize(
+    "predictor", [GaussianPredictor(), PosteriorPredictivePredictor()]
+)
+def test_a_suite_scoring_references_without_an_extractor_fails_when_built(
+    predictor: object,
+) -> None:
+    with pytest.raises(ValueError, match="reference_samples_extractor"):
+        MetricSuite(
+            epoch=(ClosedFormContinuousRankedProbabilityScore(against_reference=True),),
+            predictor=predictor,  # type: ignore[arg-type]
+        )

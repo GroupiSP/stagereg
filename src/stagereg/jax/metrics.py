@@ -621,7 +621,9 @@ class MetricSuite:
         """Validate names and explicit epoch materialization configuration.
 
         Raises:
-            ValueError: If names/configuration are invalid or a predictor is absent.
+            ValueError: If names/configuration are invalid, a predictor is
+                absent, or a metric scores reference samples and the predictor's
+                ``reference_samples_extractor`` is ``None``.
         """
         registered_names = [spec.name for spec in self.batch] + [
             metric.name for metric in self.epoch
@@ -638,7 +640,15 @@ class MetricSuite:
             raise ValueError(f"duplicate metric names are not allowed: {duplicates}.")
         if self.epoch and self.predictor is None:
             raise ValueError("epoch metrics require an explicit suite predictor.")
-        self.prediction_requirements
+        requirements = self.prediction_requirements
+        if (
+            requirements.fields.reference_samples
+            and getattr(self.predictor, "reference_samples_extractor", ...) is None
+        ):
+            raise ValueError(
+                "metrics that score reference samples require the predictor's "
+                "reference_samples_extractor."
+            )
 
     @property
     def metric_requirements(self) -> MetricRequirements:

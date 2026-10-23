@@ -221,6 +221,24 @@ def expected_sample_crps(
 
 _erf = np.vectorize(math.erf, otypes=[np.float64])
 
+# The elements of the largest intermediate one block of mixture components may
+# build, ``[block, max(M, R), *batch]``, so memory stays bounded however many
+# components a mixture has (a finite posterior may retain thousands of draws).
+_CRPS_BLOCK_ELEMENTS = 2**22
+
+
+def _sum_blocks(block_fn: Callable[[Any], Any], blocks: Any) -> Any:
+    """Return the sum of ``block_fn`` over the leading axis of ``blocks``.
+
+    Args:
+        block_fn: Maps one block, a tuple of arrays, to an array.
+        blocks: A tuple of arrays sharing a leading block axis.
+
+    Returns:
+        The sum of ``block_fn`` over the blocks.
+    """
+    return sum(block_fn(block) for block in zip(*blocks, strict=True))
+
 
 def gaussian_mixture_crps_kernel(
     xp: ModuleType,
@@ -229,6 +247,7 @@ def gaussian_mixture_crps_kernel(
     variance: Any,
     references: Any,
     weights: Any,
+    sum_blocks: Callable[[Callable[[Any], Any], Any], Any] = _sum_blocks,
 ) -> Any:
     """Return the closed-form expected CRPS of a weighted Gaussian mixture.
 
@@ -241,6 +260,9 @@ def gaussian_mixture_crps_kernel(
 
         sum_m w_m A(mu_m - y, s**2) - (1/2) sum_{m,m'} w_m w_m' A(mu_m - mu_m', 2 s**2)
 
+    The outer sums run over blocks of components, so no intermediate is larger
+    than ``[block, max(M, R), *batch]`` rather than ``[M, M, *batch]``.
+
     Args:
         xp: The array module, ``numpy`` or ``jax.numpy``.
         erf: The error function matching ``xp``.
@@ -249,6 +271,9 @@ def gaussian_mixture_crps_kernel(
             ``[*batch]``.
         references: Reference samples, shaped ``[R, *batch]``.
         weights: Component weights summing to one, shaped ``[M]``.
+        sum_blocks: Sums a function of one block over the leading axis of a
+            tuple of stacked blocks; a backend passes one that keeps a single
+            block in memory at a time. Defaults to a Python loop.
 
     Returns:
         The CRPS averaged over each unit's reference samples, shaped
@@ -261,19 +286,39 @@ def gaussian_mixture_crps_kernel(
         density = xp.exp(-0.5 * z**2) / math.sqrt(2.0 * math.pi)
         return 2.0 * scale * density + location * erf(z / math.sqrt(2.0))
 
-    weights = xp.reshape(weights, (-1,) + (1,) * (draw_means.ndim - 1))
-    absolute_error = xp.sum(
-        weights
-        * expected_absolute(draw_means[:, None] - references[None, :], variance).mean(
-            axis=1
+    components = draw_means.shape[0]
+    units = math.prod(draw_means.shape[1:])
+    widest = max(components, references.shape[0])
+    block = max(1, min(components, _CRPS_BLOCK_ELEMENTS // (widest * units)))
+    padding = -components % block
+    # Padded components repeat the first mean, so every difference stays
+    # finite, and weigh nothing.
+    padded_means = xp.concatenate(
+        [draw_means, xp.broadcast_to(draw_means[:1], (padding, *draw_means.shape[1:]))]
+    )
+    padded_weights = xp.concatenate([weights, xp.zeros(padding, dtype=weights.dtype)])
+    expand = (1,) * (draw_means.ndim - 1)
+    column_weights = xp.reshape(weights, (1, -1, *expand))
+
+    def block_crps(block_arrays: Any) -> Any:
+        means, block_weights = block_arrays
+        block_weights = xp.reshape(block_weights, (-1, *expand))
+        absolute_error = expected_absolute(
+            means[:, None] - references[None, :], variance
+        ).mean(axis=1)
+        pairwise = expected_absolute(
+            means[:, None] - draw_means[None, :], 2.0 * variance
+        )
+        spread = xp.sum(column_weights * pairwise, axis=1)
+        return xp.sum(block_weights * (absolute_error - spread / 2.0), axis=0)
+
+    return sum_blocks(
+        block_crps,
+        (
+            xp.reshape(padded_means, (-1, block, *draw_means.shape[1:])),
+            xp.reshape(padded_weights, (-1, block)),
         ),
-        axis=0,
     )
-    pairwise = expected_absolute(
-        draw_means[:, None] - draw_means[None, :], 2.0 * variance
-    )
-    spread = xp.sum(weights[:, None] * weights[None, :] * pairwise, axis=(0, 1))
-    return absolute_error - spread / 2.0
 
 
 def expected_gaussian_mixture_crps(

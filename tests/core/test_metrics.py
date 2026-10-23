@@ -8,6 +8,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from stagereg.core import metrics
 from stagereg.core.metrics import (
     cdf,
     coverage,
@@ -419,6 +420,25 @@ def test_expected_gaussian_mixture_crps_is_least_at_the_matching_location(
     shifted = expected_gaussian_mixture_crps(draw_means + shift, variance, reference)
 
     assert np.all(shifted >= matched - 1e-6)
+
+
+@pytest.mark.parametrize("block_elements", [1, 7, 40])
+def test_expected_gaussian_mixture_crps_is_the_same_in_blocks_of_components(
+    monkeypatch: pytest.MonkeyPatch, block_elements: int
+) -> None:
+    rng = np.random.default_rng(0)
+    draw_means = rng.normal(size=(3, 11))
+    variance = rng.uniform(0.1, 2.0, size=3)
+    reference = rng.normal(size=(3, 4))
+    whole = expected_gaussian_mixture_crps(draw_means, variance, reference)
+
+    monkeypatch.setattr(metrics, "_CRPS_BLOCK_ELEMENTS", block_elements)
+
+    np.testing.assert_allclose(
+        expected_gaussian_mixture_crps(draw_means, variance, reference),
+        whole,
+        rtol=1e-12,
+    )
 
 
 @pytest.mark.parametrize(

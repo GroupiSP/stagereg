@@ -114,7 +114,14 @@ def _gaussian_mixture_crps(
     if weights is None:
         weights = jnp.full(draw_means.shape[:1], 1.0 / draw_means.shape[0])
     return gaussian_mixture_crps_kernel(
-        jnp, jsp.erf, draw_means, variance, references, weights
+        jnp,
+        jsp.erf,
+        draw_means,
+        variance,
+        references,
+        weights,
+        # A sequential map keeps one block of components in memory under jit.
+        lambda block_fn, blocks: jax.lax.map(block_fn, blocks).sum(axis=0),
     )
 
 

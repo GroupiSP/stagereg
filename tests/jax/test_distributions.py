@@ -22,6 +22,7 @@ from stagereg.jax.distributions import (
     MomentMatchedPredictive,
     PosteriorPredictive,
 )
+from stagereg.core import metrics as core_metrics
 from stagereg.core import Batch, ClosedFormCRPS, expected_gaussian_mixture_crps
 
 _FINITE = st.floats(min_value=-10.0, max_value=10.0, width=32)
@@ -782,6 +783,29 @@ def test_posterior_crps_is_the_same_under_jit(
         summary.crps(targets),
         rtol=1e-5,
         atol=1e-5,
+    )
+
+
+def test_posterior_crps_is_the_same_in_blocks_of_draws_under_jit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_means, key_references = jax.random.split(jax.random.key(0))
+    masked = PosteriorPredictive(
+        draws=jax.random.normal(key_means, (13, 2)),
+        aleatoric_variance=jnp.array([0.5, 2.0]),
+        draw_mask=jnp.arange(13) < 10,
+    )
+    references = jax.random.normal(key_references, (3, 2))
+    whole = masked.crps(references)
+
+    # Blocks of two draws: seven blocks, the last one padded.
+    monkeypatch.setattr(core_metrics, "_CRPS_BLOCK_ELEMENTS", 2 * 13 * 2)
+
+    np.testing.assert_allclose(
+        jax.jit(PosteriorPredictive.crps)(masked, references),
+        whole,
+        rtol=1e-5,
+        atol=1e-6,
     )
 
 

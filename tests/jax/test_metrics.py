@@ -805,3 +805,18 @@ def test_a_suite_scoring_references_without_an_extractor_fails_when_built(
             epoch=(ClosedFormContinuousRankedProbabilityScore(against_reference=True),),
             predictor=predictor,  # type: ignore[arg-type]
         )
+
+
+def test_a_suite_cannot_score_the_closed_form_crps_of_targets_and_references() -> None:
+    with pytest.raises(ValueError, match="closed-form CRPS.*target"):
+        MetricSuite(
+            epoch=(
+                ClosedFormContinuousRankedProbabilityScore(),
+                ContinuousRankedProbabilityScore(),
+            ),
+            predictor=GaussianPredictor(
+                reference_samples_extractor=reference_from_batch
+            ),
+            predictive_sample_count=3,
+            evaluation_grid=EvaluationGrid(np.linspace(-3.0, 3.0, 31)),
+        )

@@ -623,7 +623,8 @@ class MetricSuite:
         Raises:
             ValueError: If names/configuration are invalid, a predictor is
                 absent, or a metric scores reference samples and the predictor's
-                ``reference_samples_extractor`` is ``None``.
+                ``reference_samples_extractor`` is ``None``, or the suite asks
+                for the closed-form CRPS of both targets and reference samples.
         """
         registered_names = [spec.name for spec in self.batch] + [
             metric.name for metric in self.epoch
@@ -648,6 +649,18 @@ class MetricSuite:
             raise ValueError(
                 "metrics that score reference samples require the predictor's "
                 "reference_samples_extractor."
+            )
+        # The predictor scores the closed-form CRPS against the references
+        # whenever they are materialised, so no metric may expect the target.
+        if requirements.fields.reference_samples and any(
+            metric.requirements.closed_form_crps
+            and not metric.requirements.reference_samples
+            for metric in self.epoch
+        ):
+            raise ValueError(
+                "a suite that materialises reference samples scores the closed-form "
+                "CRPS against them, so it cannot also score the closed-form CRPS "
+                "against the target."
             )
 
     @property

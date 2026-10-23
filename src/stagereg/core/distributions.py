@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from stagereg.core.types import Array, Batch
 
@@ -28,6 +28,33 @@ class PredictiveDistribution(Protocol):
     def mean(self) -> Array: ...
 
     def variance(self) -> Array: ...
+
+
+@runtime_checkable
+class ClosedFormCRPS(Protocol):
+    """A predictive distribution whose CRPS has a closed form.
+
+    This protocol is optional: a
+    [`PredictiveDistribution`][stagereg.core.PredictiveDistribution] need not
+    implement it. A distribution that does can be scored by
+    [`ClosedFormContinuousRankedProbabilityScore`][stagereg.core.ClosedFormContinuousRankedProbabilityScore],
+    which never falls back to a sample estimate (ADR 0015). ``isinstance`` checks
+    only that a ``crps`` method exists.
+    """
+
+    def crps(self, targets: Array) -> Array:
+        """Return the expected CRPS of each scoring unit.
+
+        Args:
+            targets: One target per scoring unit, shaped ``[*batch]``, or
+                ``R`` reference samples per scoring unit, shaped
+                ``[R, *batch]``.
+
+        Returns:
+            The CRPS of each scoring unit, averaged over its reference
+            samples, shaped ``[*batch]``.
+        """
+        ...
 
 
 class DistributionHead(Protocol):

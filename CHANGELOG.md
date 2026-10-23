@@ -5,6 +5,42 @@ All notable changes to `stagereg` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-23
+
+Closed-form CRPS release (#143): Gaussian and Gaussian-mixture predictives
+score their closed-form CRPS, with no Monte Carlo noise and no evaluation grid.
+
+### Breaking changes
+
+- The posterior stage's default validation `crps` is the closed-form CRPS of
+  the posterior predictive, scored with
+  `ClosedFormContinuousRankedProbabilityScore(name="crps")`, and no longer the
+  sample CRPS of 100 predictive samples per target. The default suite draws no
+  predictive samples, so default posterior `crps` values differ from earlier
+  versions (#147).
+- `MetricSuite` refuses at build time a suite with a metric that needs
+  reference samples when its predictor has no `reference_samples_extractor`.
+  This used to fail when the first epoch was materialised, and now also
+  applies to `ContinuousRankedProbabilityScore` (#146).
+- `MetricSuite` refuses a suite that mixes a target-scoring closed-form CRPS
+  with any metric that needs reference samples: once references are
+  materialised, the closed-form CRPS always scores them (#146).
+
+### Added
+
+- `expected_gaussian_mixture_crps`: the closed-form CRPS of an equally
+  weighted Gaussian mixture, in `stagereg.core` (#144).
+- `ClosedFormCRPS`: an optional protocol for predictive distributions with a
+  closed-form CRPS. A metric that asks for it never falls back to sampling
+  (ADR 0015, #144).
+- `crps(targets)` methods on `Gaussian`, `MomentMatchedPredictive` and
+  `PosteriorPredictive`; the posterior predictive honours `draw_mask`
+  (#144, #145).
+- `ClosedFormContinuousRankedProbabilityScore`: an epoch metric averaging the
+  predictive distribution's closed-form CRPS. With `against_reference=True` it
+  scores each unit's reference samples instead of its target, giving the
+  mean closed-form CRPS over the reference distribution (#144, #146).
+
 ## [0.4.0] - 2026-10-21
 
 ### Breaking changes

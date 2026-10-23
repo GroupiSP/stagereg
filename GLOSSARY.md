@@ -121,6 +121,14 @@ _Avoid_: Draw, predictive draw
 The predictive distribution of a posterior stage: the equally weighted mixture, over the draws, of Gaussians centred on each draw's mean with the aleatoric variance. Exact for the draws taken, so it may be skewed or multimodal.
 _Avoid_: BMA Gaussian, predictive Gaussian
 
+**Closed-form CRPS**:
+The CRPS of a predictive distribution computed from the distribution's own formula rather than estimated from predictive samples, so it carries no sampling noise. Defined only for distributions that offer such a formula, such as a Gaussian or the posterior predictive, and never replaced by a sample estimate where none exists.
+_Avoid_: Exact CRPS (the sample CRPS is also exact, for the empirical distribution of its samples), mixture CRPS, analytic CRPS
+
+**Sample CRPS**:
+The CRPS of the empirical distribution of a set of predictive samples, an estimate of the predictive distribution's CRPS that varies with the samples drawn.
+_Avoid_: Exact CRPS, closed-form CRPS
+
 **Moment-matched predictive**:
 The single Gaussian with the posterior predictive's mean and variance (the aleatoric plus the epistemic variance). A summary of the posterior predictive, not a substitute for it.
 _Avoid_: Posterior predictive (that is the mixture)

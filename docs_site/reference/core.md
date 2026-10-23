@@ -29,6 +29,8 @@ grouped by the module that defines it.
 
 ::: stagereg.core.PredictiveDistribution
 
+::: stagereg.core.ClosedFormCRPS
+
 ::: stagereg.core.DistributionHead
 
 ::: stagereg.core.Likelihood
@@ -85,6 +87,8 @@ grouped by the module that defines it.
 
 ::: stagereg.core.SampleContinuousRankedProbabilityScore
 
+::: stagereg.core.ClosedFormContinuousRankedProbabilityScore
+
 ::: stagereg.core.ContinuousRankedProbabilityScore
 
 ## `stagereg.core.metrics`
@@ -98,6 +102,8 @@ grouped by the module that defines it.
 ::: stagereg.core.sample_crps
 
 ::: stagereg.core.expected_sample_crps
+
+::: stagereg.core.expected_gaussian_mixture_crps
 
 ::: stagereg.core.rmse
 

@@ -23,7 +23,7 @@ from stagereg.core.metric_registry import (
     MetricRequirements,
     PredictionInterval,
 )
-from stagereg.core.distributions import PredictiveDistribution
+from stagereg.core.distributions import ClosedFormCRPS, PredictiveDistribution
 from stagereg.core.types import Batch, PyTree
 from stagereg.jax.distributions import Gaussian, PosteriorPredictive
 
@@ -241,8 +241,9 @@ class PosteriorPredictivePredictor:
     """Materialize scalar epoch data from a model returning ``PosteriorPredictive``.
 
     Scores the exact mixture rather than its moment-matched Gaussian: the
-    log-likelihood is the mixture log-density, predictive samples are drawn
-    from the mixture, and prediction intervals are central mixture quantiles.
+    log-likelihood is the mixture log-density, the closed-form CRPS is the
+    mixture's, predictive samples are drawn from the mixture, and prediction
+    intervals are central mixture quantiles.
 
     Attributes:
         coordinate_extractor: Optional explicit adapter for coordinate metadata.
@@ -309,10 +310,27 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
 ) -> EpochPredictionData:
     """Materialize the requested fields of one scalar-event prediction.
 
-    The mean, variance, predictive samples and log-likelihood are computed by one
-    compiled call and copied to the host together.
+    The mean, variance, predictive samples, log-likelihood and closed-form CRPS
+    are computed by one compiled call and copied to the host together. When
+    reference samples are requested they are extracted before that call, so
+    the closed-form CRPS can score them on the device.
+
+    Raises:
+        TypeError: If the closed-form CRPS is requested and ``prediction`` does
+            not implement [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
     """
     fields = requirements.fields
+    if fields.closed_form_crps:
+        _require_closed_form_crps(prediction)
+    batch_shape = prediction.batch_shape
+    reference_samples = _materialize_reference_samples(
+        reference_samples_extractor,
+        batch=batch,
+        key=key,
+        n_scoring_units=math.prod(jnp.shape(targets)),
+        required=fields.reference_samples,
+    )
+    against_reference = fields.closed_form_crps and reference_samples is not None
     sample_count = (
         requirements.predictive_sample_count if fields.predictive_samples else None
     )
@@ -325,13 +343,24 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
     device = jax.device_get(
         compute(
             prediction,
-            jnp.asarray(targets) if fields.log_likelihood else None,
+            (
+                jnp.asarray(targets)
+                if fields.log_likelihood
+                or (fields.closed_form_crps and not against_reference)
+                else None
+            ),
+            (
+                _rows_to_samples(reference_samples, batch_shape)
+                if against_reference
+                else None
+            ),
             key,
             variance=fields.variance,
             sample_count=sample_count,
+            log_likelihood=fields.log_likelihood,
+            closed_form_crps=fields.closed_form_crps,
         )
     )
-    batch_shape = prediction.batch_shape
     mean, target_values = _host_mean_and_targets(device["mean"], targets, batch_shape)
     return EpochPredictionData(
         targets=target_values,
@@ -346,13 +375,7 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
                 name="predictive_samples",
             )
         ),
-        reference_samples=_materialize_reference_samples(
-            reference_samples_extractor,
-            batch=batch,
-            key=key,
-            n_scoring_units=target_values.size,
-            required=fields.reference_samples,
-        ),
+        reference_samples=reference_samples,
         intervals=tuple(
             interval(prediction, level) for level in sorted(fields.interval_levels)
         ),
@@ -363,30 +386,74 @@ def _materialize_epoch_data[Prediction: PredictiveDistribution](
         ),
         evaluation_grid=_required_evaluation_grid(requirements),
         log_likelihood=_host_per_unit(device.get("log_likelihood"), batch_shape),
+        closed_form_crps=_host_per_unit(device.get("closed_form_crps"), batch_shape),
+        closed_form_crps_against_reference=against_reference,
     )
+
+
+def _require_closed_form_crps(prediction: object) -> ClosedFormCRPS:
+    """Return ``prediction`` narrowed to a closed-form CRPS, or refuse it.
+
+    The closed-form CRPS never falls back to a sample estimate (ADR 0015).
+
+    Args:
+        prediction: The predictive distribution to be scored.
+
+    Returns:
+        ``prediction`` itself, typed as
+        [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
+
+    Raises:
+        TypeError: If ``prediction`` does not implement
+            [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
+    """
+    if not isinstance(prediction, ClosedFormCRPS):
+        raise TypeError(
+            f"{type(prediction).__name__} has no closed-form CRPS: it does not "
+            "implement ClosedFormCRPS (a crps method). Score it with "
+            "SampleContinuousRankedProbabilityScore instead, or implement crps."
+        )
+    return prediction
 
 
 def _device_fields(
     prediction: PredictiveDistribution,
     targets: jax.Array | None,
+    references: jax.Array | None,
     key: jax.Array,
     *,
     variance: bool,
     sample_count: int | None,
+    log_likelihood: bool,
+    closed_form_crps: bool,
 ) -> dict[str, jax.Array]:
     """Compute a prediction's requested device fields.
 
     Args:
         prediction: The predictive distribution.
-        targets: The targets to score the log-density of, or ``None`` when
-            the log-likelihood is not requested.
+        targets: The observed targets, shaped like the prediction's batch,
+            or ``None`` when no field needs them.
+        references: Reference samples shaped ``[R, *batch]`` for the
+            closed-form CRPS to score instead of ``targets``, or ``None``.
         key: The metric key; predictive samples use ``fold_in(key, 0)``.
         variance: Whether to compute the predictive variance.
         sample_count: The number of predictive samples, or ``None`` for none.
+        log_likelihood: Whether to compute the targets' log-density.
+        closed_form_crps: Whether to compute the closed-form CRPS of the
+            references, or of the targets without references; ``prediction``
+            must then implement
+            [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
 
     Returns:
         The mean, and each requested field under its ``EpochPredictionData``
         name.
+
+    Raises:
+        ValueError: If a requested field has nothing to score: the
+            log-likelihood without ``targets``, or the closed-form CRPS
+            without ``targets`` or ``references``.
+        TypeError: If the closed-form CRPS is requested and ``prediction``
+            does not implement [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS].
     """
     computed = {"mean": prediction.mean()}
     if variance:
@@ -395,13 +462,23 @@ def _device_fields(
         computed["predictive_samples"] = prediction.sample(
             jax.random.fold_in(key, 0), sample_shape=(sample_count,)
         )
-    if targets is not None:
+    if log_likelihood:
+        if targets is None:
+            raise ValueError("the log-likelihood requires targets.")
         computed["log_likelihood"] = prediction.log_prob(targets)
+    if closed_form_crps:
+        scored = targets if references is None else references
+        if scored is None:
+            raise ValueError("the closed-form CRPS requires targets or references.")
+        computed["closed_form_crps"] = _require_closed_form_crps(prediction).crps(
+            scored
+        )
     return computed
 
 
 _compiled_device_fields = jax.jit(
-    _device_fields, static_argnames=("variance", "sample_count")
+    _device_fields,
+    static_argnames=("variance", "sample_count", "log_likelihood", "closed_form_crps"),
 )
 
 
@@ -506,6 +583,24 @@ def _samples_to_rows(
     return np.moveaxis(array, 0, -1).reshape(-1, array.shape[0])
 
 
+def _rows_to_samples(
+    rows: NDArray[np.float64], batch_shape: tuple[int, ...]
+) -> jax.Array:
+    """Convert host scoring-unit rows to JAX sample-first samples.
+
+    ``device_put`` rather than ``jnp.asarray``, which compiles a copy per shape.
+
+    Args:
+        rows: Samples per scoring unit, shaped ``(units, R)`` with ``units``
+            the product of ``batch_shape``.
+        batch_shape: The prediction's batch shape.
+
+    Returns:
+        The samples on the device, shaped ``[R, *batch]``.
+    """
+    return jax.device_put(rows.T.reshape(rows.shape[1], *batch_shape))
+
+
 def _gaussian_interval(prediction: Gaussian, level: float) -> PredictionInterval:
     """Materialize an exact central Gaussian interval at ``level``."""
     z_value = NormalDist().inv_cdf((1.0 + level) / 2.0)
@@ -557,7 +652,10 @@ class MetricSuite:
         """Validate names and explicit epoch materialization configuration.
 
         Raises:
-            ValueError: If names/configuration are invalid or a predictor is absent.
+            ValueError: If names/configuration are invalid, a predictor is
+                absent, or a metric scores reference samples and the predictor's
+                ``reference_samples_extractor`` is ``None``, or the suite asks
+                for the closed-form CRPS of both targets and reference samples.
         """
         registered_names = [spec.name for spec in self.batch] + [
             metric.name for metric in self.epoch
@@ -574,7 +672,27 @@ class MetricSuite:
             raise ValueError(f"duplicate metric names are not allowed: {duplicates}.")
         if self.epoch and self.predictor is None:
             raise ValueError("epoch metrics require an explicit suite predictor.")
-        self.prediction_requirements
+        requirements = self.prediction_requirements
+        if (
+            requirements.fields.reference_samples
+            and getattr(self.predictor, "reference_samples_extractor", ...) is None
+        ):
+            raise ValueError(
+                "metrics that score reference samples require the predictor's "
+                "reference_samples_extractor."
+            )
+        # The predictor scores the closed-form CRPS against the references
+        # whenever they are materialised, so no metric may expect the target.
+        if requirements.fields.reference_samples and any(
+            metric.requirements.closed_form_crps
+            and not metric.requirements.reference_samples
+            for metric in self.epoch
+        ):
+            raise ValueError(
+                "a suite that materialises reference samples scores the closed-form "
+                "CRPS against them, so it cannot also score the closed-form CRPS "
+                "against the target."
+            )
 
     @property
     def metric_requirements(self) -> MetricRequirements:
@@ -734,7 +852,30 @@ def merge_epoch_prediction_data(
         coordinate=_concat_optional_vectors(parts, "coordinate"),
         evaluation_grid=_merge_grid(parts),
         log_likelihood=_concat_optional_vectors(parts, "log_likelihood"),
+        closed_form_crps=_concat_optional_vectors(parts, "closed_form_crps"),
+        closed_form_crps_against_reference=_merge_closed_form_crps_scoring(parts),
     )
+
+
+def _merge_closed_form_crps_scoring(parts: Sequence[EpochPredictionData]) -> bool:
+    """Return whether every part's closed-form CRPS scored reference samples.
+
+    Args:
+        parts: The per-batch prediction data being merged, at least one.
+
+    Returns:
+        The parts' shared ``closed_form_crps_against_reference`` flag.
+
+    Raises:
+        ValueError: If some parts scored the target and others the references.
+    """
+    scoring = {part.closed_form_crps_against_reference for part in parts}
+    if len(scoring) > 1:
+        raise ValueError(
+            "closed_form_crps must score the target in all batches or the "
+            "reference samples in all batches."
+        )
+    return scoring.pop()
 
 
 def _concat_optional_vectors(

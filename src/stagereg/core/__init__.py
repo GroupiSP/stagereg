@@ -13,6 +13,7 @@ from stagereg.core.checkpoints import (
     is_finalized,
 )
 from stagereg.core.distributions import (
+    ClosedFormCRPS,
     DistributionHead,
     DistributionLoss,
     Likelihood,
@@ -34,6 +35,7 @@ from stagereg.core.losses import (
     add_epsilon,
 )
 from stagereg.core.metric_registry import (
+    ClosedFormContinuousRankedProbabilityScore,
     ContinuousRankedProbabilityScore,
     EpochMetric,
     EpochPredictionData,
@@ -51,6 +53,7 @@ from stagereg.core.metrics import (
     cdf,
     coverage,
     crps,
+    expected_gaussian_mixture_crps,
     expected_sample_crps,
     point_crps,
     rmse,
@@ -99,6 +102,8 @@ __all__ = [
     "Checkpoint",
     "CheckpointRef",
     "CheckpointStore",
+    "ClosedFormCRPS",
+    "ClosedFormContinuousRankedProbabilityScore",
     "ContinuousRankedProbabilityScore",
     "Dataset",
     "Decision",
@@ -151,6 +156,7 @@ __all__ = [
     "coverage",
     "crps",
     "every_nth_save",
+    "expected_gaussian_mixture_crps",
     "expected_sample_crps",
     "finalized_only",
     "flatten_parameters",

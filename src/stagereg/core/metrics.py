@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
+from types import ModuleType
+from typing import Any
+
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
@@ -212,6 +217,159 @@ def expected_sample_crps(
     )
     spread = _mean_pairwise_distance(np.sort(predictive, axis=1))
     return absolute_error - spread / 2.0
+
+
+_erf = np.vectorize(math.erf, otypes=[np.float64])
+
+# The elements of the largest intermediate one block of mixture components may
+# build, ``[block, max(M, R), *batch]``, so memory stays bounded however many
+# components a mixture has (a finite posterior may retain thousands of draws).
+_CRPS_BLOCK_ELEMENTS = 2**22
+
+
+def _sum_blocks(block_fn: Callable[[Any], Any], blocks: Any) -> Any:
+    """Return the sum of ``block_fn`` over the leading axis of ``blocks``.
+
+    Args:
+        block_fn: Maps one block, a tuple of arrays, to an array.
+        blocks: A tuple of arrays sharing a leading block axis.
+
+    Returns:
+        The sum of ``block_fn`` over the blocks.
+    """
+    return sum(block_fn(block) for block in zip(*blocks, strict=True))
+
+
+def gaussian_mixture_crps_kernel(
+    xp: ModuleType,
+    erf: Callable[[Any], Any],
+    draw_means: Any,
+    variance: Any,
+    references: Any,
+    weights: Any,
+    sum_blocks: Callable[[Callable[[Any], Any], Any], Any] = _sum_blocks,
+) -> Any:
+    """Return the closed-form expected CRPS of a weighted Gaussian mixture.
+
+    The one implementation of the Grimit et al. (2006) formula, written against
+    an array module so that the core stays free of any backend (ADR 0012): the
+    core passes NumPy, and the JAX backend passes ``jax.numpy``, which keeps the
+    result traceable under ``jax.jit``. It does no validation; callers check
+    their inputs. With ``A(mu, v) = E|Z|`` for ``Z ~ N(mu, v)``, the CRPS of a
+    mixture with component weights ``w_m`` at a target ``y`` is::
+
+        sum_m w_m A(mu_m - y, s**2) - (1/2) sum_{m,m'} w_m w_m' A(mu_m - mu_m', 2 s**2)
+
+    The outer sums run over blocks of components, so no intermediate is larger
+    than ``[block, max(M, R), *batch]`` rather than ``[M, M, *batch]``.
+
+    Args:
+        xp: The array module, ``numpy`` or ``jax.numpy``.
+        erf: The error function matching ``xp``.
+        draw_means: Component means, shaped ``[M, *batch]``; all must be finite.
+        variance: The positive variance every component shares, shaped
+            ``[*batch]``.
+        references: Reference samples, shaped ``[R, *batch]``.
+        weights: Component weights summing to one, shaped ``[M]``.
+        sum_blocks: Sums a function of one block over the leading axis of a
+            tuple of stacked blocks; a backend passes one that keeps a single
+            block in memory at a time. Defaults to a Python loop.
+
+    Returns:
+        The CRPS averaged over each unit's reference samples, shaped
+        ``[*batch]``.
+    """
+
+    def expected_absolute(location: Any, location_variance: Any) -> Any:
+        scale = xp.sqrt(location_variance)
+        z = location / scale
+        density = xp.exp(-0.5 * z**2) / math.sqrt(2.0 * math.pi)
+        return 2.0 * scale * density + location * erf(z / math.sqrt(2.0))
+
+    components = draw_means.shape[0]
+    units = math.prod(draw_means.shape[1:])
+    widest = max(components, references.shape[0])
+    block = max(1, min(components, _CRPS_BLOCK_ELEMENTS // (widest * units)))
+    padding = -components % block
+    # Padded components repeat the first mean, so every difference stays
+    # finite, and weigh nothing.
+    padded_means = xp.concatenate(
+        [draw_means, xp.broadcast_to(draw_means[:1], (padding, *draw_means.shape[1:]))]
+    )
+    padded_weights = xp.concatenate([weights, xp.zeros(padding, dtype=weights.dtype)])
+    expand = (1,) * (draw_means.ndim - 1)
+    column_weights = xp.reshape(weights, (1, -1, *expand))
+
+    def block_crps(block_arrays: Any) -> Any:
+        means, block_weights = block_arrays
+        block_weights = xp.reshape(block_weights, (-1, *expand))
+        absolute_error = expected_absolute(
+            means[:, None] - references[None, :], variance
+        ).mean(axis=1)
+        pairwise = expected_absolute(
+            means[:, None] - draw_means[None, :], 2.0 * variance
+        )
+        spread = xp.sum(column_weights * pairwise, axis=1)
+        return xp.sum(block_weights * (absolute_error - spread / 2.0), axis=0)
+
+    return sum_blocks(
+        block_crps,
+        (
+            xp.reshape(padded_means, (-1, block, *draw_means.shape[1:])),
+            xp.reshape(padded_weights, (-1, block)),
+        ),
+    )
+
+
+def expected_gaussian_mixture_crps(
+    draw_means: ArrayLike, variance: ArrayLike, reference_samples: ArrayLike
+) -> NDArray[np.float64]:
+    """Return the closed-form expected CRPS of each unit's Gaussian mixture.
+
+    Each scoring unit (row) predicts an equally weighted mixture of Gaussians
+    ``N(mu_m, s**2)``, one per draw mean, all sharing the unit's variance
+    ``s**2``. With ``A(mu, v) = E|Z|`` for ``Z ~ N(mu, v)``, its CRPS at a
+    target ``y`` is (Grimit et al. 2006)::
+
+        (1/M) sum_m A(mu_m - y, s**2) - (1/(2 M**2)) sum_{m,m'} A(mu_m - mu_m', 2 s**2)
+
+    and this function returns its mean over the unit's reference samples. A
+    point target is a single reference sample (``R = 1``). With one draw it is
+    the closed-form CRPS of a Gaussian. Unlike
+    [`expected_sample_crps`][stagereg.core.expected_sample_crps] it scores the
+    predictive's own formula rather than samples drawn from it, so it carries no
+    Monte Carlo noise. The cost is ``O(M R + M**2)`` per unit.
+
+    Args:
+        draw_means: Mean of each mixture component, of shape ``(units, M)``.
+        variance: The variance every component of a unit shares, of shape
+            ``(units,)``.
+        reference_samples: Reference samples of shape ``(units, R)``, such as
+            the observed target (``R = 1``) or draws from a simulator.
+
+    Returns:
+        The expected CRPS of each unit, of shape ``(units,)``.
+
+    Raises:
+        ValueError: If an input is empty or non-finite, if ``draw_means`` or
+            ``reference_samples`` is not two-dimensional, if ``variance`` is
+            not one-dimensional or not positive, or if the numbers of units
+            differ.
+    """
+    means = _as_nonempty_matrix(draw_means, name="draw_means")
+    reference = _as_nonempty_matrix(reference_samples, name="reference_samples")
+    shared_variance = _as_nonempty_vector(variance, name="variance")
+    if not means.shape[0] == reference.shape[0] == shared_variance.shape[0]:
+        raise ValueError(
+            "draw_means, variance and reference_samples must have the same number "
+            "of units."
+        )
+    if np.any(shared_variance <= 0.0):
+        raise ValueError("variance must be positive.")
+    draws = means.shape[1]
+    return gaussian_mixture_crps_kernel(
+        np, _erf, means.T, shared_variance, reference.T, np.full(draws, 1.0 / draws)
+    )
 
 
 def rmse(y_true: ArrayLike, y_pred: ArrayLike) -> float:

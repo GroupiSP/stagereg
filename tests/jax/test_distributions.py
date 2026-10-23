@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any
 
 import jax
@@ -21,7 +22,8 @@ from stagereg.jax.distributions import (
     MomentMatchedPredictive,
     PosteriorPredictive,
 )
-from stagereg.core import Batch
+from stagereg.core import metrics as core_metrics
+from stagereg.core import Batch, ClosedFormCRPS, expected_gaussian_mixture_crps
 
 _FINITE = st.floats(min_value=-10.0, max_value=10.0, width=32)
 _POSITIVE = st.floats(min_value=0.0625, max_value=10.0, width=32)
@@ -549,3 +551,268 @@ def test_batch_stays_a_single_pytree_leaf() -> None:
     batch = Batch(inputs=jnp.zeros((2, 1)), targets=jnp.ones((2,)))
 
     assert jax.tree.leaves(batch) == [batch]
+
+
+@st.composite
+def gaussians_and_references(
+    draw: st.DrawFn,
+) -> tuple[Gaussian, np.ndarray]:
+    """Draw a Gaussian of batch rank 1 or 2 and ``[R, *batch]`` references."""
+    batch_shape = draw(st.lists(st.integers(1, 3), min_size=1, max_size=2).map(tuple))
+    reference_count = draw(st.integers(1, 4))
+    loc = draw(arrays(np.float32, batch_shape, elements=_FINITE))
+    scale = draw(arrays(np.float32, batch_shape, elements=_POSITIVE))
+    references = draw(
+        arrays(np.float32, (reference_count, *batch_shape), elements=_FINITE)
+    )
+    return Gaussian(loc=jnp.asarray(loc), scale=jnp.asarray(scale)), references
+
+
+def _core_crps(draw_means: Any, variance: Any, references: np.ndarray) -> np.ndarray:
+    """Score references with the core function as the oracle, in float64.
+
+    Takes the JAX layout, ``[M, *batch]`` draw means, ``[*batch]`` variances and
+    ``[R, *batch]`` references, and returns ``[*batch]`` scores.
+    """
+    draw_means = np.asarray(draw_means, dtype=np.float64)
+    variance = np.asarray(variance, dtype=np.float64)
+    references = np.asarray(references, dtype=np.float64)
+    scores = expected_gaussian_mixture_crps(
+        draw_means.reshape(draw_means.shape[0], -1).T,
+        variance.reshape(-1),
+        references.reshape(references.shape[0], -1).T,
+    )
+    return scores.reshape(variance.shape)
+
+
+def _core_gaussian_crps(gaussian: Gaussian, references: np.ndarray) -> np.ndarray:
+    """Score ``[R, *batch]`` references against ``gaussian`` with the core function."""
+    scale = np.asarray(gaussian.scale, dtype=np.float64)
+    return _core_crps(np.asarray(gaussian.loc)[None], np.square(scale), references)
+
+
+@settings(deadline=None)
+@given(gaussians_and_references())
+def test_gaussian_crps_of_one_target_per_unit_matches_the_core_function(
+    case: tuple[Gaussian, np.ndarray],
+) -> None:
+    gaussian, references = case
+    targets = references[0]
+
+    np.testing.assert_allclose(
+        gaussian.crps(jnp.asarray(targets)),
+        _core_gaussian_crps(gaussian, references[:1]),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None)
+@given(gaussians_and_references())
+def test_gaussian_crps_of_reference_samples_matches_the_core_function(
+    case: tuple[Gaussian, np.ndarray],
+) -> None:
+    gaussian, references = case
+
+    np.testing.assert_allclose(
+        gaussian.crps(jnp.asarray(references)),
+        _core_gaussian_crps(gaussian, references),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None)
+@given(gaussians_and_references())
+def test_gaussian_crps_is_the_textbook_gaussian_crps(
+    case: tuple[Gaussian, np.ndarray],
+) -> None:
+    # The core function shares the JAX formula, so it cannot catch an error in
+    # it; Gneiting and Raftery's (2007) Gaussian CRPS is independent of it.
+    gaussian, references = case
+    loc = np.asarray(gaussian.loc, dtype=np.float64)
+    scale = np.asarray(gaussian.scale, dtype=np.float64)
+    standard = NormalDist()
+    z = (references.astype(np.float64) - loc) / scale
+    cdf = np.vectorize(standard.cdf)(z)
+    pdf = np.vectorize(standard.pdf)(z)
+    expected = scale * (z * (2.0 * cdf - 1.0) + 2.0 * pdf - 1.0 / math.sqrt(math.pi))
+
+    np.testing.assert_allclose(
+        gaussian.crps(jnp.asarray(references)),
+        expected.mean(axis=0),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None)
+@given(gaussians_and_references())
+def test_gaussian_crps_is_the_same_under_jit(
+    case: tuple[Gaussian, np.ndarray],
+) -> None:
+    gaussian, references = case
+    targets = jnp.asarray(references)
+
+    np.testing.assert_allclose(
+        jax.jit(Gaussian.crps)(gaussian, targets),
+        gaussian.crps(targets),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_gaussian_crps_rejects_targets_of_another_rank() -> None:
+    gaussian = Gaussian(loc=jnp.zeros(3), scale=jnp.ones(3))
+
+    with pytest.raises(ValueError, match="targets"):
+        gaussian.crps(jnp.zeros((2, 2, 3)))
+
+
+def test_only_distributions_with_a_closed_form_offer_the_closed_form_crps() -> None:
+    gaussian = Gaussian(loc=jnp.zeros(2), scale=jnp.ones(2))
+    gamma = Gamma(concentration=jnp.ones(2), rate=jnp.ones(2))
+
+    assert isinstance(gaussian, ClosedFormCRPS)
+    assert not isinstance(gamma, ClosedFormCRPS)
+
+
+@st.composite
+def posterior_predictives_and_references(
+    draw: st.DrawFn,
+) -> tuple[PosteriorPredictive, np.ndarray]:
+    """Draw a mixture over a ``[B]`` batch and ``[R, B]`` reference samples."""
+    means, variance = draw(posterior_predictives())
+    reference_count = draw(st.integers(1, 4))
+    references = draw(
+        arrays(np.float32, (reference_count, means.shape[1]), elements=_FINITE)
+    )
+    mixture = PosteriorPredictive(
+        draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variance)
+    )
+    return mixture, references
+
+
+@settings(deadline=None, max_examples=25)
+@given(posterior_predictives_and_references(), st.booleans())
+def test_posterior_predictive_crps_matches_the_core_function(
+    case: tuple[PosteriorPredictive, np.ndarray], one_target_per_unit: bool
+) -> None:
+    mixture, references = case
+    if one_target_per_unit:
+        references = references[:1]
+    targets = references[0] if one_target_per_unit else references
+
+    np.testing.assert_allclose(
+        mixture.crps(jnp.asarray(targets)),
+        _core_crps(mixture.draws, mixture.aleatoric_variance, references),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None, max_examples=25)
+@given(mixtures=padded_posterior_predictives(), targets=_FINITE)
+def test_a_draw_mask_excludes_its_slots_from_the_crps(
+    mixtures: tuple[PosteriorPredictive, PosteriorPredictive], targets: float
+) -> None:
+    masked, exact = mixtures
+
+    np.testing.assert_allclose(
+        masked.crps(jnp.full(masked.batch_shape, targets)),
+        exact.crps(jnp.full(exact.batch_shape, targets)),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@pytest.mark.parametrize("extreme", [3e38, -3e38, float("inf"), float("nan")])
+def test_extreme_means_in_excluded_slots_leave_the_crps_finite(extreme: float) -> None:
+    included = jnp.array([[0.5, -1.0], [2.0, 0.0]])
+    masked = PosteriorPredictive(
+        draws=jnp.concatenate([included, jnp.full((1, 2), extreme)]),
+        aleatoric_variance=jnp.array([0.5, 2.0]),
+        draw_mask=jnp.array([True, True, False]),
+    )
+    exact = PosteriorPredictive(
+        draws=included, aleatoric_variance=jnp.array([0.5, 2.0])
+    )
+    references = jnp.array([[0.0, 1.0], [3.0, -2.0]])
+
+    np.testing.assert_allclose(
+        masked.crps(references), exact.crps(references), rtol=1e-5, atol=1e-6
+    )
+
+
+@settings(deadline=None, max_examples=25)
+@given(posterior_predictives_and_references(), st.booleans())
+def test_moment_matched_crps_matches_the_core_function(
+    case: tuple[PosteriorPredictive, np.ndarray], one_target_per_unit: bool
+) -> None:
+    mixture, references = case
+    if one_target_per_unit:
+        references = references[:1]
+    targets = references[0] if one_target_per_unit else references
+    summary = mixture.moment_matched()
+
+    np.testing.assert_allclose(
+        summary.crps(jnp.asarray(targets)),
+        _core_crps(summary.loc[None], summary.variance(), references),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None, max_examples=15)
+@given(mixtures=padded_posterior_predictives(), references=_FINITE)
+def test_posterior_crps_is_the_same_under_jit(
+    mixtures: tuple[PosteriorPredictive, PosteriorPredictive], references: float
+) -> None:
+    masked, _ = mixtures
+    targets = jnp.full((2, *masked.batch_shape), references)
+    summary = masked.moment_matched()
+
+    np.testing.assert_allclose(
+        jax.jit(PosteriorPredictive.crps)(masked, targets),
+        masked.crps(targets),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        jax.jit(MomentMatchedPredictive.crps)(summary, targets),
+        summary.crps(targets),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_posterior_crps_is_the_same_in_blocks_of_draws_under_jit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_means, key_references = jax.random.split(jax.random.key(0))
+    masked = PosteriorPredictive(
+        draws=jax.random.normal(key_means, (13, 2)),
+        aleatoric_variance=jnp.array([0.5, 2.0]),
+        draw_mask=jnp.arange(13) < 10,
+    )
+    references = jax.random.normal(key_references, (3, 2))
+    whole = masked.crps(references)
+
+    # Blocks of two draws: seven blocks, the last one padded.
+    monkeypatch.setattr(core_metrics, "_CRPS_BLOCK_ELEMENTS", 2 * 13 * 2)
+
+    np.testing.assert_allclose(
+        jax.jit(PosteriorPredictive.crps)(masked, references),
+        whole,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_the_posterior_predictive_and_its_summary_offer_the_closed_form_crps() -> None:
+    mixture = PosteriorPredictive(
+        draws=jnp.zeros((2, 3)), aleatoric_variance=jnp.ones(3)
+    )
+
+    assert isinstance(mixture, ClosedFormCRPS)
+    assert isinstance(mixture.moment_matched(), ClosedFormCRPS)

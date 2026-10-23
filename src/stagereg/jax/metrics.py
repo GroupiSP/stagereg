@@ -241,8 +241,9 @@ class PosteriorPredictivePredictor:
     """Materialize scalar epoch data from a model returning ``PosteriorPredictive``.
 
     Scores the exact mixture rather than its moment-matched Gaussian: the
-    log-likelihood is the mixture log-density, predictive samples are drawn
-    from the mixture, and prediction intervals are central mixture quantiles.
+    log-likelihood is the mixture log-density, the closed-form CRPS is the
+    mixture's, predictive samples are drawn from the mixture, and prediction
+    intervals are central mixture quantiles.
 
     Attributes:
         coordinate_extractor: Optional explicit adapter for coordinate metadata.

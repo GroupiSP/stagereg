@@ -447,6 +447,7 @@ def _mixture_suite(predictor: object) -> MetricSuite:
         epoch=(
             NegativeLogLikelihood(),
             PointContinuousRankedProbabilityScore(name="crps"),
+            ClosedFormContinuousRankedProbabilityScore(),
             IntervalCoverage(level=0.9),
         ),
         predictor=predictor,  # type: ignore[arg-type]
@@ -486,7 +487,7 @@ def test_posterior_predictive_predictor_with_one_draw_scores_as_the_gaussian(
         _MIXTURE_BATCH,
     )
 
-    assert mixture.keys() == {"nll", "crps", "coverage"}
+    assert mixture.keys() == {"nll", "crps", "closed_form_crps", "coverage"}
     assert mixture == pytest.approx(gaussian, rel=1e-4)
 
 
@@ -640,7 +641,10 @@ class FixedPredictionModel(nnx.Module, pytree=False):
 
 _DEVICE_FIELDS = PredictionRequirements(
     fields=MetricRequirements(
-        variance=True, predictive_samples=True, log_likelihood=True
+        variance=True,
+        predictive_samples=True,
+        log_likelihood=True,
+        closed_form_crps=True,
     ),
     predictive_sample_count=16,
 )
@@ -677,6 +681,7 @@ def test_a_predictor_materializes_a_prediction_in_one_compiled_call(
     assert counter.total == 1
     assert data.variance is not None and data.variance.shape == (11,)
     assert data.log_likelihood is not None and data.log_likelihood.shape == (11,)
+    assert data.closed_form_crps is not None and data.closed_form_crps.shape == (11,)
     assert data.predictive_samples is not None
     assert data.predictive_samples.shape == (11, 16)
 
@@ -738,29 +743,24 @@ def test_merge_concatenates_closed_form_crps_across_batches() -> None:
     assert np.array_equal(merged.closed_form_crps, np.array([1.0, 2.0, 2.0]))
 
 
-def test_the_closed_form_crps_is_computed_in_the_same_compiled_call(
-    compile_counter: Callable[[], Any],
-) -> None:
-    batch = Batch(inputs=jnp.zeros((11, 1)), targets=jnp.linspace(0.0, 2.0, 11))
-    model = FixedPredictionModel(
-        Gaussian(loc=jnp.linspace(0.0, 1.0, 11), scale=jnp.full(11, 0.5))
-    )
-    requirements = PredictionRequirements(
-        fields=MetricRequirements(
-            variance=True,
-            predictive_samples=True,
-            log_likelihood=True,
-            closed_form_crps=True,
-        ),
-        predictive_sample_count=16,
+def test_closed_form_crps_scores_the_posterior_predictive_without_samples_or_a_grid() -> (
+    None
+):
+    offsets = [-1.5, 0.0, 2.5]
+    suite = MetricSuite(
+        epoch=(ClosedFormContinuousRankedProbabilityScore(),),
+        predictor=PosteriorPredictivePredictor(),
     )
 
-    with compile_counter() as counter:
-        data = GaussianPredictor()(
-            model, batch, requirements, metric_key(jax.random.key(0))
-        )
+    scores = _scores(suite, MixtureModel(offsets, 0.25), _MIXTURE_BATCH)
 
-    assert counter.total == 1
-    assert data.closed_form_crps is not None
-    assert data.closed_form_crps.shape == (11,)
-    assert data.log_likelihood is not None
+    inputs = np.asarray(_MIXTURE_BATCH.inputs, np.float64).reshape(-1)
+    targets = np.asarray(_MIXTURE_BATCH.targets, np.float64).reshape(-1, 1)
+    expected = expected_gaussian_mixture_crps(
+        inputs[:, None] + np.asarray(offsets)[None, :],
+        np.full(inputs.size, 0.25),
+        targets,
+    )
+    assert suite.prediction_requirements.predictive_sample_count is None
+    assert suite.prediction_requirements.evaluation_grid is None
+    assert scores == {"closed_form_crps": pytest.approx(np.mean(expected), rel=1e-5)}

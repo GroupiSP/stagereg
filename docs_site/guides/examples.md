@@ -122,6 +122,18 @@ uv run --group example-cmapss python examples/jax/cmapss/data.py --fetch
 uv run --group example-cmapss python examples/jax/cmapss/data.py
 ```
 
+To compare that staged model with a joint model (one CNN backbone with a
+Gaussian head, trained on the Gaussian negative log-likelihood) on the same
+prepared data, run the comparison. It trains both models from `--seeds` seeds
+(default 5) on a fixed train/validation split and prints a `staged` vs `joint`
+table of RMSE, 95% interval coverage, closed-form CRPS and NLL as
+`mean ± std` over seeds. The joint model has roughly half the staged model's
+parameters.
+
+```bash
+uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5
+```
+
 The first run downloads the CMAPSS archive from NASA and caches it on disk, so
 it needs network access once. The README explains how to point the example at
 a copy you already have.

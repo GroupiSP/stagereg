@@ -65,7 +65,9 @@ Contains the classes defining the two-stage predictive model: a Stage-1
 deterministic mean model (`Cnn1DMeanModel`), a Stage-2 Gamma residual model
 (`Cnn1DGammaModel`), and a `CompositeGaussianModel` combining the frozen
 Stage-1 point prediction with the Stage-2 Gamma mean into a single Gaussian
-predictive RUL distribution.
+predictive RUL distribution. It also holds the joint model the comparison
+trains against it, `Cnn1DGaussianModel`: one backbone of the same kind,
+followed by a Gaussian head predicting mean and scale together.
 
 ### `plots.py`
 
@@ -144,3 +146,42 @@ that figure instead of displaying it:
 ```shell
 uv run --group example-cmapss python examples/jax/cmapss/run.py --plot-path rul_curves.png
 ```
+
+### `compare.py`
+
+Compares the **staged model** of `run.py` with a **joint model** on the same
+prepared FD001 data. The joint model (`Cnn1DGaussianModel` in `model.py`) is
+one 1D-CNN backbone, with the same architecture and hyperparameters as each
+staged model's backbone, followed by `stagereg`'s `GaussianHead`. It is
+trained with `run_supervised` on the Gaussian negative log-likelihood for
+`joint_epochs` epochs (default 20, the same budget as each stage), and
+validated on the held-out validation windows after every epoch. Both models
+train on the raw linear-RUL targets, with no target standardization, so any
+instability of joint training on unscaled targets shows up in the results.
+
+The data is prepared once, with the configured seed, so the train/validation
+split is the same for every seed; seed index `i` initializes both models
+from `seed + i`. `compare_models` returns one `SeedComparison` per seed,
+holding both trained models and their test metrics: RMSE, 95% interval
+coverage, closed-form CRPS and NLL. NLL is included because it is the joint
+model's own training objective.
+
+Run it with:
+
+```shell
+uv run --group example-cmapss python examples/jax/cmapss/compare.py
+```
+
+Training is silent. The script prints one line per (seed, model) run as it
+finishes, then a table with one row per metric and a `staged` and a `joint`
+column, each cell the `mean ± std` over seeds. Pass `--seeds` to trade
+runtime for confidence (default 5):
+
+```shell
+uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 10
+```
+
+Note that the joint model has one backbone where the staged model has two
+(one per stage), so it has roughly half the staged model's parameters. The
+comparison holds the architecture and the per-model epoch budget fixed, not
+the parameter count.

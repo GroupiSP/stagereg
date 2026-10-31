@@ -70,9 +70,11 @@ predictive RUL distribution.
 ### `plots.py`
 
 Builds the example's RUL curves. `plot_validation_rul_curves` takes the
-standardized validation trajectories, the feature columns, a trained
-composite model, the three units to draw, and the window length, and
-draws one row of three columns, one unit per column. `run.py` passes the
+standardized validation trajectories, the feature columns, a sequence of
+`LabelledModel`s (a label and a trained Gaussian model each), the three
+units to draw, and the window length, and draws an N×3 grid: one row per
+model, labelled with its name, and one column per unit. `run.py` passes
+its one staged model, so its figure is a single row. It also passes the
 lifetime-spanning units of the validation subset, so the columns are its
 shortest-, median-, and longest-lifetime unit in that order; the module
 itself decides how a RUL curve looks and never which units it looks at. Spanning the lifetime range that way lets a reader
@@ -82,11 +84,14 @@ times as long.
 
 Each column shows one unit's true linear RUL across its whole trajectory,
 the model's predicted mean, and the 95% predictive interval
-`loc ± 1.96 * scale` taken analytically from the composite Gaussian. The
-columns have independent x and y limits, so the band stays readable in
-the short-lived unit instead of being squashed by the long-lived one's
-axis range; each is titled with its unit ID, the role it plays, and that
-unit's lifetime in cycles, and one shared figure-level legend names the
+`loc ± 1.96 * scale` taken analytically from the model's Gaussian. The
+columns have independent x limits, so the band stays readable in the
+short-lived unit instead of being squashed by the long-lived one's axis
+range, while each column shares its x-axis across rows so that every
+model's curve for a unit sits on the same time axis; y limits are
+independent per panel. Each column is titled with its unit ID, the role it
+plays, and that unit's lifetime in cycles, and one shared figure-level
+legend names the
 three elements. The predicted mean and its band start at each unit's
 first full window, since no prediction exists before `window_length`
 cycles of history have accumulated; the band is left unclipped at zero,

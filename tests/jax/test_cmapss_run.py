@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -319,7 +320,7 @@ def test_main_plots_the_rul_curves_after_printing_metrics(
     def record_plot(
         trajectories: pd.DataFrame,
         feature_columns: list[str],
-        model: object,
+        models: Sequence[object],
         *,
         units: object,
         window_length: int,
@@ -330,7 +331,7 @@ def test_main_plots_the_rul_curves_after_printing_metrics(
             {
                 "trajectories": trajectories,
                 "feature_columns": feature_columns,
-                "model": model,
+                "models": list(models),
                 "units": units,
                 "window_length": window_length,
                 "save_path": save_path,
@@ -345,7 +346,10 @@ def test_main_plots_the_rul_curves_after_printing_metrics(
     (call,) = calls
     assert call["feature_columns"] == cmapss_run._SENSOR_NAMES
     assert call["window_length"] == 10
-    assert isinstance(call["model"], cmapss_run.CompositeGaussianModel)
+    # The staged-only run draws its one staged model as a single row.
+    (labelled,) = call["models"]
+    assert labelled.label == "Staged model"
+    assert isinstance(labelled.model, cmapss_run.CompositeGaussianModel)
     expected_path = Path(plot_path_argv[1]) if plot_path_argv else None
     assert call["save_path"] == expected_path
     # The unit plotted is a held-out validation unit, and the metrics are

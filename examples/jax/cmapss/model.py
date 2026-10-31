@@ -1,4 +1,4 @@
-"""1D-convolutional mean and Gamma-variance models for windowed CMAPSS RUL data."""
+"""1D-convolutional staged and joint RUL models for windowed CMAPSS data."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from stagereg.jax import Gamma, GammaHead, Gaussian
+from stagereg.jax import Gamma, GammaHead, Gaussian, GaussianHead
 
 
 class Cnn1DBackbone(nnx.Module):
@@ -183,3 +183,53 @@ class CompositeGaussianModel(nnx.Module):
         loc = self.mean_model(inputs)
         variance = self.variance_model(inputs).mean()
         return Gaussian(loc=loc, scale=jnp.sqrt(variance))
+
+
+class Cnn1DGaussianModel(nnx.Module):
+    """Joint model: one 1D-CNN backbone predicting a Gaussian RUL distribution.
+
+    The textbook mean-variance baseline the staged model is compared against:
+    a single `Cnn1DBackbone`, with the same architecture and hyperparameters
+    as each staged model's backbone, followed by a
+    [`GaussianHead`][stagereg.jax.GaussianHead] that predicts mean and scale
+    together. Having one backbone rather than two, it has roughly half the
+    staged model's parameters.
+    """
+
+    def __init__(
+        self,
+        n_sensors: int,
+        *,
+        hidden_channels: int = 16,
+        kernel_size: int = 5,
+        rngs: nnx.Rngs,
+    ) -> None:
+        """Initialize the convolutional backbone and the Gaussian output head.
+
+        Args:
+            n_sensors: Number of sensor channels in the windowed input.
+            hidden_channels: Number of channels produced by the
+                convolutional backbone.
+            kernel_size: Convolution kernel width along the time axis.
+            rngs: NNX random-number generators used to initialize parameters.
+        """
+        self.backbone = Cnn1DBackbone(
+            n_sensors,
+            hidden_channels=hidden_channels,
+            kernel_size=kernel_size,
+            rngs=rngs,
+        )
+        self.head = GaussianHead(hidden_channels, 1, rngs=rngs)
+
+    def __call__(self, inputs: jax.Array) -> Gaussian:
+        """Predict a Gaussian RUL distribution for each windowed example.
+
+        Args:
+            inputs: Windowed sensor readings, shape ``(batch, window_length,
+                n_sensors)``.
+
+        Returns:
+            A [`Gaussian`][stagereg.jax.Gaussian] with ``loc`` and a strictly
+            positive ``scale``, each shaped ``(batch, 1)``.
+        """
+        return self.head(self.backbone(inputs))

@@ -97,6 +97,19 @@ def cmapss_run() -> ModuleType:
     return _load_example_module(_CMAPSS_DIR, "cmapss_run", "run.py")
 
 
+@pytest.fixture(scope="session")
+def cmapss_compare(cmapss_run: ModuleType) -> ModuleType:
+    """The example's staged-vs-joint comparison module.
+
+    The comparison imports its sibling as `run`. That name is aliased to the
+    already loaded `cmapss_run`, so both share one module (and one set of
+    monkeypatchable FD001 loaders), and the tracking example's own `run.py`,
+    which also puts its directory on `sys.path`, can never shadow it.
+    """
+    sys.modules["run"] = cmapss_run
+    return _load_example_module(_CMAPSS_DIR, "cmapss_compare", "compare.py")
+
+
 @pytest.fixture
 def offline_fd001(cmapss_run: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     """Serve synthetic FD001 splits in place of the cached NASA archive."""

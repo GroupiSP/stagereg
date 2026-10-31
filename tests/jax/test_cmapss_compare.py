@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import re
+import sys
 from types import ModuleType
 from typing import Any
 
@@ -132,3 +134,48 @@ def test_compare_models_scores_lie_in_their_ranges(
         assert 0.0 <= metrics["coverage"] <= 1.0
         for name in ("rmse", "closed_form_crps", "nll"):
             assert math.isfinite(metrics[name])
+
+
+_CELL = r"-?\d+\.\d+ ± \d+\.\d+"
+
+
+@pytest.mark.usefixtures("offline_fd001")
+@pytest.mark.parametrize(("seeds_argv", "seeds"), [([], 5), (["--seeds", "2"], 2)])
+def test_main_prints_one_line_per_run_and_a_mean_std_table(
+    cmapss_compare: ModuleType,
+    tiny_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    seeds_argv: list[str],
+    seeds: int,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["compare.py", *seeds_argv])
+    monkeypatch.setattr(cmapss_compare, "CmapssConfig", lambda: tiny_config)
+    prepared_with: list[Any] = []
+    prepare = cmapss_compare.prepare_cmapss_windows
+
+    def record_prepare(config: Any) -> Any:
+        prepared_with.append(config)
+        return prepare(config)
+
+    monkeypatch.setattr(cmapss_compare, "prepare_cmapss_windows", record_prepare)
+
+    cmapss_compare.main()
+
+    # The data is prepared once, with the configured seed, for every seed.
+    assert prepared_with == [tiny_config]
+    lines = capsys.readouterr().out.splitlines()
+    for model in ("staged", "joint"):
+        run_lines = [line for line in lines if line.startswith(f"[{model} ")]
+        expected_seeds = range(tiny_config.seed, tiny_config.seed + seeds)
+        assert [line.split()[1] for line in run_lines] == [
+            f"seed={seed}]" for seed in expected_seeds
+        ]
+        for line in run_lines:
+            for name in ("rmse", "coverage", "closed_form_crps", "nll"):
+                assert f"{name}=" in line
+    (header,) = [line for line in lines if re.search(r"staged\s+joint\s*$", line)]
+    table = lines[lines.index(header) + 1 :]
+    for row in ("RMSE", "95% coverage", "closed-form CRPS", "NLL"):
+        (line,) = [line for line in table if line.startswith(row)]
+        assert re.fullmatch(rf"{re.escape(row)}\s+{_CELL}\s+{_CELL}", line)

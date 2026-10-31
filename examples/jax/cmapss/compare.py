@@ -21,13 +21,15 @@ Run it with:
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import jax
+import numpy as np
 import optax
 from flax import nnx
 
@@ -45,6 +47,7 @@ from run import (
     build_composite_model,
     evaluate_test_metrics,
     make_window_loader,
+    prepare_cmapss_windows,
     train_gamma_model,
     train_mean_model,
 )
@@ -65,6 +68,12 @@ COMPARISON_METRICS: tuple[EpochMetric, ...] = (*TEST_METRICS, NegativeLogLikelih
 
 JOINT_STAGE = "joint"
 """The stage segment the joint model's training is reported under."""
+
+STAGED = "staged"
+"""The staged model's name in the per-run lines and the table."""
+
+JOINT = "joint"
+"""The joint model's name in the per-run lines and the table."""
 
 
 def train_joint_model(
@@ -146,10 +155,28 @@ class SeedComparison:
     joint_metrics: dict[str, float]
 
 
+RunReporter = Callable[[str, int, dict[str, float]], None]
+"""Called as `report(model, seed, metrics)` once each (seed, model) run is scored."""
+
+
+def _ignore_run(model: str, seed: int, metrics: dict[str, float]) -> None:
+    """Report nothing about a finished run."""
+    del model, seed, metrics
+
+
 def _train_and_score_seed(
-    prepared: PreparedCmapssData, config: CmapssConfig
+    prepared: PreparedCmapssData, config: CmapssConfig, *, on_run: RunReporter
 ) -> SeedComparison:
-    """Train and score the staged and the joint model from `config.seed`."""
+    """Train and score the staged and then the joint model from `config.seed`."""
+
+    def score(model: nnx.Module) -> dict[str, float]:
+        return evaluate_test_metrics(
+            model,
+            prepared.test_windows,
+            prepared.test_rul,
+            epoch_metrics=COMPARISON_METRICS,
+        )
+
     mean_model, state = train_mean_model(
         prepared.train_windows,
         prepared.train_targets,
@@ -166,46 +193,137 @@ def _train_and_score_seed(
         event_sinks=(),
     )
     staged_model = build_composite_model(mean_model, variance_model)
+    staged_metrics = score(staged_model)
+    on_run(STAGED, config.seed, staged_metrics)
+
     joint_model = nnx.clone(train_joint_model(prepared, config, event_sinks=()))
     joint_model.eval()
-
-    def score(model: nnx.Module) -> dict[str, float]:
-        return evaluate_test_metrics(
-            model,
-            prepared.test_windows,
-            prepared.test_rul,
-            epoch_metrics=COMPARISON_METRICS,
-        )
+    joint_metrics = score(joint_model)
+    on_run(JOINT, config.seed, joint_metrics)
 
     return SeedComparison(
         seed=config.seed,
         staged_model=staged_model,
         joint_model=joint_model,
-        staged_metrics=score(staged_model),
-        joint_metrics=score(joint_model),
+        staged_metrics=staged_metrics,
+        joint_metrics=joint_metrics,
     )
 
 
 def compare_models(
-    prepared: PreparedCmapssData, config: CmapssConfig, *, seeds: int
+    prepared: PreparedCmapssData,
+    config: CmapssConfig,
+    *,
+    seeds: int,
+    on_run: RunReporter = _ignore_run,
 ) -> list[SeedComparison]:
     """Train and score the staged and the joint model once per seed.
 
     Every seed trains on the same `prepared` data, so only initialization
     varies: seed index `i` initializes both models from `config.seed + i`.
-    Training is silent.
+    Training is silent. Each `SeedComparison` keeps both trained models, so
+    a caller can plot, say, the first seed's models without retraining.
 
     Args:
         prepared: The prepared FD001 windows, shared by every seed.
         config: Example configuration; its `seed` is the first seed.
         seeds: Number of seeds to train both models from.
+        on_run: Called with the model's name (`"staged"` or `"joint"`), the
+            seed and the test metrics as soon as each run is scored. Does
+            nothing by default.
 
     Returns:
         One `SeedComparison` per seed, in seed order.
     """
     return [
         _train_and_score_seed(
-            prepared, dataclasses.replace(config, seed=config.seed + index)
+            prepared,
+            dataclasses.replace(config, seed=config.seed + index),
+            on_run=on_run,
         )
         for index in range(seeds)
     ]
+
+
+_TABLE_ROWS = (
+    ("RMSE", "rmse"),
+    ("95% coverage", "coverage"),
+    ("closed-form CRPS", "closed_form_crps"),
+    ("NLL", "nll"),
+)
+
+
+def _mean_std(values: Sequence[float]) -> str:
+    """Format values as `mean ± std`: the sample std, or 0 for a single value."""
+    array = np.asarray(values, dtype=float)
+    std = float(array.std(ddof=1)) if array.size > 1 else 0.0
+    return f"{float(array.mean()):.4f} ± {std:.4f}"
+
+
+def format_comparison_table(results: Sequence[SeedComparison]) -> str:
+    """Tabulate both models' test metrics as `mean ± std` over seeds.
+
+    Args:
+        results: The per-seed comparisons from `compare_models`.
+
+    Returns:
+        A table with one row per metric (RMSE, 95% coverage, closed-form
+        CRPS, NLL) and a `staged` and a `joint` column.
+    """
+    cells = [
+        (
+            label,
+            _mean_std([result.staged_metrics[name] for result in results]),
+            _mean_std([result.joint_metrics[name] for result in results]),
+        )
+        for label, name in _TABLE_ROWS
+    ]
+    label_width = max(len(label) for label, _, _ in cells)
+    cell_width = max(len(cell) for row in cells for cell in row[1:])
+    lines = [
+        f"{'':<{label_width}}  {STAGED:>{cell_width}}  {JOINT:>{cell_width}}",
+        *(
+            f"{label:<{label_width}}  {staged:>{cell_width}}  {joint:>{cell_width}}"
+            for label, staged, joint in cells
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def print_run(model: str, seed: int, metrics: dict[str, float]) -> None:
+    """Print one finished (seed, model) run's test metrics on one line.
+
+    Args:
+        model: The model's name, `"staged"` or `"joint"`.
+        seed: The seed the model was initialized from.
+        metrics: The model's test metrics by name.
+    """
+    values = ", ".join(f"{name}={value:.4f}" for name, value in metrics.items())
+    print(f"[{model} seed={seed}] {values}")
+
+
+def main() -> None:
+    """Compare the staged and the joint model over seeds and print the results.
+
+    Pass `--seeds` to set the number of seeds (default 5).
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=5,
+        help="Number of seeds to train both models from (default: 5).",
+    )
+    args = parser.parse_args()
+    if args.seeds <= 0:
+        parser.error("--seeds must be positive.")
+
+    config = CmapssConfig()
+    prepared = prepare_cmapss_windows(config)
+    results = compare_models(prepared, config, seeds=args.seeds, on_run=print_run)
+    print(f"\nFD001 test metrics over {args.seeds} seeds (mean ± std):")
+    print(format_comparison_table(results))
+
+
+if __name__ == "__main__":
+    main()

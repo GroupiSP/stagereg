@@ -32,8 +32,11 @@ def test_compare_models_scores_both_models_on_the_four_metrics_once_per_seed(
 
     assert [result.seed for result in results] == [3, 4]
     for result in results:
-        assert set(result.staged_metrics) == _METRIC_NAMES
-        assert set(result.joint_metrics) == _METRIC_NAMES
+        staged, joint = result.models
+        assert (staged.name, staged.label) == ("staged", "Staged model")
+        assert (joint.name, joint.label) == ("joint", "Joint model")
+        assert set(staged.metrics) == _METRIC_NAMES
+        assert set(joint.metrics) == _METRIC_NAMES
 
 
 def test_compare_models_trains_silently_and_reproduces_a_seed(
@@ -48,8 +51,8 @@ def test_compare_models_trains_silently_and_reproduces_a_seed(
     (second,) = cmapss_compare.compare_models(prepared, tiny_cmapss_config, seeds=1)
 
     assert capsys.readouterr().out == ""
-    assert first.staged_metrics == second.staged_metrics
-    assert first.joint_metrics == second.joint_metrics
+    for first_model, second_model in zip(first.models, second.models, strict=True):
+        assert first_model.metrics == second_model.metrics
 
 
 def test_compare_models_varies_initialization_across_seeds(
@@ -61,8 +64,8 @@ def test_compare_models_varies_initialization_across_seeds(
 
     first, second = cmapss_compare.compare_models(prepared, tiny_cmapss_config, seeds=2)
 
-    assert first.staged_metrics != second.staged_metrics
-    assert first.joint_metrics != second.joint_metrics
+    for first_model, second_model in zip(first.models, second.models, strict=True):
+        assert first_model.metrics != second_model.metrics
 
 
 @settings(max_examples=4, deadline=None)
@@ -81,13 +84,35 @@ def test_compare_models_scores_lie_in_their_ranges(
 
     (result,) = cmapss_compare.compare_models(prepared, tiny_cmapss_config, seeds=1)
 
-    for metrics in (result.staged_metrics, result.joint_metrics):
+    for metrics in (model.metrics for model in result.models):
         assert 0.0 <= metrics["coverage"] <= 1.0
         for name in ("rmse", "closed_form_crps", "nll"):
             assert math.isfinite(metrics[name])
 
 
 _CELL = r"-?\d+\.\d+ ± \d+\.\d+"
+
+
+def test_format_comparison_table_gives_each_model_a_mean_and_sample_std_column(
+    cmapss_compare: ModuleType,
+) -> None:
+    def seed(staged_rmse: float, joint_rmse: float) -> Any:
+        def model(name: str, rmse: float) -> Any:
+            metrics = {"rmse": rmse, "coverage": 1.0, "closed_form_crps": 0.0}
+            return cmapss_compare.ModelResult(
+                name=name, label=name, model=None, metrics={**metrics, "nll": 0.0}
+            )
+
+        return cmapss_compare.SeedComparison(
+            seed=0, models=(model("staged", staged_rmse), model("joint", joint_rmse))
+        )
+
+    table = cmapss_compare.format_comparison_table([seed(1.0, 10.0), seed(3.0, 10.0)])
+
+    header, rmse, *_ = table.splitlines()
+    assert header.split() == ["staged", "joint"]
+    # Mean 2 and sample std sqrt(2) for the staged model; no spread for the joint.
+    assert rmse.split() == ["RMSE", "2.0000", "±", "1.4142", "10.0000", "±", "0.0000"]
 
 
 @pytest.mark.usefixtures("offline_fd001")
@@ -138,8 +163,8 @@ def test_main_prints_one_line_per_run_and_a_mean_std_table_then_plots(
     staged, joint = plot.models
     assert staged.label == "Staged model"
     assert joint.label == "Joint model"
-    assert staged.model is compared[0].staged_model
-    assert joint.model is compared[0].joint_model
+    assert staged.model is compared[0].models[0].model
+    assert joint.model is compared[0].models[1].model
     assert plot.save_path == plot_path
     assert plot.window_length == tiny_cmapss_config.window_length
     assert plot.feature_columns == cmapss_run._SENSOR_NAMES

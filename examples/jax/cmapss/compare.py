@@ -42,7 +42,7 @@ _MODULE_DIR = Path(__file__).resolve().parent
 if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
-from model import Cnn1DGaussianModel, CompositeGaussianModel
+from model import Cnn1DGaussianModel
 from plots import LabelledModel, plot_validation_rul_curves
 from preprocessing import select_lifetime_spanning_units
 from run import (
@@ -72,12 +72,6 @@ COMPARISON_METRICS: tuple[EpochMetric, ...] = (*TEST_METRICS, NegativeLogLikelih
 
 JOINT_STAGE = "joint"
 """The stage segment the joint model's training is reported under."""
-
-STAGED = "staged"
-"""The staged model's name in the per-run lines and the table."""
-
-JOINT = "joint"
-"""The joint model's name in the per-run lines and the table."""
 
 
 def train_joint_model(
@@ -130,24 +124,35 @@ def train_joint_model(
 
 
 @dataclass(frozen=True)
+class ModelResult:
+    """One trained model of a comparison and its test-split scores.
+
+    Attributes:
+        name: The model's name in the per-run lines and the table's column
+            header, e.g. `"staged"`.
+        label: The model's row label in the figure, e.g. `"Staged model"`.
+        model: The trained, eval-mode model.
+        metrics: The model's `COMPARISON_METRICS` on the test split, by
+            metric name.
+    """
+
+    name: str
+    label: str
+    model: nnx.Module
+    metrics: dict[str, float]
+
+
+@dataclass(frozen=True)
 class SeedComparison:
     """Both models trained from one seed, and their test-split scores.
 
     Attributes:
         seed: The seed both models were initialized from.
-        staged_model: The eval-mode staged model.
-        joint_model: An eval-mode clone of the trained joint model.
-        staged_metrics: The staged model's `COMPARISON_METRICS` on the test
-            split, by metric name.
-        joint_metrics: The joint model's `COMPARISON_METRICS` on the test
-            split, by metric name.
+        models: The staged model's result, then the joint model's.
     """
 
     seed: int
-    staged_model: CompositeGaussianModel
-    joint_model: Cnn1DGaussianModel
-    staged_metrics: dict[str, float]
-    joint_metrics: dict[str, float]
+    models: tuple[ModelResult, ModelResult]
 
 
 RunReporter = Callable[[str, int, dict[str, float]], None]
@@ -180,13 +185,15 @@ def _train_and_score_seed(
         The seed's `SeedComparison`.
     """
 
-    def score(model: nnx.Module) -> dict[str, float]:
-        return evaluate_test_metrics(
+    def score(name: str, label: str, model: nnx.Module) -> ModelResult:
+        metrics = evaluate_test_metrics(
             model,
             prepared.test_windows,
             prepared.test_rul,
             epoch_metrics=COMPARISON_METRICS,
         )
+        on_run(name, config.seed, metrics)
+        return ModelResult(name=name, label=label, model=model, metrics=metrics)
 
     mean_model, state = train_mean_model(
         prepared.train_windows,
@@ -203,22 +210,15 @@ def _train_and_score_seed(
         config,
         event_sinks=(),
     )
-    staged_model = build_composite_model(mean_model, variance_model)
-    staged_metrics = score(staged_model)
-    on_run(STAGED, config.seed, staged_metrics)
+    staged = score(
+        "staged", "Staged model", build_composite_model(mean_model, variance_model)
+    )
 
     joint_model = nnx.clone(train_joint_model(prepared, config, event_sinks=()))
     joint_model.eval()
-    joint_metrics = score(joint_model)
-    on_run(JOINT, config.seed, joint_metrics)
+    joint = score("joint", "Joint model", joint_model)
 
-    return SeedComparison(
-        seed=config.seed,
-        staged_model=staged_model,
-        joint_model=joint_model,
-        staged_metrics=staged_metrics,
-        joint_metrics=joint_metrics,
-    )
+    return SeedComparison(seed=config.seed, models=(staged, joint))
 
 
 def compare_models(
@@ -283,30 +283,34 @@ def format_comparison_table(results: Sequence[SeedComparison]) -> str:
     """Tabulate both models' test metrics as `mean ± std` over seeds.
 
     Args:
-        results: The per-seed comparisons from `compare_models`.
+        results: The per-seed comparisons from `compare_models`; at least
+            one.
 
     Returns:
         A table with one row per metric (RMSE, 95% coverage, closed-form
-        CRPS, NLL) and a `staged` and a `joint` column.
+        CRPS, NLL) and one column per model, headed by its name, in the
+        comparisons' model order: `staged`, then `joint`.
     """
-    cells = [
+    names = [model.name for model in results[0].models]
+    rows = [
         (
             label,
-            _mean_std([result.staged_metrics[name] for result in results]),
-            _mean_std([result.joint_metrics[name] for result in results]),
+            [
+                _mean_std([result.models[index].metrics[metric] for result in results])
+                for index in range(len(names))
+            ],
         )
-        for label, name in _TABLE_ROWS
+        for label, metric in _TABLE_ROWS
     ]
-    label_width = max(len(label) for label, _, _ in cells)
-    cell_width = max(len(cell) for row in cells for cell in row[1:])
-    lines = [
-        f"{'':<{label_width}}  {STAGED:>{cell_width}}  {JOINT:>{cell_width}}",
-        *(
-            f"{label:<{label_width}}  {staged:>{cell_width}}  {joint:>{cell_width}}"
-            for label, staged, joint in cells
-        ),
-    ]
-    return "\n".join(lines)
+    label_width = max(len(label) for label, _ in rows)
+    cell_width = max(len(cell) for _, cells in rows for cell in cells)
+
+    def line(label: str, cells: Sequence[str]) -> str:
+        return "  ".join(
+            [f"{label:<{label_width}}", *(f"{cell:>{cell_width}}" for cell in cells)]
+        )
+
+    return "\n".join([line("", names), *(line(label, cells) for label, cells in rows)])
 
 
 def print_run(model: str, seed: int, metrics: dict[str, float]) -> None:
@@ -358,10 +362,7 @@ def main() -> None:
     plot_validation_rul_curves(
         validation_trajectories,
         prepared.standardization.feature_columns,
-        [
-            LabelledModel("Staged model", first.staged_model),
-            LabelledModel("Joint model", first.joint_model),
-        ],
+        [LabelledModel(result.label, result.model) for result in first.models],
         units=select_lifetime_spanning_units(validation_trajectories),
         window_length=config.window_length,
         save_path=args.plot_path,

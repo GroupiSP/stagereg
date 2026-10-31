@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
 from types import ModuleType
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 pytest.importorskip("jax")
 pytest.importorskip("flax.nnx")
@@ -80,3 +83,52 @@ def test_compare_models_scores_both_models_on_the_four_metrics_once_per_seed(
     for result in results:
         assert set(result.staged_metrics) == _METRIC_NAMES
         assert set(result.joint_metrics) == _METRIC_NAMES
+
+
+def test_compare_models_trains_silently_and_reproduces_a_seed(
+    cmapss_run: ModuleType,
+    cmapss_compare: ModuleType,
+    tiny_config: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepared = _synthetic_prepared_data(cmapss_run)
+
+    (first,) = cmapss_compare.compare_models(prepared, tiny_config, seeds=1)
+    (second,) = cmapss_compare.compare_models(prepared, tiny_config, seeds=1)
+
+    assert capsys.readouterr().out == ""
+    assert first.staged_metrics == second.staged_metrics
+    assert first.joint_metrics == second.joint_metrics
+
+
+def test_compare_models_varies_initialization_across_seeds(
+    cmapss_run: ModuleType, cmapss_compare: ModuleType, tiny_config: Any
+) -> None:
+    prepared = _synthetic_prepared_data(cmapss_run)
+
+    first, second = cmapss_compare.compare_models(prepared, tiny_config, seeds=2)
+
+    assert first.staged_metrics != second.staged_metrics
+    assert first.joint_metrics != second.joint_metrics
+
+
+@settings(max_examples=4, deadline=None)
+@given(
+    data_seed=st.integers(min_value=0, max_value=2**16),
+    max_rul=st.floats(min_value=2.0, max_value=400.0),
+)
+def test_compare_models_scores_lie_in_their_ranges(
+    cmapss_run: ModuleType,
+    cmapss_compare: ModuleType,
+    tiny_config: Any,
+    data_seed: int,
+    max_rul: float,
+) -> None:
+    prepared = _synthetic_prepared_data(cmapss_run, seed=data_seed, max_rul=max_rul)
+
+    (result,) = cmapss_compare.compare_models(prepared, tiny_config, seeds=1)
+
+    for metrics in (result.staged_metrics, result.joint_metrics):
+        assert 0.0 <= metrics["coverage"] <= 1.0
+        for name in ("rmse", "closed_form_crps", "nll"):
+            assert math.isfinite(metrics[name])

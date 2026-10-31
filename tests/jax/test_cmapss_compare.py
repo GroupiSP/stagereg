@@ -5,13 +5,11 @@ from __future__ import annotations
 import math
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-import numpy as np
-import pandas as pd
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -23,65 +21,14 @@ pytest.importorskip("optax")
 _METRIC_NAMES = {"rmse", "coverage", "closed_form_crps", "nll"}
 
 
-def _synthetic_prepared_data(
-    cmapss_run: ModuleType,
-    *,
-    seed: int = 0,
-    window_length: int = 10,
-    n_sensors: int = 3,
-    max_rul: float = 100.0,
-) -> Any:
-    """Build small synthetic prepared data; only its windowed arrays are trained on."""
-    rng = np.random.default_rng(seed)
-
-    def windows(n_windows: int) -> tuple[np.ndarray, np.ndarray]:
-        inputs = rng.normal(size=(n_windows, window_length, n_sensors))
-        targets = rng.uniform(low=1.0, high=max_rul, size=n_windows)
-        return inputs, targets
-
-    train_windows, train_targets = windows(32)
-    validation_windows, validation_targets = windows(8)
-    test_windows, test_rul = windows(6)
-    sensors = [f"sensor_{i}" for i in range(n_sensors)]
-    columns = ["unit_id", "time_cycles", *sensors]
-    return cmapss_run.PreparedCmapssData(
-        train_windows=train_windows,
-        train_targets=train_targets,
-        validation_windows=validation_windows,
-        validation_targets=validation_targets,
-        test_windows=test_windows,
-        test_rul=test_rul,
-        train_trajectories=pd.DataFrame(columns=columns),
-        validation_trajectories=pd.DataFrame(columns=columns),
-        standardization=cmapss_run.SensorStandardization(
-            feature_columns=sensors,
-            mean=np.zeros(n_sensors),
-            scale=np.ones(n_sensors),
-        ),
-    )
-
-
-@pytest.fixture(scope="module")
-def tiny_config(cmapss_compare: ModuleType) -> Any:
-    """A configuration small enough to train both models in a second or two."""
-    return cmapss_compare.CmapssConfig(
-        window_length=10,
-        batch_size=16,
-        hidden_channels=2,
-        kernel_size=3,
-        mean_epochs=2,
-        variance_epochs=2,
-        joint_epochs=2,
-        seed=3,
-    )
-
-
 def test_compare_models_scores_both_models_on_the_four_metrics_once_per_seed(
-    cmapss_run: ModuleType, cmapss_compare: ModuleType, tiny_config: Any
+    cmapss_compare: ModuleType,
+    tiny_cmapss_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
 ) -> None:
-    prepared = _synthetic_prepared_data(cmapss_run)
+    prepared = synthetic_prepared_data()
 
-    results = cmapss_compare.compare_models(prepared, tiny_config, seeds=2)
+    results = cmapss_compare.compare_models(prepared, tiny_cmapss_config, seeds=2)
 
     assert [result.seed for result in results] == [3, 4]
     for result in results:
@@ -90,15 +37,15 @@ def test_compare_models_scores_both_models_on_the_four_metrics_once_per_seed(
 
 
 def test_compare_models_trains_silently_and_reproduces_a_seed(
-    cmapss_run: ModuleType,
     cmapss_compare: ModuleType,
-    tiny_config: Any,
+    tiny_cmapss_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    prepared = _synthetic_prepared_data(cmapss_run)
+    prepared = synthetic_prepared_data()
 
-    (first,) = cmapss_compare.compare_models(prepared, tiny_config, seeds=1)
-    (second,) = cmapss_compare.compare_models(prepared, tiny_config, seeds=1)
+    (first,) = cmapss_compare.compare_models(prepared, tiny_cmapss_config, seeds=1)
+    (second,) = cmapss_compare.compare_models(prepared, tiny_cmapss_config, seeds=1)
 
     assert capsys.readouterr().out == ""
     assert first.staged_metrics == second.staged_metrics
@@ -106,11 +53,13 @@ def test_compare_models_trains_silently_and_reproduces_a_seed(
 
 
 def test_compare_models_varies_initialization_across_seeds(
-    cmapss_run: ModuleType, cmapss_compare: ModuleType, tiny_config: Any
+    cmapss_compare: ModuleType,
+    tiny_cmapss_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
 ) -> None:
-    prepared = _synthetic_prepared_data(cmapss_run)
+    prepared = synthetic_prepared_data()
 
-    first, second = cmapss_compare.compare_models(prepared, tiny_config, seeds=2)
+    first, second = cmapss_compare.compare_models(prepared, tiny_cmapss_config, seeds=2)
 
     assert first.staged_metrics != second.staged_metrics
     assert first.joint_metrics != second.joint_metrics
@@ -122,15 +71,15 @@ def test_compare_models_varies_initialization_across_seeds(
     max_rul=st.floats(min_value=2.0, max_value=400.0),
 )
 def test_compare_models_scores_lie_in_their_ranges(
-    cmapss_run: ModuleType,
     cmapss_compare: ModuleType,
-    tiny_config: Any,
+    tiny_cmapss_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
     data_seed: int,
     max_rul: float,
 ) -> None:
-    prepared = _synthetic_prepared_data(cmapss_run, seed=data_seed, max_rul=max_rul)
+    prepared = synthetic_prepared_data(seed=data_seed, max_rul=max_rul)
 
-    (result,) = cmapss_compare.compare_models(prepared, tiny_config, seeds=1)
+    (result,) = cmapss_compare.compare_models(prepared, tiny_cmapss_config, seeds=1)
 
     for metrics in (result.staged_metrics, result.joint_metrics):
         assert 0.0 <= metrics["coverage"] <= 1.0
@@ -149,10 +98,10 @@ _CELL = r"-?\d+\.\d+ ± \d+\.\d+"
 def test_main_prints_one_line_per_run_and_a_mean_std_table_then_plots(
     cmapss_run: ModuleType,
     cmapss_compare: ModuleType,
-    tiny_config: Any,
+    tiny_cmapss_config: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
+    plot_recorder: Any,
     seeds_argv: list[str],
     seeds: int,
     plot_name: str | None,
@@ -160,7 +109,7 @@ def test_main_prints_one_line_per_run_and_a_mean_std_table_then_plots(
     plot_path = tmp_path / plot_name if plot_name else None
     plot_argv = ["--plot-path", str(plot_path)] if plot_path else []
     monkeypatch.setattr(sys, "argv", ["compare.py", *seeds_argv, *plot_argv])
-    monkeypatch.setattr(cmapss_compare, "CmapssConfig", lambda: tiny_config)
+    monkeypatch.setattr(cmapss_compare, "CmapssConfig", lambda: tiny_cmapss_config)
     prepared_with: list[Any] = []
     prepare = cmapss_compare.prepare_cmapss_windows
 
@@ -178,50 +127,29 @@ def test_main_prints_one_line_per_run_and_a_mean_std_table_then_plots(
         return results
 
     monkeypatch.setattr(cmapss_compare, "compare_models", record_compare)
-    plots: list[dict[str, Any]] = []
-
-    def record_plot(
-        trajectories: pd.DataFrame,
-        feature_columns: list[str],
-        models: Sequence[Any],
-        *,
-        units: Any,
-        window_length: int,
-        save_path: Path | None,
-    ) -> None:
-        plots.append(
-            {
-                "trajectories": trajectories,
-                "feature_columns": feature_columns,
-                "models": list(models),
-                "units": units,
-                "window_length": window_length,
-                "save_path": save_path,
-            }
-        )
-
-    monkeypatch.setattr(cmapss_compare, "plot_validation_rul_curves", record_plot)
+    monkeypatch.setattr(cmapss_compare, "plot_validation_rul_curves", plot_recorder)
 
     cmapss_compare.main()
 
     # The data is prepared once, with the configured seed, for every seed.
-    assert prepared_with == [tiny_config]
+    assert prepared_with == [tiny_cmapss_config]
     # One figure, drawn from the first seed's models: staged row above joint.
-    (plot,) = plots
-    staged, joint = plot["models"]
+    (plot,) = plot_recorder.calls
+    staged, joint = plot.models
     assert staged.label == "Staged model"
     assert joint.label == "Joint model"
     assert staged.model is compared[0].staged_model
     assert joint.model is compared[0].joint_model
-    assert plot["save_path"] == plot_path
-    assert plot["window_length"] == tiny_config.window_length
-    assert plot["feature_columns"] == cmapss_run._SENSOR_NAMES
-    validation = plot["trajectories"]
-    assert plot["units"] == cmapss_compare.select_lifetime_spanning_units(validation)
-    lines = capsys.readouterr().out.splitlines()
+    assert plot.save_path == plot_path
+    assert plot.window_length == tiny_cmapss_config.window_length
+    assert plot.feature_columns == cmapss_run._SENSOR_NAMES
+    validation = plot.trajectories
+    assert plot.units == cmapss_compare.select_lifetime_spanning_units(validation)
+    # Every run line and the table are printed before the figure is drawn.
+    lines = plot.printed.splitlines()
     for model in ("staged", "joint"):
         run_lines = [line for line in lines if line.startswith(f"[{model} ")]
-        expected_seeds = range(tiny_config.seed, tiny_config.seed + seeds)
+        expected_seeds = range(tiny_cmapss_config.seed, tiny_cmapss_config.seed + seeds)
         assert [line.split()[1] for line in run_lines] == [
             f"seed={seed}]" for seed in expected_seeds
         ]

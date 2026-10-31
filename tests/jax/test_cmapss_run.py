@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -13,6 +13,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 # The example module itself arrives through the `cmapss_run` fixture; these
 # names are used directly by the test bodies, so they stay module-level.
@@ -22,35 +24,16 @@ nnx = pytest.importorskip("flax.nnx")
 pytest.importorskip("optax")
 
 
-def _synthetic_windows(
-    rng: np.random.Generator, *, n_windows: int, window_length: int, n_sensors: int
-) -> tuple[np.ndarray, np.ndarray]:
-    windows = rng.normal(size=(n_windows, window_length, n_sensors))
-    targets = rng.uniform(low=1.0, high=100.0, size=n_windows)
-    return windows, targets
-
-
 def test_train_gamma_model_and_evaluate_test_metrics_end_to_end(
     cmapss_run: ModuleType,
+    tiny_cmapss_config: Any,
+    synthetic_windows: Callable[..., tuple[np.ndarray, np.ndarray]],
 ) -> None:
     rng = np.random.default_rng(0)
-    train_windows, train_targets = _synthetic_windows(
-        rng, n_windows=64, window_length=30, n_sensors=9
-    )
-    validation_windows, validation_targets = _synthetic_windows(
-        rng, n_windows=16, window_length=30, n_sensors=9
-    )
-    test_windows, test_rul = _synthetic_windows(
-        rng, n_windows=10, window_length=30, n_sensors=9
-    )
-    config = cmapss_run.CmapssConfig(
-        batch_size=16,
-        hidden_channels=4,
-        kernel_size=3,
-        mean_epochs=3,
-        variance_epochs=3,
-        seed=1,
-    )
+    train_windows, train_targets = synthetic_windows(rng, 64)
+    validation_windows, validation_targets = synthetic_windows(rng, 16)
+    test_windows, test_rul = synthetic_windows(rng, 10)
+    config = tiny_cmapss_config
 
     mean_model, state = cmapss_run.train_mean_model(
         train_windows,
@@ -94,22 +77,16 @@ class _RecordingSink:
 
 
 def test_training_functions_report_only_to_the_event_sinks_they_are_given(
-    cmapss_run: ModuleType, capsys: pytest.CaptureFixture[str]
+    cmapss_run: ModuleType,
+    tiny_cmapss_config: Any,
+    synthetic_windows: Callable[..., tuple[np.ndarray, np.ndarray]],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     rng = np.random.default_rng(3)
-    train_windows, train_targets = _synthetic_windows(
-        rng, n_windows=16, window_length=10, n_sensors=3
-    )
-    validation_windows, validation_targets = _synthetic_windows(
-        rng, n_windows=8, window_length=10, n_sensors=3
-    )
-    config = cmapss_run.CmapssConfig(
-        window_length=10,
-        batch_size=8,
-        hidden_channels=2,
-        kernel_size=3,
-        mean_epochs=2,
-        variance_epochs=3,
+    train_windows, train_targets = synthetic_windows(rng, 16)
+    validation_windows, validation_targets = synthetic_windows(rng, 8)
+    config = dataclasses.replace(
+        tiny_cmapss_config, batch_size=8, mean_epochs=2, variance_epochs=3
     )
     mean_sink, gamma_sink = _RecordingSink(), _RecordingSink()
 
@@ -215,7 +192,7 @@ def test_cmapss_config_rejects_invalid_values(cmapss_run: ModuleType) -> None:
         cmapss_run.CmapssConfig(variance_epochs=0)
 
 
-@pytest.mark.parametrize("joint_epochs", [0, -1])
+@given(joint_epochs=st.integers(max_value=0))
 def test_cmapss_config_rejects_non_positive_joint_epochs(
     cmapss_run: ModuleType, joint_epochs: int
 ) -> None:
@@ -337,73 +314,42 @@ def test_main_plots_the_rul_curves_after_printing_metrics(
     cmapss_run: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
+    tiny_cmapss_config: Any,
+    plot_recorder: Any,
     plot_path_argv: list[str],
 ) -> None:
     if plot_path_argv:
         plot_path_argv = [plot_path_argv[0], str(tmp_path / plot_path_argv[1])]
     monkeypatch.setattr(sys, "argv", ["run.py", *plot_path_argv])
-    fast_config = cmapss_run.CmapssConfig(
-        window_length=10,
-        batch_size=16,
-        hidden_channels=2,
-        kernel_size=3,
-        mean_epochs=1,
-        variance_epochs=1,
-    )
-    monkeypatch.setattr(cmapss_run, "CmapssConfig", lambda: fast_config)
-    calls: list[dict[str, object]] = []
-
-    def record_plot(
-        trajectories: pd.DataFrame,
-        feature_columns: list[str],
-        models: Sequence[object],
-        *,
-        units: object,
-        window_length: int,
-        save_path: Path | None,
-    ) -> None:
-        """Record one plotting call and whatever was printed before it."""
-        calls.append(
-            {
-                "trajectories": trajectories,
-                "feature_columns": feature_columns,
-                "models": list(models),
-                "units": units,
-                "window_length": window_length,
-                "save_path": save_path,
-                "printed": capsys.readouterr().out,
-            }
-        )
-
-    monkeypatch.setattr(cmapss_run, "plot_validation_rul_curves", record_plot)
+    monkeypatch.setattr(cmapss_run, "CmapssConfig", lambda: tiny_cmapss_config)
+    monkeypatch.setattr(cmapss_run, "plot_validation_rul_curves", plot_recorder)
 
     cmapss_run.main()
 
-    (call,) = calls
-    assert call["feature_columns"] == cmapss_run._SENSOR_NAMES
-    assert call["window_length"] == 10
+    (call,) = plot_recorder.calls
+    assert call.feature_columns == cmapss_run._SENSOR_NAMES
+    assert call.window_length == tiny_cmapss_config.window_length
     # The staged-only run draws its one staged model as a single row.
-    (labelled,) = call["models"]
+    (labelled,) = call.models
     assert labelled.label == "Staged model"
     assert isinstance(labelled.model, cmapss_run.CompositeGaussianModel)
     expected_path = Path(plot_path_argv[1]) if plot_path_argv else None
-    assert call["save_path"] == expected_path
+    assert call.save_path == expected_path
     # The unit plotted is a held-out validation unit, and the metrics are
     # already printed by the time the figure is built.
-    trajectories = call["trajectories"]
+    trajectories = call.trajectories
     assert isinstance(trajectories, pd.DataFrame)
     assert not trajectories.empty
-    prepared = cmapss_run.prepare_cmapss_windows(fast_config)
+    prepared = cmapss_run.prepare_cmapss_windows(tiny_cmapss_config)
     plotted_units = set(trajectories["unit_id"].unique())
     assert plotted_units == set(prepared.validation_trajectories["unit_id"].unique())
     assert plotted_units.isdisjoint(prepared.train_trajectories["unit_id"].unique())
     # The run, not the plotting module, picks the lifetime-spanning trio,
     # and it picks it out of the validation trajectories it hands over.
-    units = call["units"]
+    units = call.units
     assert units == cmapss_run.select_lifetime_spanning_units(trajectories)
     assert {units.shortest, units.median, units.longest} <= plotted_units
-    printed = call["printed"]
+    printed = call.printed
     assert isinstance(printed, str)
     assert "FD001 test RMSE" in printed
     assert "FD001 test closed-form CRPS" in printed

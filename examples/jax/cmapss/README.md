@@ -76,7 +76,9 @@ standardized validation trajectories, the feature columns, a sequence of
 `LabelledModel`s (a label and a trained Gaussian model each), the three
 units to draw, and the window length, and draws an N×3 grid: one row per
 model, labelled with its name, and one column per unit. `run.py` passes
-its one staged model, so its figure is a single row. It also passes the
+its one staged model, so its figure is a single row, and its first panel's
+y-label now names that model ("Staged model") above "RUL (cycles)". It also
+passes the
 lifetime-spanning units of the validation subset, so the columns are its
 shortest-, median-, and longest-lifetime unit in that order; the module
 itself decides how a RUL curve looks and never which units it looks at. Spanning the lifetime range that way lets a reader
@@ -174,7 +176,9 @@ uv run --group example-cmapss python examples/jax/cmapss/compare.py
 
 Training is silent. The script prints one line per (seed, model) run as it
 finishes, then a table with one row per metric and a `staged` and a `joint`
-column, each cell the `mean ± std` over seeds. Pass `--seeds` to trade
+column, each cell the `mean ± std` over seeds. The `±` is the sample
+standard deviation over seeds (`ddof=1`), and 0 for a single seed. Pass
+`--seeds` to trade
 runtime for confidence (default 5):
 
 ```shell

@@ -118,6 +118,10 @@ exactly the feature scaling the models were trained with.
 `build_composite_model` is the one factory for the composite predictive
 model: it clones both trained stage models and returns the composite in
 eval mode, so every consumer scores the same model in the same mode.
+`evaluate_test_metrics` scores any model whose output is a Gaussian, the
+staged model included. The mean and Gamma training functions take their
+event sinks as a parameter, so each entry point decides how verbose
+training is.
 
 Run it with:
 
@@ -127,7 +131,8 @@ uv run --group example-cmapss python examples/jax/cmapss/run.py
 
 The script prints per-epoch training metrics for both stages, followed by
 the final test-set metrics: RMSE, 95% predictive-interval coverage, and
-point-CRPS. It then plots the RUL curves of the shortest-, median-, and
+closed-form CRPS. The closed-form CRPS comes from each predictive
+Gaussian's own formula, so it carries no sampling noise. It then plots the RUL curves of the shortest-, median-, and
 longest-lifetime held-out validation units. Pass `--plot-path` to save
 that figure instead of displaying it:
 

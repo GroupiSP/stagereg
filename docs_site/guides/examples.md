@@ -107,7 +107,8 @@ Source:
 
 Two-step probabilistic remaining-useful-life estimation on NASA CMAPSS FD001: a
 CNN mean stage, a Gamma variance stage on its squared residuals, and a
-composite Gaussian scored against the official test split.
+composite Gaussian scored against the official test split by RMSE, 95%
+interval coverage and closed-form CRPS.
 
 ```bash
 uv run --group example-cmapss python examples/jax/cmapss/run.py

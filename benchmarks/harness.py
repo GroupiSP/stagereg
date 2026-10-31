@@ -442,14 +442,21 @@ def run_cmapss(config: Any = None, *, prepared: Any = None) -> WorkloadReport:
             prepared.validation_windows,
             prepared.validation_targets,
             config,
+            event_sinks=[cmapss.PrintingEventSink()],
         )
         probe.mark()
         variance_model = cmapss.train_gamma_model(
-            state, prepared.train_windows, prepared.train_targets, config
+            state,
+            prepared.train_windows,
+            prepared.train_targets,
+            config,
+            event_sinks=[cmapss.PrintingEventSink()],
         )
         scoring_start = probe.mark()
-        cmapss.evaluate_composite_metrics(
-            mean_model, variance_model, prepared.test_windows, prepared.test_rul, config
+        cmapss.evaluate_test_metrics(
+            cmapss.build_composite_model(mean_model, variance_model),
+            prepared.test_windows,
+            prepared.test_rul,
         )
         end = time.perf_counter()
     return WorkloadReport(

@@ -49,7 +49,7 @@ from data import (
     load_fd001_test_rul,
 )
 from model import Cnn1DGammaModel, Cnn1DMeanModel, CompositeGaussianModel
-from plots import plot_validation_rul_curves
+from plots import LabelledModel, plot_validation_rul_curves
 from preprocessing import (
     SensorStandardization,
     apply_standardization,
@@ -509,7 +509,11 @@ def main() -> None:
     plot_validation_rul_curves(
         validation_trajectories,
         _SENSOR_NAMES,
-        build_composite_model(mean_model, variance_model),
+        [
+            LabelledModel(
+                "Staged model", build_composite_model(mean_model, variance_model)
+            )
+        ],
         units=select_lifetime_spanning_units(validation_trajectories),
         window_length=config.window_length,
         save_path=args.plot_path,

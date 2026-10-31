@@ -167,14 +167,30 @@ RunReporter = Callable[[str, int, dict[str, float]], None]
 
 
 def _ignore_run(model: str, seed: int, metrics: dict[str, float]) -> None:
-    """Report nothing about a finished run."""
+    """Report nothing about a finished run.
+
+    Args:
+        model: The model's name, ignored.
+        seed: The seed the model was initialized from, ignored.
+        metrics: The model's test metrics by name, ignored.
+    """
     del model, seed, metrics
 
 
 def _train_and_score_seed(
     prepared: PreparedCmapssData, config: CmapssConfig, *, on_run: RunReporter
 ) -> SeedComparison:
-    """Train and score the staged and then the joint model from `config.seed`."""
+    """Train and score the staged and then the joint model from `config.seed`.
+
+    Args:
+        prepared: The prepared FD001 windows to train, validate and score on.
+        config: Example configuration; its `seed` initializes both models.
+        on_run: Called with each model's name, the seed and its test metrics
+            as soon as that model is scored.
+
+    Returns:
+        The seed's `SeedComparison`.
+    """
 
     def score(model: nnx.Module) -> dict[str, float]:
         return evaluate_test_metrics(
@@ -261,7 +277,15 @@ _TABLE_ROWS = (
 
 
 def _mean_std(values: Sequence[float]) -> str:
-    """Format values as `mean ± std`: the sample std, or 0 for a single value."""
+    """Format values as `mean ± std`: the sample std, or 0 for a single value.
+
+    Args:
+        values: One metric's values, one per seed; at least one.
+
+    Returns:
+        The mean and the sample standard deviation (`ddof=1`), both to four
+        decimals, joined by `±`.
+    """
     array = np.asarray(values, dtype=float)
     std = float(array.std(ddof=1)) if array.size > 1 else 0.0
     return f"{float(array.mean()):.4f} ± {std:.4f}"

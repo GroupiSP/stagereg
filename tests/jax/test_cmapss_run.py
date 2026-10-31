@@ -81,9 +81,15 @@ class _RecordingSink:
     """An event sink that keeps every training event it receives."""
 
     def __init__(self) -> None:
+        """Start with no recorded events."""
         self.events: list[Any] = []
 
     def on_event(self, event: Any) -> None:
+        """Record one training event.
+
+        Args:
+            event: The training event a stage emitted.
+        """
         self.events.append(event)
 
 
@@ -131,10 +137,25 @@ class _ConstantGaussianModel(nnx.Module):
     """A Gaussian-output model predicting the same distribution for every window."""
 
     def __init__(self, loc: float, scale: float) -> None:
+        """Fix the predicted distribution.
+
+        Args:
+            loc: The predicted mean for every window.
+            scale: The predicted standard deviation for every window.
+        """
         self.loc = loc
         self.scale = scale
 
     def __call__(self, inputs: Any) -> Any:
+        """Predict the fixed Gaussian for every window in the batch.
+
+        Args:
+            inputs: Windowed sensor readings, shape `(batch, window_length,
+                n_sensors)`.
+
+        Returns:
+            A Gaussian with `loc` and `scale` each filled to shape `(batch, 1)`.
+        """
         from stagereg.jax import Gaussian
 
         shape = (inputs.shape[0], 1)

@@ -12,7 +12,7 @@ The frozen Stage-1 point prediction and the Stage-2 Gamma mean are then
 combined into a composite `Gaussian` predictive distribution, evaluated
 end to end against the official FD001 test split with `stagereg`'s
 `MetricSuite`/`GaussianPredictor`/`evaluate_loader` machinery, reporting
-RMSE, 95% interval coverage, and point-CRPS. The test split follows a
+RMSE, 95% interval coverage, and the closed-form CRPS. The test split follows a
 single-window-per-trajectory protocol: one window per test unit, ending at
 its last observed (possibly truncated) cycle, scored against that unit's
 ground-truth RUL from `RUL_FD001.txt`.
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,13 +63,13 @@ from preprocessing import (
 
 from stagereg.core.losses import SquaredErrorLoss
 from stagereg.core.metric_registry import (
-    EvaluationGrid,
+    ClosedFormContinuousRankedProbabilityScore,
+    EpochMetric,
     IntervalCoverage,
-    PointContinuousRankedProbabilityScore,
     RootMeanSquaredError,
 )
 from stagereg.core.protocols import LoaderFactory
-from stagereg.core.tracking import TrainingEvent
+from stagereg.core.tracking import EventSink, TrainingEvent
 from stagereg.core.types import Batch, TrainingState
 from stagereg.jax import (
     GammaVarianceStage,
@@ -83,6 +84,13 @@ from stagereg.jax import (
 )
 
 _SENSOR_NAMES = [f"sensor_{i}" for i in (11, 12, 4, 7, 15, 20, 21, 2, 17)]
+
+TEST_METRICS: tuple[EpochMetric, ...] = (
+    RootMeanSquaredError(),
+    IntervalCoverage(level=0.95),
+    ClosedFormContinuousRankedProbabilityScore(),
+)
+"""The staged-only run's test metrics: RMSE, 95% coverage, closed-form CRPS."""
 
 
 @dataclass(frozen=True)
@@ -100,8 +108,6 @@ class CmapssConfig:
         learning_rate: Adam learning rate for both stages.
         mean_epochs: Number of Stage-1 mean-model training epochs.
         variance_epochs: Number of Stage-2 Gamma-model training epochs.
-        predictive_sample_count: Number of predictive samples per test window
-            used to approximate point-CRPS.
         seed: Base JAX random seed for splitting, model init, and training.
     """
 
@@ -113,7 +119,6 @@ class CmapssConfig:
     learning_rate: float = 1e-3
     mean_epochs: int = 20
     variance_epochs: int = 20
-    predictive_sample_count: int = 256
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -129,8 +134,6 @@ class CmapssConfig:
             raise ValueError("hidden_channels and kernel_size must be positive.")
         if self.mean_epochs <= 0 or self.variance_epochs <= 0:
             raise ValueError("mean_epochs and variance_epochs must be positive.")
-        if self.predictive_sample_count <= 0:
-            raise ValueError("predictive_sample_count must be positive.")
         if not 0.0 < self.validation_fraction < 1.0:
             raise ValueError("validation_fraction must be within (0, 1).")
 
@@ -191,6 +194,8 @@ def train_mean_model(
     validation_windows: np.ndarray,
     validation_targets: np.ndarray,
     config: CmapssConfig,
+    *,
+    event_sinks: Sequence[EventSink],
 ) -> tuple[Cnn1DMeanModel, TrainingState]:
     """Train a 1D-CNN mean model through `MeanStage` on windowed RUL data.
 
@@ -202,6 +207,8 @@ def train_mean_model(
             `train_windows`.
         validation_targets: Held-out validation RUL targets.
         config: Example configuration controlling model size and training.
+        event_sinks: Sinks notified of the stage's training events; pass
+            none to train silently.
 
     Returns:
         A tuple of the trained `Cnn1DMeanModel` and the shared staged
@@ -236,7 +243,7 @@ def train_mean_model(
                 loader=validation_loader,
                 loss=loss,
             ),
-            event_sinks=[PrintingEventSink()],
+            event_sinks=event_sinks,
         ),
     )
     state = TrainingState(rng_state=rng_key)
@@ -250,6 +257,8 @@ def train_gamma_model(
     train_windows: np.ndarray,
     train_targets: np.ndarray,
     config: CmapssConfig,
+    *,
+    event_sinks: Sequence[EventSink],
 ) -> Cnn1DGammaModel:
     """Train a 1D-CNN Gamma model through `GammaVarianceStage`.
 
@@ -263,6 +272,8 @@ def train_gamma_model(
             window_length, n_sensors)`.
         train_targets: Training RUL targets, shape `(n_train,)`.
         config: Example configuration controlling model size and training.
+        event_sinks: Sinks notified of the stage's training events; pass
+            none to train silently.
 
     Returns:
         The trained `Cnn1DGammaModel`.
@@ -286,7 +297,7 @@ def train_gamma_model(
         source_loader=train_loader,
         options=SupervisedStageOptions(
             epochs=config.variance_epochs,
-            event_sinks=[PrintingEventSink()],
+            event_sinks=event_sinks,
         ),
         splits=("train",),
     )
@@ -319,63 +330,41 @@ def build_composite_model(
     return composite
 
 
-def evaluate_composite_metrics(
-    mean_model: Cnn1DMeanModel,
-    variance_model: Cnn1DGammaModel,
+def evaluate_test_metrics(
+    model: nnx.Module,
     test_windows: np.ndarray,
     test_rul: np.ndarray,
-    config: CmapssConfig,
+    *,
+    epoch_metrics: tuple[EpochMetric, ...] = TEST_METRICS,
 ) -> dict[str, float]:
-    """Evaluate the composite Gaussian predictive model against the test split.
+    """Score a Gaussian-output model against the FD001 test split.
 
-    Obtains the composite model from `build_composite_model` and scores
-    it with `stagereg`'s `MetricSuite`, `GaussianPredictor`, and
-    `evaluate_loader`.
+    Works for any model whose output is a `Gaussian`, such as the staged
+    model from `build_composite_model`. Scoring goes through `stagereg`'s
+    `MetricSuite`, `GaussianPredictor`, and `evaluate_loader`; the closed-form
+    CRPS needs neither predictive samples nor an evaluation grid, so the
+    scores carry no Monte Carlo noise. No loss is computed.
 
     Args:
-        mean_model: The trained Stage-1 mean model.
-        variance_model: The trained Stage-2 Gamma model.
+        model: An eval-mode model mapping windows to a `Gaussian`.
         test_windows: One trailing window per test unit, shape `(n_units,
             window_length, n_sensors)`.
         test_rul: Ground-truth RUL per test unit, shape `(n_units,)`.
-        config: Example configuration controlling the predictive sample
-            count used to approximate point-CRPS.
-
-    No loss is computed: the composite model is scored against the metric
-    suite alone.
+        epoch_metrics: The metrics to report. Defaults to `TEST_METRICS`:
+            RMSE (`"rmse"`), 95% interval coverage (`"coverage"`) and the
+            closed-form CRPS (`"closed_form_crps"`).
 
     Returns:
-        A mapping with `"rmse"`, `"coverage"`, and `"point_crps"`.
-
-    Raises:
-        ValueError: If `test_rul` has no positive value to size the CRPS
-            evaluation grid against.
+        A mapping from each metric's name to its value on the test split.
     """
-    grid_upper_bound = float(test_rul.max()) * 1.5
-    if grid_upper_bound <= 0.0:
-        raise ValueError("test_rul must contain at least one positive value.")
-
-    composite = build_composite_model(mean_model, variance_model)
-
     inputs = jnp.asarray(test_windows, dtype=jnp.float32)
     targets = jnp.asarray(test_rul, dtype=jnp.float32).reshape(-1, 1)
     batch = Batch(inputs=inputs, targets=targets)
 
-    metric_suite = MetricSuite(
-        epoch=(
-            RootMeanSquaredError(),
-            IntervalCoverage(level=0.95),
-            PointContinuousRankedProbabilityScore(),
-        ),
-        predictor=GaussianPredictor(),
-        predictive_sample_count=config.predictive_sample_count,
-        evaluation_grid=EvaluationGrid(np.linspace(0.0, grid_upper_bound, 301)),
-    )
+    metric_suite = MetricSuite(epoch=epoch_metrics, predictor=GaussianPredictor())
+    # No metric draws predictive samples, so the key never affects a score.
     metrics, _ = evaluate_loader(
-        composite,
-        [batch],
-        key=jax.random.key(config.seed),
-        metrics=metric_suite,
+        model, [batch], key=jax.random.key(0), metrics=metric_suite
     )
     return metrics
 
@@ -493,17 +482,24 @@ def main() -> None:
         prepared.validation_windows,
         prepared.validation_targets,
         config,
+        event_sinks=[PrintingEventSink()],
     )
     variance_model = train_gamma_model(
-        state, prepared.train_windows, prepared.train_targets, config
+        state,
+        prepared.train_windows,
+        prepared.train_targets,
+        config,
+        event_sinks=[PrintingEventSink()],
     )
 
-    metrics = evaluate_composite_metrics(
-        mean_model, variance_model, prepared.test_windows, prepared.test_rul, config
+    metrics = evaluate_test_metrics(
+        build_composite_model(mean_model, variance_model),
+        prepared.test_windows,
+        prepared.test_rul,
     )
     print(f"FD001 test RMSE: {metrics['rmse']:.4f}")
     print(f"FD001 test 95% interval coverage: {metrics['coverage']:.4f}")
-    print(f"FD001 test point-CRPS: {metrics['point_crps']:.4f}")
+    print(f"FD001 test closed-form CRPS: {metrics['closed_form_crps']:.4f}")
 
     validation_trajectories = prepared.validation_trajectories
     plot_validation_rul_curves(

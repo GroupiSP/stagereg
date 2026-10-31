@@ -108,6 +108,8 @@ class CmapssConfig:
         learning_rate: Adam learning rate for both stages.
         mean_epochs: Number of Stage-1 mean-model training epochs.
         variance_epochs: Number of Stage-2 Gamma-model training epochs.
+        joint_epochs: Number of training epochs for the joint model of the
+            staged-vs-joint comparison.
         seed: Base JAX random seed for splitting, model init, and training.
     """
 
@@ -119,6 +121,7 @@ class CmapssConfig:
     learning_rate: float = 1e-3
     mean_epochs: int = 20
     variance_epochs: int = 20
+    joint_epochs: int = 20
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -134,6 +137,8 @@ class CmapssConfig:
             raise ValueError("hidden_channels and kernel_size must be positive.")
         if self.mean_epochs <= 0 or self.variance_epochs <= 0:
             raise ValueError("mean_epochs and variance_epochs must be positive.")
+        if self.joint_epochs <= 0:
+            raise ValueError("joint_epochs must be positive.")
         if not 0.0 < self.validation_fraction < 1.0:
             raise ValueError("validation_fraction must be within (0, 1).")
 

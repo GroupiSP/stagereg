@@ -194,6 +194,22 @@ def test_cmapss_config_rejects_invalid_values(cmapss_run: ModuleType) -> None:
         cmapss_run.CmapssConfig(variance_epochs=0)
 
 
+@pytest.mark.parametrize("joint_epochs", [0, -1])
+def test_cmapss_config_rejects_non_positive_joint_epochs(
+    cmapss_run: ModuleType, joint_epochs: int
+) -> None:
+    with pytest.raises(ValueError, match="joint_epochs"):
+        cmapss_run.CmapssConfig(joint_epochs=joint_epochs)
+
+
+def test_cmapss_config_gives_the_joint_model_the_same_default_budget_as_each_stage(
+    cmapss_run: ModuleType,
+) -> None:
+    config = cmapss_run.CmapssConfig()
+
+    assert config.joint_epochs == 20
+
+
 def test_cmapss_config_has_no_predictive_sample_count(cmapss_run: ModuleType) -> None:
     # The closed-form CRPS draws no predictive samples, so the run has no
     # sample count to configure.

@@ -127,8 +127,10 @@ Gaussian head, trained on the Gaussian negative log-likelihood) on the same
 prepared data, run the comparison. It trains both models from `--seeds` seeds
 (default 5) on a fixed train/validation split and prints a `staged` vs `joint`
 table of RMSE, 95% interval coverage, closed-form CRPS and NLL as
-`mean ± std` over seeds. The joint model has roughly half the staged model's
-parameters.
+`mean ± std` over seeds. It then plots the first seed's validation RUL curves,
+the staged model's row above the joint model's; pass `--plot-path` to save the
+figure instead of displaying it. The joint model has roughly half the staged
+model's parameters.
 
 ```bash
 uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5

@@ -181,6 +181,16 @@ runtime for confidence (default 5):
 uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 10
 ```
 
+Finally it plots the first seed's RUL curves for the same shortest-,
+median-, and longest-lifetime held-out validation units as `run.py`: the
+staged model's row above the joint model's, with a shared time axis in each
+column. Using the first seed keeps the figure reproducible. Pass
+`--plot-path` to save that figure instead of displaying it:
+
+```shell
+uv run --group example-cmapss python examples/jax/cmapss/compare.py --plot-path comparison.png
+```
+
 Note that the joint model has one backbone where the staged model has two
 (one per stage), so it has roughly half the staged model's parameters. The
 comparison holds the architecture and the per-model epoch budget fixed, not

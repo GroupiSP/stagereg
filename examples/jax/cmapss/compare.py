@@ -14,9 +14,14 @@ official FD001 test split on RMSE, 95% interval coverage, closed-form CRPS
 and NLL. The train/validation split stays fixed across seeds; only model
 initialization changes.
 
+It then draws the first seed's validation RUL curves: the staged model's row
+above the joint model's, for the same lifetime-spanning validation units.
+
 Run it with:
 
     uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5
+
+Pass `--plot-path` to save the figure instead of displaying it.
 """
 
 from __future__ import annotations
@@ -40,6 +45,8 @@ if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
 from model import Cnn1DGaussianModel, CompositeGaussianModel
+from plots import LabelledModel, plot_validation_rul_curves
+from preprocessing import select_lifetime_spanning_units
 from run import (
     TEST_METRICS,
     CmapssConfig,
@@ -303,9 +310,10 @@ def print_run(model: str, seed: int, metrics: dict[str, float]) -> None:
 
 
 def main() -> None:
-    """Compare the staged and the joint model over seeds and print the results.
+    """Compare the staged and the joint model over seeds, print and plot the results.
 
-    Pass `--seeds` to set the number of seeds (default 5).
+    Pass `--seeds` to set the number of seeds (default 5), and `--plot-path` to save the
+    first seed's RUL-curves figure to that path instead of displaying it.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -313,6 +321,15 @@ def main() -> None:
         type=int,
         default=5,
         help="Number of seeds to train both models from (default: 5).",
+    )
+    parser.add_argument(
+        "--plot-path",
+        type=Path,
+        default=None,
+        help=(
+            "Save the staged-vs-joint validation RUL-curves figure to this path "
+            "instead of displaying it."
+        ),
     )
     args = parser.parse_args()
     if args.seeds <= 0:
@@ -323,6 +340,20 @@ def main() -> None:
     results = compare_models(prepared, config, seeds=args.seeds, on_run=print_run)
     print(f"\nFD001 test metrics over {args.seeds} seeds (mean ± std):")
     print(format_comparison_table(results))
+
+    first = results[0]
+    validation_trajectories = prepared.validation_trajectories
+    plot_validation_rul_curves(
+        validation_trajectories,
+        prepared.standardization.feature_columns,
+        [
+            LabelledModel("Staged model", first.staged_model),
+            LabelledModel("Joint model", first.joint_model),
+        ],
+        units=select_lifetime_spanning_units(validation_trajectories),
+        window_length=config.window_length,
+        save_path=args.plot_path,
+    )
 
 
 if __name__ == "__main__":

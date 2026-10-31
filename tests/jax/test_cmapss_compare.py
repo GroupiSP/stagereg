@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 import re
 import sys
+from collections.abc import Sequence
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -140,16 +142,24 @@ _CELL = r"-?\d+\.\d+ ± \d+\.\d+"
 
 
 @pytest.mark.usefixtures("offline_fd001")
-@pytest.mark.parametrize(("seeds_argv", "seeds"), [([], 5), (["--seeds", "2"], 2)])
-def test_main_prints_one_line_per_run_and_a_mean_std_table(
+@pytest.mark.parametrize(
+    ("seeds_argv", "seeds", "plot_name"),
+    [([], 5, None), (["--seeds", "2"], 2, "comparison.png")],
+)
+def test_main_prints_one_line_per_run_and_a_mean_std_table_then_plots(
+    cmapss_run: ModuleType,
     cmapss_compare: ModuleType,
     tiny_config: Any,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     seeds_argv: list[str],
     seeds: int,
+    plot_name: str | None,
 ) -> None:
-    monkeypatch.setattr(sys, "argv", ["compare.py", *seeds_argv])
+    plot_path = tmp_path / plot_name if plot_name else None
+    plot_argv = ["--plot-path", str(plot_path)] if plot_path else []
+    monkeypatch.setattr(sys, "argv", ["compare.py", *seeds_argv, *plot_argv])
     monkeypatch.setattr(cmapss_compare, "CmapssConfig", lambda: tiny_config)
     prepared_with: list[Any] = []
     prepare = cmapss_compare.prepare_cmapss_windows
@@ -159,11 +169,55 @@ def test_main_prints_one_line_per_run_and_a_mean_std_table(
         return prepare(config)
 
     monkeypatch.setattr(cmapss_compare, "prepare_cmapss_windows", record_prepare)
+    compared: list[Any] = []
+    compare = cmapss_compare.compare_models
+
+    def record_compare(*args: Any, **kwargs: Any) -> Any:
+        results = compare(*args, **kwargs)
+        compared.extend(results)
+        return results
+
+    monkeypatch.setattr(cmapss_compare, "compare_models", record_compare)
+    plots: list[dict[str, Any]] = []
+
+    def record_plot(
+        trajectories: pd.DataFrame,
+        feature_columns: list[str],
+        models: Sequence[Any],
+        *,
+        units: Any,
+        window_length: int,
+        save_path: Path | None,
+    ) -> None:
+        plots.append(
+            {
+                "trajectories": trajectories,
+                "feature_columns": feature_columns,
+                "models": list(models),
+                "units": units,
+                "window_length": window_length,
+                "save_path": save_path,
+            }
+        )
+
+    monkeypatch.setattr(cmapss_compare, "plot_validation_rul_curves", record_plot)
 
     cmapss_compare.main()
 
     # The data is prepared once, with the configured seed, for every seed.
     assert prepared_with == [tiny_config]
+    # One figure, drawn from the first seed's models: staged row above joint.
+    (plot,) = plots
+    staged, joint = plot["models"]
+    assert staged.label == "Staged model"
+    assert joint.label == "Joint model"
+    assert staged.model is compared[0].staged_model
+    assert joint.model is compared[0].joint_model
+    assert plot["save_path"] == plot_path
+    assert plot["window_length"] == tiny_config.window_length
+    assert plot["feature_columns"] == cmapss_run._SENSOR_NAMES
+    validation = plot["trajectories"]
+    assert plot["units"] == cmapss_compare.select_lifetime_spanning_units(validation)
     lines = capsys.readouterr().out.splitlines()
     for model in ("staged", "joint"):
         run_lines = [line for line in lines if line.startswith(f"[{model} ")]

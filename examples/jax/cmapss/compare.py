@@ -33,9 +33,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-import jax
 import numpy as np
-import optax
 from flax import nnx
 
 # Allow sibling-module imports both when run as a script and when loaded
@@ -52,8 +50,8 @@ from run import (
     CmapssConfig,
     PreparedCmapssData,
     build_composite_model,
+    build_supervised_training_setup,
     evaluate_test_metrics,
-    make_window_loader,
     prepare_cmapss_windows,
     train_gamma_model,
     train_mean_model,
@@ -64,7 +62,6 @@ from stagereg.core.metric_registry import EpochMetric
 from stagereg.core.tracking import EventSink
 from stagereg.jax import (
     HeldOutValidation,
-    create_optimizer,
     initialize_training_state,
     make_supervised_loss,
     run_supervised,
@@ -105,40 +102,31 @@ def train_joint_model(
     Returns:
         The trained `Cnn1DGaussianModel`.
     """
-    n_sensors = prepared.train_windows.shape[-1]
-    model_key, rng_key = jax.random.split(jax.random.key(config.seed))
-    model = Cnn1DGaussianModel(
-        n_sensors,
-        hidden_channels=config.hidden_channels,
-        kernel_size=config.kernel_size,
-        rngs=nnx.Rngs(model_key),
+    setup = build_supervised_training_setup(
+        Cnn1DGaussianModel,
+        prepared.train_windows,
+        prepared.train_targets,
+        prepared.validation_windows,
+        prepared.validation_targets,
+        config,
     )
-    optimizer = create_optimizer(model, optax.adam(config.learning_rate))
     loss = make_supervised_loss(NegativeLogLikelihoodLoss())
     run_supervised(
-        model=model,
-        optimizer=optimizer,
-        train_loader=make_window_loader(
-            prepared.train_windows,
-            prepared.train_targets,
-            batch_size=config.batch_size,
-        ),
+        model=setup.model,
+        optimizer=setup.optimizer,
+        train_loader=setup.train_loader,
         loss=loss,
-        state=initialize_training_state(model, optimizer, rng_key=rng_key),
+        state=initialize_training_state(
+            setup.model, setup.optimizer, rng_key=setup.rng_key
+        ),
         epochs=config.joint_epochs,
         validation=HeldOutValidation(
-            model=model,
-            loader=make_window_loader(
-                prepared.validation_windows,
-                prepared.validation_targets,
-                batch_size=config.batch_size,
-            ),
-            loss=loss,
+            model=setup.model, loader=setup.validation_loader, loss=loss
         ),
         event_sinks=event_sinks,
         stage=JOINT_STAGE,
     )
-    return model
+    return setup.model
 
 
 @dataclass(frozen=True)

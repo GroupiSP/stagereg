@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -193,6 +193,74 @@ class PrintingEventSink:
         print(f"[{event.name}] epoch={event.step} split={event.split} {metrics}")
 
 
+@dataclass(frozen=True)
+class SupervisedTrainingSetup[ModelT: nnx.Module]:
+    """A freshly initialized CNN model and what supervised training needs for it.
+
+    Attributes:
+        model: The freshly initialized model.
+        optimizer: An Adam optimizer over all of `model`'s parameters.
+        rng_key: The training key split off alongside the model's
+            initialization key.
+        train_loader: Shuffled mini-batches of the training windows.
+        validation_loader: Shuffled mini-batches of the validation windows.
+    """
+
+    model: ModelT
+    optimizer: nnx.Optimizer
+    rng_key: jax.Array
+    train_loader: LoaderFactory
+    validation_loader: LoaderFactory
+
+
+def build_supervised_training_setup[ModelT: nnx.Module](
+    model_type: Callable[..., ModelT],
+    train_windows: np.ndarray,
+    train_targets: np.ndarray,
+    validation_windows: np.ndarray,
+    validation_targets: np.ndarray,
+    config: CmapssConfig,
+) -> SupervisedTrainingSetup[ModelT]:
+    """Initialize a 1D-CNN model and its optimizer and loaders from `config`.
+
+    The key `config.seed` is split into the model's initialization key and
+    the training key. The model is built with the configured channel width
+    and kernel size, and optimized with Adam at the configured learning rate.
+
+    Args:
+        model_type: The model class, constructed as `model_type(n_sensors, *,
+            hidden_channels, kernel_size, rngs)`.
+        train_windows: Training sliding windows, shape `(n_train,
+            window_length, n_sensors)`.
+        train_targets: Training RUL targets, shape `(n_train,)`.
+        validation_windows: Held-out validation windows, same layout as
+            `train_windows`.
+        validation_targets: Held-out validation RUL targets.
+        config: Example configuration controlling model size and training.
+
+    Returns:
+        The model, its optimizer, the training key, and both loaders.
+    """
+    model_key, rng_key = jax.random.split(jax.random.key(config.seed))
+    model = model_type(
+        train_windows.shape[-1],
+        hidden_channels=config.hidden_channels,
+        kernel_size=config.kernel_size,
+        rngs=nnx.Rngs(model_key),
+    )
+    return SupervisedTrainingSetup(
+        model=model,
+        optimizer=create_optimizer(model, optax.adam(config.learning_rate)),
+        rng_key=rng_key,
+        train_loader=make_window_loader(
+            train_windows, train_targets, batch_size=config.batch_size
+        ),
+        validation_loader=make_window_loader(
+            validation_windows, validation_targets, batch_size=config.batch_size
+        ),
+    )
+
+
 def train_mean_model(
     train_windows: np.ndarray,
     train_targets: np.ndarray,
@@ -219,42 +287,34 @@ def train_mean_model(
         A tuple of the trained `Cnn1DMeanModel` and the shared staged
         `TrainingState`, ready for Stage 2 to continue on.
     """
-    n_sensors = train_windows.shape[-1]
-    model_key, rng_key = jax.random.split(jax.random.key(config.seed))
-    model = Cnn1DMeanModel(
-        n_sensors,
-        hidden_channels=config.hidden_channels,
-        kernel_size=config.kernel_size,
-        rngs=nnx.Rngs(model_key),
+    setup = build_supervised_training_setup(
+        Cnn1DMeanModel,
+        train_windows,
+        train_targets,
+        validation_windows,
+        validation_targets,
+        config,
     )
-    optimizer = create_optimizer(model, optax.adam(config.learning_rate))
     loss = make_supervised_loss(SquaredErrorLoss())
-    train_loader = make_window_loader(
-        train_windows, train_targets, batch_size=config.batch_size
-    )
-    validation_loader = make_window_loader(
-        validation_windows, validation_targets, batch_size=config.batch_size
-    )
-
     stage = MeanStage(
-        model=model,
-        optimizer=optimizer,
-        train_loader=train_loader,
+        model=setup.model,
+        optimizer=setup.optimizer,
+        train_loader=setup.train_loader,
         loss=loss,
         options=SupervisedStageOptions(
             epochs=config.mean_epochs,
             validation=HeldOutValidation(
-                model=model,
-                loader=validation_loader,
+                model=setup.model,
+                loader=setup.validation_loader,
                 loss=loss,
             ),
             event_sinks=event_sinks,
         ),
     )
-    state = TrainingState(rng_state=rng_key)
+    state = TrainingState(rng_state=setup.rng_key)
     stage.prepare(state)
     stage.train(state)
-    return model, state
+    return setup.model, state
 
 
 def train_gamma_model(

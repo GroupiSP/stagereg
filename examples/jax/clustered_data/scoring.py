@@ -12,6 +12,7 @@ probability integral transform `F(y)` satisfies `|F(y) - 1/2| <= p/2`.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import jax
@@ -132,4 +133,35 @@ def score(draws: PredictiveDraws, targets: jax.Array, masks: RegionMasks) -> Sco
     return Scores(
         rmse=float(jnp.sqrt(jnp.mean(squared_error, where=masks[IN_DISTRIBUTION]))),
         regions={name: region_scores(masks[name]) for name in REGIONS},
+    )
+
+
+CALIBRATION_LEVELS: tuple[float, ...] = tuple(step / 20 for step in range(1, 20))
+"""The nominal levels a calibration curve is drawn at: 0.05, 0.10, ..., 0.95."""
+
+
+def calibration_curve(
+    draws: PredictiveDraws,
+    targets: jax.Array,
+    levels: Sequence[float] = CALIBRATION_LEVELS,
+    *,
+    where: jax.Array | None = None,
+) -> tuple[float, ...]:
+    """Return the observed coverage of the central interval at each level.
+
+    Each point is `central_coverage` at that level, so the calibration
+    curve and the table's coverage share one scoring path.
+
+    Args:
+        draws: The per-draw predictive means and variances, shape `[S, N]`.
+        targets: One target per grid point, shape `[N]`.
+        levels: The nominal levels, each in `(0, 1)`.
+        where: Optional boolean mask of shape `[N]` restricting the points
+            counted, e.g. the extrapolation region's.
+
+    Returns:
+        One observed coverage in `[0, 1]` per level, in the levels' order.
+    """
+    return tuple(
+        central_coverage(draws, targets, level, where=where) for level in levels
     )

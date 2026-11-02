@@ -174,6 +174,15 @@ region average of the draw-averaged variance), the epistemic σ (square root of
 the region average of the variance of the means over draws) and the 95%
 coverage of the mixture's exact central interval.
 
+`--seeds N` (default 1) repeats the whole comparison over seeds `--seed` to
+`--seed + N - 1`. The training data and the grid stay fixed, so only the
+initialization, the batch order and the draws vary. With more than one seed,
+every table cell reports `mean ± std` over seeds:
+
+```bash
+uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py --seeds 5
+```
+
 It then draws the first seed's configurations in two figures. The uncertainty
 grid has one row per training and one column per inference method; each panel
 shows the training points, the noise-free truth, the predictive mean, an inner

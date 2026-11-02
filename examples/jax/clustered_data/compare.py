@@ -22,7 +22,10 @@ Run it with:
 
     uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py
 
-Every setting is a flag; `--help` lists them with their defaults.
+Pass `--seeds N` to repeat the whole comparison over seeds `--seed` to
+`--seed + N - 1` on the same data; the table then reports each cell as
+mean ± std over seeds. Every setting is a flag; `--help` lists them with
+their defaults.
 """
 
 from __future__ import annotations
@@ -266,14 +269,14 @@ _FLAG_HELP: dict[str, str] = {
     "prior_precision": "Precision of the isotropic Gaussian prior",
     "bbb_learning_rate": "Adam learning rate of Bayes by Backprop",
     "bbb_initial_std": "Initial standard deviation of Bayes by Backprop",
-    "seed": "Seed of the initialization, batch order and draws",
+    "seed": "Seed of the initialization, batch order and draws; the first seed",
 }
 """Each `ClusteredDataConfig` field's command-line help."""
 
 
 def _parser() -> argparse.ArgumentParser:
     """Build the command line: one flag per `ClusteredDataConfig` field, and
-    `--plot-path`."""
+    `--seeds` and `--plot-path`."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -285,6 +288,15 @@ def _parser() -> argparse.ArgumentParser:
             default=default,
             help=f"{_FLAG_HELP[field.name]} (default: {default}).",
         )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=1,
+        help=(
+            "Number of seeds to repeat the comparison over, from --seed up "
+            "(default: 1)."
+        ),
+    )
     parser.add_argument(
         "--plot-path",
         type=Path,
@@ -301,14 +313,21 @@ def main() -> None:
     """Run the comparison from the command line, print its table and draw it."""
     parser = _parser()
     arguments = vars(parser.parse_args())
+    seeds = arguments.pop("seeds")
+    if seeds <= 0:
+        parser.error("--seeds must be positive.")
     plot_path: Path | None = arguments.pop("plot_path")
     try:
         config = ClusteredDataConfig(**arguments)
     except ValueError as error:
         parser.error(str(error))
     data = make_clustered_data(config)
-    results = compare(data, config, seeds=1, on_run=print_run)
-    print(f"\nClustered data, seed {config.seed}:")
+    results = compare(data, config, seeds=seeds, on_run=print_run)
+    if seeds == 1:
+        print(f"\nClustered data, seed {config.seed}:")
+    else:
+        last = config.seed + seeds - 1
+        print(f"\nClustered data, seeds {config.seed}-{last} (mean ± std):")
     print(format_table(results))
     draw_figures(results[0].configurations, data, plot_path=plot_path)
 

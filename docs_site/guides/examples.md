@@ -173,6 +173,8 @@ The three runs differ only in the inference method and the dropout rate; the
 architecture, prior, batch size and epochs are shared. pSGLD's burn-in and
 thinning count update steps: at the defaults it burns in the first 10,000 of
 its 20,000 steps and keeps every 100th step after them, the last one included.
+At the defaults the three runs take about two and a half minutes on a laptop
+CPU.
 
 It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn from a different seed, split into the glossary's

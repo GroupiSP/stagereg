@@ -153,7 +153,7 @@ sum-of-sines target and noise σ = 0.02. Every model shares one Tanh MLP
 backbone of 5 hidden layers of 10 units.
 
 ```bash
-uv run --extra jax python examples/jax/clustered_data/compare.py
+uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py
 ```
 
 The comparison trains the staged model: a mean stage and a Gamma variance
@@ -174,12 +174,25 @@ region average of the draw-averaged variance), the epistemic σ (square root of
 the region average of the variance of the means over draws) and the 95%
 coverage of the mixture's exact central interval.
 
+It then draws the first seed's configurations in two figures. The uncertainty
+grid has one row per training and one column per inference method; each panel
+shows the training points, the noise-free truth, the predictive mean, an inner
+band of ±1.96 epistemic σ and an outer band of ±1.96 total σ, with the gap and
+extrapolation regions shaded. The second figure plots one
+[calibration curve](../glossary.md) per method in the extrapolation region, at
+nominal levels 0.05 to 0.95, from the same mixture scoring as the table's
+coverage. Configurations that were not run leave their panels empty. Both
+figures are shown on screen, or saved as `uncertainty_grid.png` and
+`extrapolation_calibration.png` into the directory `--plot-path` names, with
+no window opened.
+
 Every setting is a flag, `--noise-std` among them; `--help` lists them with
-their defaults. A quick run at small settings:
+their defaults. A quick run at small settings, saving the figures:
 
 ```bash
-uv run --extra jax python examples/jax/clustered_data/compare.py \
-    --mean-epochs 50 --variance-epochs 50 --posterior-epochs 20 --num-draws 10
+uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py \
+    --mean-epochs 50 --variance-epochs 50 --posterior-epochs 20 --num-draws 10 \
+    --plot-path figures/
 ```
 
 Source:

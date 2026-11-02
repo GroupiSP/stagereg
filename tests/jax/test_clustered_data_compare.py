@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Iterator
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -30,6 +32,16 @@ _TINY_FLAGS = (
     "3",
 )
 _NUMBER = r"\d+\.\d+"
+
+
+@pytest.fixture(autouse=True)
+def shown_figures(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[bool]]:
+    """Record `plt.show` calls instead of opening a window."""
+    pyplot = pytest.importorskip("matplotlib.pyplot")
+    shown: list[bool] = []
+    monkeypatch.setattr(pyplot, "show", lambda: shown.append(True))
+    yield shown
+    pyplot.close("all")
 
 
 @pytest.fixture(scope="session")
@@ -107,3 +119,34 @@ def test_point_epochs_count_every_epoch_run_not_only_up_to_the_best(
     supervised = clustered_staged.train_supervised_stages(data, config)
 
     assert supervised.point_epochs == 40
+
+
+def test_main_saves_both_figures_into_the_plot_path_without_showing(
+    clustered_compare: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    shown_figures: list[bool],
+) -> None:
+    plot_path = tmp_path / "figures"
+    monkeypatch.setattr(
+        sys, "argv", ["compare.py", *_TINY_FLAGS, "--plot-path", str(plot_path)]
+    )
+
+    clustered_compare.main()
+
+    for name in ("uncertainty_grid.png", "extrapolation_calibration.png"):
+        assert (plot_path / name).is_file()
+        assert (plot_path / name).stat().st_size > 0
+    assert shown_figures == []
+
+
+def test_main_shows_the_figures_without_a_plot_path(
+    clustered_compare: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    shown_figures: list[bool],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["compare.py", *_TINY_FLAGS])
+
+    clustered_compare.main()
+
+    assert shown_figures == [True]

@@ -1,10 +1,12 @@
-"""Compare how confident the staged model is in and out of distribution.
+"""Compare how confident the joint and staged models are in and out of distribution.
 
 Generates the UvA tutorial's two clusters of training data and a dense
 evaluation grid over `[-0.5, 1.5]`, then, for each seed, trains the staged
 model (mean stage, Gamma variance stage, then the library's posterior stage
-with Bayes by Backprop) on a Tanh MLP backbone of 5 hidden layers of 10
-units.
+with Bayes by Backprop) and the joint posterior (Bayes by Backprop over a
+network with a mean head and a variance head, from a random initialization,
+for the staged model's total epochs), both on a Tanh MLP backbone of 5
+hidden layers of 10 units.
 
 Each configuration is reduced to per-draw predictive means and variances
 on the grid and scored on the in-distribution region, the gap region
@@ -41,7 +43,11 @@ from clustered import ClusteredData, ClusteredDataConfig, make_clustered_data
 from methods import METHODS
 from regions import EXTRAPOLATION, GAP, IN_DISTRIBUTION, REGIONS, region_masks
 from scoring import PredictiveDraws, Scores, score
+from joint import run_joint
 from staged import run_staged, train_supervised_stages
+
+JOINT = "joint"
+"""Name of the joint posterior's training in the results and the table."""
 
 STAGED = "staged"
 """Name of the staged training in the results and the table."""
@@ -59,7 +65,7 @@ class ConfigurationResult:
     """One configuration's draws on the grid, and their scores.
 
     Attributes:
-        training: How the posterior was inferred, e.g. `"staged"`.
+        training: How the posterior was inferred, `"joint"` or `"staged"`.
         method: The inference method's name, e.g. `"BBB"`.
         draws: The per-draw predictive means and variances on the grid.
         scores: The draws' scores against the grid's noisy targets.
@@ -83,7 +89,8 @@ class SeedComparison:
     Attributes:
         seed: The seed the configurations were trained from.
         point_epochs: Epochs the staged model's mean and variance stages ran
-            together.
+            together. Every joint run of the seed ran these plus the
+            posterior epochs.
         configurations: Each configuration's result, in table order.
     """
 
@@ -109,6 +116,10 @@ def compare_seed(
 ) -> SeedComparison:
     """Train and score every configuration from `config.seed`, silently.
 
+    The staged model's mean and variance stages train first: every joint run
+    reads its epoch budget from them, then the joint rows precede the staged
+    ones.
+
     Args:
         data: The training set and the evaluation grid.
         config: The comparison's settings.
@@ -120,6 +131,17 @@ def compare_seed(
     masks = region_masks(data.grid_inputs)
     supervised = train_supervised_stages(data, config)
     configurations = []
+    joint_epochs = supervised.point_epochs + config.posterior_epochs
+    for method, make_method in METHODS.items():
+        draws = run_joint(data, config, make_method(config), epochs=joint_epochs)
+        result = ConfigurationResult(
+            training=JOINT,
+            method=method,
+            draws=draws,
+            scores=score(draws, data.grid_targets, masks),
+        )
+        on_run(config.seed, result)
+        configurations.append(result)
     for method, make_method in METHODS.items():
         draws = run_staged(data, config, supervised, make_method(config))
         result = ConfigurationResult(

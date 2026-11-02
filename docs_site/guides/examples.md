@@ -146,9 +146,9 @@ README:
 
 ## Clustered data
 
-How confident the staged model is inside the training data and away from it,
-on the "Simulate data" set of the UvA DL2 Bayesian neural network tutorial 1:
-two clusters of 500 points on `[-0.2, 0.2]` and `[0.6, 1.0]` (seed 42) with a
+How confident the joint and staged models are inside the training data and
+away from it, on the "Simulate data" set of the UvA DL2 Bayesian neural
+network tutorial 1: two clusters of 500 points on `[-0.2, 0.2]` and `[0.6, 1.0]` (seed 42) with a
 sum-of-sines target and noise σ = 0.02. Every model shares one Tanh MLP
 backbone of 5 hidden layers of 10 units.
 
@@ -160,8 +160,16 @@ The comparison trains the staged model: a mean stage and a Gamma variance
 stage, each early-stopped on its training loss (at most 3,000 epochs, patience
 100), then the [posterior stage](posterior-stage.md) for a fixed 2,000 epochs
 with Bayes by Backprop under an isotropic Gaussian prior of precision 1. Both
-supervised stages use Adam at learning rate 1e-3 and batches of 100. At the
-defaults the run takes about half a minute on a laptop CPU.
+supervised stages use Adam at learning rate 1e-3 and batches of 100.
+
+It also infers the joint posterior, the baseline: one network shares the
+backbone between a mean head and a variance head (a softplus plus a 1e-6
+floor), and Bayes by Backprop infers every weight, variance head included,
+under the network's own Gaussian likelihood and the same prior. It starts from
+a random initialization with no warm start and no early stopping, and runs
+exactly as many epochs as the staged model of the same seed: its mean-stage,
+variance-stage and posterior epochs together. Each joint draw carries its own
+mean and variance.
 
 It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn from a different seed, split into the glossary's

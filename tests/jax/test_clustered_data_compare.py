@@ -40,7 +40,7 @@ def tiny_clustered_config(clustered_dataset: ModuleType) -> Any:
     )
 
 
-def test_compare_groups_staged_bbb_results_per_seed(
+def test_compare_groups_joint_and_staged_results_per_seed(
     clustered_compare: ModuleType,
     clustered_dataset: ModuleType,
     clustered_regions: ModuleType,
@@ -52,19 +52,46 @@ def test_compare_groups_staged_bbb_results_per_seed(
 
     assert [result.seed for result in results] == [3, 4]
     for result in results:
-        (configuration,) = result.configurations
-        assert configuration.name == "staged BBB"
-        assert configuration.draws.means.shape == (4, data.grid_inputs.shape[0])
-        assert configuration.draws.variances.shape == configuration.draws.means.shape
-        assert set(configuration.scores.regions) == set(clustered_regions.REGIONS)
-        for region in configuration.scores.regions.values():
-            assert 0.0 <= region.coverage <= 1.0
-            assert region.aleatoric_std >= 0.0
-            assert region.epistemic_std >= 0.0
+        names = [configuration.name for configuration in result.configurations]
+        assert {"joint BBB", "staged BBB"} <= set(names)
+        assert names.index("joint BBB") < names.index("staged BBB")
+        for configuration in result.configurations:
+            means = configuration.draws.means
+            assert means.shape == (4, data.grid_inputs.shape[0])
+            assert configuration.draws.variances.shape == means.shape
+            assert set(configuration.scores.regions) == set(clustered_regions.REGIONS)
+            for region in configuration.scores.regions.values():
+                assert 0.0 <= region.coverage <= 1.0
+                assert region.aleatoric_std >= 0.0
+                assert region.epistemic_std >= 0.0
         assert result.point_epochs == 6  # patience outlasts both stages
 
 
-def test_main_prints_a_one_row_table_with_every_region(
+def test_joint_runs_get_the_staged_runs_total_epochs(
+    clustered_compare: ModuleType,
+    clustered_dataset: ModuleType,
+    tiny_clustered_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budgets = []
+    run_joint = clustered_compare.run_joint
+
+    def recording_run_joint(*args: Any, epochs: int, **kwargs: Any) -> Any:
+        budgets.append(epochs)
+        return run_joint(*args, epochs=epochs, **kwargs)
+
+    monkeypatch.setattr(clustered_compare, "run_joint", recording_run_joint)
+    data = clustered_dataset.make_clustered_data(tiny_clustered_config)
+
+    (result,) = clustered_compare.compare(data, tiny_clustered_config, seeds=1)
+
+    assert budgets
+    # Mean and variance stages run 3 epochs each, the posterior stage 2.
+    assert all(budget == 3 + 3 + 2 for budget in budgets)
+    assert result.point_epochs == 6
+
+
+def test_main_prints_a_row_per_configuration_with_every_region(
     clustered_compare: ModuleType,
     clustered_regions: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -75,14 +102,17 @@ def test_main_prints_a_one_row_table_with_every_region(
     clustered_compare.main()
 
     lines = capsys.readouterr().out.strip().splitlines()
-    header, row = lines[-2], lines[-1]
+    title = next(i for i, line in enumerate(lines) if line.startswith("Clustered"))
+    header, *rows = lines[title + 1 :]
     assert header.split()[:3] == ["ID", "RMSE", "ID"]
-    assert row.startswith("staged BBB")
-    cells = re.findall(_NUMBER, row)
-    assert len(cells) == 1 + 3 * len(clustered_regions.REGIONS)
-    coverages = [float(cell) for cell in cells[3::3]]
-    assert len(coverages) == 3
-    assert all(0.0 <= coverage <= 1.0 for coverage in coverages)
+    assert rows[0].startswith("joint BBB")
+    assert any(row.startswith("staged BBB") for row in rows)
+    for row in rows:
+        cells = re.findall(_NUMBER, row)
+        assert len(cells) == 1 + 3 * len(clustered_regions.REGIONS)
+        coverages = [float(cell) for cell in cells[3::3]]
+        assert len(coverages) == 3
+        assert all(0.0 <= coverage <= 1.0 for coverage in coverages)
 
 
 def test_main_rejects_invalid_settings(

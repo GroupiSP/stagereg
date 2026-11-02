@@ -122,7 +122,6 @@ def test_harness_reports_every_measurement_for_both_reference_workloads(
         kernel_size=3,
         mean_epochs=3,
         variance_epochs=3,
-        predictive_sample_count=16,
     )
 
     xsin = harness.run_xsin(xsin_config)

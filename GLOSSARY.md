@@ -14,6 +14,14 @@ _Avoid_: Phase, training loop
 Fitting a mean and a variance together under one Gaussian negative log-likelihood, as classic mean-variance estimation does. Training in stages replaces it, because joint training couples the two fits: the variance can grow to excuse a poor mean, and the mean stalls where the variance is large.
 _Avoid_: Combined training, MVE training, single-step training
 
+**Joint model**:
+A model trained by joint training: one network predicting a mean and a variance together. The baseline that staged training is compared against.
+_Avoid_: MVE model, single-stage model
+
+**Staged model**:
+The predictive model assembled from the finalized checkpoints of a run's stages, such as a trained mean combined with a trained variance into one predictive distribution.
+_Avoid_: Two-step model, composite model (one way of assembling it)
+
 **Training event**:
 A structured observation emitted at a named point in a stage's lifecycle, carrying the split it concerns, any metrics measured at that point, and the live training state. Not a log line: it has no format, and what it means is decided by whoever consumes it.
 _Avoid_: Log record, message

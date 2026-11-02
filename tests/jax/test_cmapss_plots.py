@@ -31,13 +31,15 @@ class _StubGaussian:
 class _StubModel:
     """A composite-model stand-in predicting a constant-scale Gaussian."""
 
-    def __init__(self, *, scale: float = 4.0) -> None:
+    def __init__(self, *, scale: float = 4.0, offset: float = 0.0) -> None:
         """Fix the predictive scale and start recording the inputs seen.
 
         Args:
             scale: The constant predictive standard deviation to return.
+            offset: Added to every predicted mean, to tell models apart.
         """
         self.scale = scale
+        self.offset = offset
         self.seen_inputs: list[np.ndarray] = []
 
     def __call__(self, inputs: Any) -> _StubGaussian:
@@ -48,13 +50,13 @@ class _StubModel:
                 window_length, n_features)`.
 
         Returns:
-            A Gaussian with `loc = [0, 1, ..., n_windows - 1]` and the
-            fixed scale.
+            A Gaussian with `loc = offset + [0, 1, ..., n_windows - 1]`
+            and the fixed scale.
         """
         array = np.asarray(inputs)
         self.seen_inputs.append(array)
         n_windows = array.shape[0]
-        loc = np.arange(n_windows, dtype=float).reshape(-1, 1)
+        loc = self.offset + np.arange(n_windows, dtype=float).reshape(-1, 1)
         return _StubGaussian(loc=loc, scale=np.full((n_windows, 1), self.scale))
 
 
@@ -84,7 +86,7 @@ def test_rul_curves_show_truth_prediction_and_band_per_column(
     figure = cmapss_plots.plot_validation_rul_curves(
         trajectories,
         FEATURE_COLUMNS,
-        _StubModel(),
+        [cmapss_plots.LabelledModel("Staged model", _StubModel())],
         units=spanning_units(2, 3, 1),
         window_length=window_length,
     )
@@ -125,7 +127,7 @@ def test_rul_curve_columns_have_independent_axis_limits(
     figure = cmapss_plots.plot_validation_rul_curves(
         trajectories,
         FEATURE_COLUMNS,
-        _StubModel(),
+        [cmapss_plots.LabelledModel("Staged model", _StubModel())],
         units=spanning_units(1, 2, 3),
         window_length=5,
     )
@@ -150,7 +152,7 @@ def test_rul_curve_column_titles_name_the_unit_role_and_lifetime(
     figure = cmapss_plots.plot_validation_rul_curves(
         trajectories,
         FEATURE_COLUMNS,
-        _StubModel(),
+        [cmapss_plots.LabelledModel("Staged model", _StubModel())],
         units=spanning_units(8, 9, 7),
         window_length=4,
     )
@@ -179,7 +181,7 @@ def test_rul_curves_carry_one_shared_figure_legend(
     figure = cmapss_plots.plot_validation_rul_curves(
         trajectories,
         FEATURE_COLUMNS,
-        _StubModel(),
+        [cmapss_plots.LabelledModel("Staged model", _StubModel())],
         units=spanning_units(2, 3, 1),
         window_length=4,
     )
@@ -204,7 +206,7 @@ def test_band_is_the_analytic_95_percent_predictive_interval(
     figure = cmapss_plots.plot_validation_rul_curves(
         trajectories,
         FEATURE_COLUMNS,
-        _StubModel(scale=100.0),
+        [cmapss_plots.LabelledModel("Staged model", _StubModel(scale=100.0))],
         units=spanning_units(1, 1, 1),
         window_length=window_length,
     )
@@ -233,7 +235,7 @@ def test_rul_curves_window_each_unit_with_the_given_features(
     cmapss_plots.plot_validation_rul_curves(
         trajectories,
         FEATURE_COLUMNS,
-        model,
+        [cmapss_plots.LabelledModel("Staged model", model)],
         units=spanning_units(2, 3, 1),
         window_length=window_length,
     )
@@ -261,7 +263,7 @@ def test_rul_curves_draw_exactly_the_units_the_caller_selected(
     figure = cmapss_plots.plot_validation_rul_curves(
         trajectories,
         FEATURE_COLUMNS,
-        _StubModel(),
+        [cmapss_plots.LabelledModel("Staged model", _StubModel())],
         units=spanning_units(2, 3, 2),
         window_length=4,
     )
@@ -284,7 +286,7 @@ def test_rul_curves_save_to_the_given_path(
     cmapss_plots.plot_validation_rul_curves(
         trajectories,
         FEATURE_COLUMNS,
-        _StubModel(),
+        [cmapss_plots.LabelledModel("Staged model", _StubModel())],
         units=spanning_units(1, 2, 3),
         window_length=5,
         save_path=save_path,
@@ -316,7 +318,7 @@ def test_band_is_always_the_predicted_mean_plus_minus_1_96_scale(
     figure = cmapss_plots.plot_validation_rul_curves(
         trajectories,
         FEATURE_COLUMNS,
-        _StubModel(scale=scale),
+        [cmapss_plots.LabelledModel("Staged model", _StubModel(scale=scale))],
         units=spanning_units(1, 1, 1),
         window_length=window_length,
     )
@@ -338,3 +340,111 @@ def test_band_is_always_the_predicted_mean_plus_minus_1_96_scale(
             predicted_y.min() - 1.96 * scale, rel=1e-6
         )
     cmapss_plots.plt.close(figure)
+
+
+def test_rul_curves_draw_one_row_per_labelled_model(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 30, 2: 12, 3: 20})
+    window_length = 4
+    offsets = (0.0, 100.0, 200.0)
+    labels = ("Staged model", "Joint model", "Third model")
+    models = [
+        cmapss_plots.LabelledModel(label, _StubModel(offset=offset))
+        for label, offset in zip(labels, offsets, strict=True)
+    ]
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        models,
+        units=spanning_units(2, 3, 1),
+        window_length=window_length,
+    )
+
+    assert len(figure.axes) == 3 * len(models)
+    grid = np.asarray(figure.axes, dtype=object).reshape(len(models), 3)
+    for row, (label, offset) in enumerate(zip(labels, offsets, strict=True)):
+        # The row's leftmost axes names the model the row belongs to.
+        assert label in grid[row, 0].get_ylabel()
+        for column, lifetime in enumerate((12, 20, 30)):
+            axes = grid[row, column]
+            predicted = _lines_by_label(axes)[cmapss_plots._PREDICTED_MEAN_LABEL]
+            n_windows = lifetime - window_length + 1
+            np.testing.assert_allclose(
+                predicted.get_ydata(), offset + np.arange(n_windows)
+            )
+    # Exactly one legend for the whole figure, whatever the number of rows.
+    assert all(axes.get_legend() is None for axes in figure.axes)
+    assert len(figure.legends) == 1
+
+
+def test_rul_curve_columns_share_their_x_axis_across_rows(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 12, 2: 40, 3: 120})
+    models = [
+        cmapss_plots.LabelledModel("Staged model", _StubModel()),
+        cmapss_plots.LabelledModel("Joint model", _StubModel(scale=50.0)),
+    ]
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        models,
+        units=spanning_units(1, 2, 3),
+        window_length=5,
+    )
+
+    top, bottom = np.asarray(figure.axes, dtype=object).reshape(2, 3)
+    for column in range(3):
+        # The same unit is compared on the same time axis in every row.
+        assert top[column].get_shared_x_axes().joined(top[column], bottom[column])
+        assert top[column].get_xlim() == bottom[column].get_xlim()
+    # Columns stay independent of one another.
+    assert not top[0].get_shared_x_axes().joined(top[0], top[2])
+    assert top[0].get_xlim() != top[2].get_xlim()
+
+
+def test_single_labelled_model_yields_one_labelled_row(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 30, 2: 12, 3: 20})
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        [cmapss_plots.LabelledModel("Staged model", _StubModel())],
+        units=spanning_units(2, 3, 1),
+        window_length=4,
+    )
+
+    assert len(figure.axes) == 3
+    assert "Staged model" in figure.axes[0].get_ylabel()
+    # Every column of the single row keeps its title and x label.
+    assert all(axes.get_title() for axes in figure.axes)
+    assert all(axes.get_xlabel() for axes in figure.axes)
+
+
+def test_rul_curves_reject_an_empty_model_sequence(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 30, 2: 12, 3: 20})
+
+    with pytest.raises(ValueError, match="labelled model"):
+        cmapss_plots.plot_validation_rul_curves(
+            trajectories,
+            FEATURE_COLUMNS,
+            [],
+            units=spanning_units(2, 3, 1),
+            window_length=4,
+        )
+    assert captured_show == []

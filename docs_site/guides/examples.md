@@ -107,7 +107,8 @@ Source:
 
 Two-step probabilistic remaining-useful-life estimation on NASA CMAPSS FD001: a
 CNN mean stage, a Gamma variance stage on its squared residuals, and a
-composite Gaussian scored against the official test split.
+composite Gaussian scored against the official test split by RMSE, 95%
+interval coverage and closed-form CRPS.
 
 ```bash
 uv run --group example-cmapss python examples/jax/cmapss/run.py
@@ -119,6 +120,20 @@ trajectories, run the data module on its own:
 ```bash
 uv run --group example-cmapss python examples/jax/cmapss/data.py --fetch
 uv run --group example-cmapss python examples/jax/cmapss/data.py
+```
+
+To compare that staged model with a joint model (one CNN backbone with a
+Gaussian head, trained on the Gaussian negative log-likelihood) on the same
+prepared data, run the comparison. It trains both models from `--seeds` seeds
+(default 5) on a fixed train/validation split and prints a `staged` vs `joint`
+table of RMSE, 95% interval coverage, closed-form CRPS and NLL as
+`mean ± std` over seeds. It then plots the first seed's validation RUL curves,
+the staged model's row above the joint model's; pass `--plot-path` to save the
+figure instead of displaying it. The joint model has roughly half the staged
+model's parameters.
+
+```bash
+uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5
 ```
 
 The first run downloads the CMAPSS archive from NASA and caches it on disk, so

@@ -30,6 +30,7 @@ _TINY_FLAGS = (
     "3",
 )
 _NUMBER = r"\d+\.\d+"
+_STAGED_NAMES = ["staged BBB", "staged MCD", "staged pSGLD"]
 
 
 @pytest.fixture(scope="session")
@@ -40,7 +41,7 @@ def tiny_clustered_config(clustered_dataset: ModuleType) -> Any:
     )
 
 
-def test_compare_groups_staged_bbb_results_per_seed(
+def test_compare_groups_every_staged_method_per_seed(
     clustered_compare: ModuleType,
     clustered_dataset: ModuleType,
     clustered_regions: ModuleType,
@@ -52,19 +53,23 @@ def test_compare_groups_staged_bbb_results_per_seed(
 
     assert [result.seed for result in results] == [3, 4]
     for result in results:
-        (configuration,) = result.configurations
-        assert configuration.name == "staged BBB"
-        assert configuration.draws.means.shape == (4, data.grid_inputs.shape[0])
-        assert configuration.draws.variances.shape == configuration.draws.means.shape
-        assert set(configuration.scores.regions) == set(clustered_regions.REGIONS)
-        for region in configuration.scores.regions.values():
-            assert 0.0 <= region.coverage <= 1.0
-            assert region.aleatoric_std >= 0.0
-            assert region.epistemic_std >= 0.0
+        names = [configuration.name for configuration in result.configurations]
+        assert names == _STAGED_NAMES
+        for configuration in result.configurations:
+            # pSGLD retains exactly num_draws samples, like the others draw.
+            assert configuration.draws.means.shape == (4, data.grid_inputs.shape[0])
+            assert (
+                configuration.draws.variances.shape == configuration.draws.means.shape
+            )
+            assert set(configuration.scores.regions) == set(clustered_regions.REGIONS)
+            for region in configuration.scores.regions.values():
+                assert 0.0 <= region.coverage <= 1.0
+                assert region.aleatoric_std >= 0.0
+                assert region.epistemic_std > 0.0
         assert result.point_epochs == 6  # patience outlasts both stages
 
 
-def test_main_prints_a_one_row_table_with_every_region(
+def test_main_prints_one_row_per_staged_method_with_every_region(
     clustered_compare: ModuleType,
     clustered_regions: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -75,20 +80,27 @@ def test_main_prints_a_one_row_table_with_every_region(
     clustered_compare.main()
 
     lines = capsys.readouterr().out.strip().splitlines()
-    header, row = lines[-2], lines[-1]
+    header, rows = lines[-4], lines[-3:]
     assert header.split()[:3] == ["ID", "RMSE", "ID"]
-    assert row.startswith("staged BBB")
-    cells = re.findall(_NUMBER, row)
-    assert len(cells) == 1 + 3 * len(clustered_regions.REGIONS)
-    coverages = [float(cell) for cell in cells[3::3]]
-    assert len(coverages) == 3
-    assert all(0.0 <= coverage <= 1.0 for coverage in coverages)
+    for name, row in zip(_STAGED_NAMES, rows, strict=True):
+        assert row.startswith(name)
+        cells = re.findall(_NUMBER, row)
+        assert len(cells) == 1 + 3 * len(clustered_regions.REGIONS)
+        coverages = [float(cell) for cell in cells[3::3]]
+        assert len(coverages) == 3
+        assert all(0.0 <= coverage <= 1.0 for coverage in coverages)
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [("--num-draws", "0"), ("--mc-dropout-rate", "1.0")],
+)
 def test_main_rejects_invalid_settings(
-    clustered_compare: ModuleType, monkeypatch: pytest.MonkeyPatch
+    clustered_compare: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: tuple[str, ...],
 ) -> None:
-    monkeypatch.setattr(sys, "argv", ["compare.py", "--num-draws", "0"])
+    monkeypatch.setattr(sys, "argv", ["compare.py", *arguments])
 
     with pytest.raises(SystemExit):
         clustered_compare.main()

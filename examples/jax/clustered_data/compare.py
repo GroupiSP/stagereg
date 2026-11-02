@@ -2,9 +2,11 @@
 
 Generates the UvA tutorial's two clusters of training data and a dense
 evaluation grid over `[-0.5, 1.5]`, then, for each seed, trains the staged
-model (mean stage, Gamma variance stage, then the library's posterior stage
-with Bayes by Backprop) on a Tanh MLP backbone of 5 hidden layers of 10
-units.
+model on a Tanh MLP backbone of 5 hidden layers of 10 units: a mean stage
+and a Gamma variance stage, shared by three runs of the library's posterior
+stage, with Bayes by Backprop, MC dropout and pSGLD. The three differ only
+in the inference method and the backbone's dropout rate, which is non-zero
+for MC dropout alone.
 
 Each configuration is reduced to per-draw predictive means and variances
 on the grid and scored on the in-distribution region, the gap region
@@ -38,10 +40,10 @@ if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
 from clustered import ClusteredData, ClusteredDataConfig, make_clustered_data
-from methods import METHODS
+from methods import METHODS, dropout_rate
 from regions import EXTRAPOLATION, GAP, IN_DISTRIBUTION, REGIONS, region_masks
 from scoring import PredictiveDraws, Scores, score
-from staged import run_staged, train_supervised_stages
+from staged import posterior_network, run_staged, train_supervised_stages
 
 STAGED = "staged"
 """Name of the staged training in the results and the table."""
@@ -121,7 +123,13 @@ def compare_seed(
     supervised = train_supervised_stages(data, config)
     configurations = []
     for method, make_method in METHODS.items():
-        draws = run_staged(data, config, supervised, make_method(config))
+        draws = run_staged(
+            data,
+            config,
+            supervised,
+            make_method(config),
+            network=posterior_network(config, dropout_rate(method, config)),
+        )
         result = ConfigurationResult(
             training=STAGED,
             method=method,
@@ -260,6 +268,9 @@ _FLAG_HELP: dict[str, str] = {
     "prior_precision": "Precision of the isotropic Gaussian prior",
     "bbb_learning_rate": "Adam learning rate of Bayes by Backprop",
     "bbb_initial_std": "Initial standard deviation of Bayes by Backprop",
+    "mc_dropout_rate": "Dropout rate of the backbone under MC dropout",
+    "mc_dropout_learning_rate": "Adam learning rate of MC dropout",
+    "psgld_step_size": "Langevin step size of pSGLD",
     "seed": "Seed of the initialization, batch order and draws",
 }
 """Each `ClusteredDataConfig` field's command-line help."""

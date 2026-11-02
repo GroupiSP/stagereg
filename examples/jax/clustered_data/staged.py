@@ -158,6 +158,23 @@ def _fork(state: TrainingState) -> TrainingState:
     )
 
 
+def posterior_network(config: ClusteredDataConfig, dropout_rate: float) -> MeanNetwork:
+    """Build the posterior stage's network: the mean network's architecture.
+
+    The posterior stage copies the trained mean network's parameters into
+    it, so only its dropout rate matters.
+
+    Args:
+        config: The comparison's settings; `seed` is read.
+        dropout_rate: The backbone's dropout rate.
+
+    Returns:
+        An untrained mean network with that dropout rate.
+    """
+    key = jax.random.fold_in(jax.random.key(config.seed), 5)
+    return MeanNetwork(dropout_rate=dropout_rate, rngs=nnx.Rngs(key))
+
+
 def run_staged(
     data: ClusteredData,
     config: ClusteredDataConfig,

@@ -52,23 +52,13 @@ def shown_figures(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[bool]]:
     pyplot.close("all")
 
 
-@pytest.fixture(scope="session")
-def tiny_clustered_config(clustered_dataset: ModuleType) -> Any:
-    """A clustered-data configuration that trains in a few seconds."""
-    return clustered_dataset.ClusteredDataConfig(
-        mean_epochs=3, variance_epochs=3, posterior_epochs=2, num_draws=4, seed=3
-    )
-
-
 def test_compare_groups_joint_and_staged_results_per_seed(
     clustered_compare: ModuleType,
-    clustered_dataset: ModuleType,
     clustered_regions: ModuleType,
+    clustered_data: Any,
     tiny_clustered_config: Any,
 ) -> None:
-    data = clustered_dataset.make_clustered_data(tiny_clustered_config)
-
-    results = clustered_compare.compare(data, tiny_clustered_config, seeds=2)
+    results = clustered_compare.compare(clustered_data, tiny_clustered_config, seeds=2)
 
     assert [result.seed for result in results] == [3, 4]
     for result in results:
@@ -77,7 +67,7 @@ def test_compare_groups_joint_and_staged_results_per_seed(
         for configuration in result.configurations:
             # pSGLD retains exactly num_draws samples, like the others draw.
             means = configuration.draws.means
-            assert means.shape == (4, data.grid_inputs.shape[0])
+            assert means.shape == (4, clustered_data.grid_inputs.shape[0])
             assert configuration.draws.variances.shape == means.shape
             assert set(configuration.scores.regions) == set(clustered_regions.REGIONS)
             for region in configuration.scores.regions.values():
@@ -89,7 +79,7 @@ def test_compare_groups_joint_and_staged_results_per_seed(
 
 def test_joint_runs_get_the_staged_runs_total_epochs(
     clustered_compare: ModuleType,
-    clustered_dataset: ModuleType,
+    clustered_data: Any,
     tiny_clustered_config: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -101,9 +91,9 @@ def test_joint_runs_get_the_staged_runs_total_epochs(
         return run_joint(*args, epochs=epochs, **kwargs)
 
     monkeypatch.setattr(clustered_compare, "run_joint", recording_run_joint)
-    data = clustered_dataset.make_clustered_data(tiny_clustered_config)
-
-    (result,) = clustered_compare.compare(data, tiny_clustered_config, seeds=1)
+    (result,) = clustered_compare.compare(
+        clustered_data, tiny_clustered_config, seeds=1
+    )
 
     assert len(budgets) == 3
     # Mean and variance stages run 3 epochs each, the posterior stage 2.
@@ -113,7 +103,7 @@ def test_joint_runs_get_the_staged_runs_total_epochs(
 
 def test_joint_runs_share_each_methods_hyperparameters_and_draw_schedule(
     clustered_compare: ModuleType,
-    clustered_dataset: ModuleType,
+    clustered_data: Any,
     tiny_clustered_config: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -133,9 +123,9 @@ def test_joint_runs_share_each_methods_hyperparameters_and_draw_schedule(
 
     monkeypatch.setattr(clustered_compare, "run_joint", recording_run_joint)
     monkeypatch.setattr(clustered_compare, "run_staged", recording_run_staged)
-    data = clustered_dataset.make_clustered_data(tiny_clustered_config)
-
-    (result,) = clustered_compare.compare(data, tiny_clustered_config, seeds=1)
+    (result,) = clustered_compare.compare(
+        clustered_data, tiny_clustered_config, seeds=1
+    )
 
     assert (
         set(joint_runs)

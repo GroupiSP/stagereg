@@ -11,30 +11,29 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 nnx = pytest.importorskip("flax.nnx")
 
 
-@pytest.fixture(scope="session")
-def tiny_joint_config(clustered_dataset: ModuleType) -> Any:
-    """A clustered-data configuration whose joint run trains in a second."""
-    return clustered_dataset.ClusteredDataConfig(num_draws=4, seed=3)
-
-
-@pytest.fixture(scope="session")
-def clustered_data(clustered_dataset: ModuleType, tiny_joint_config: Any) -> Any:
-    """The clustered training set and evaluation grid."""
-    return clustered_dataset.make_clustered_data(tiny_joint_config)
-
-
 class _RecordingMethod:
-    """An inference method that records what the hand loop asks of it."""
+    """An inference method that records what the hand loop asks of it.
+
+    Attributes:
+        problem: The problem it was initialized with, or `None` before `init`.
+        updates: Update steps taken so far.
+    """
+
+    _method: Any
+    problem: Any
+    updates: int
 
     def __init__(self, method: Any) -> None:
         self._method = method
-        self.problem: Any = None
+        self.problem = None
         self.updates = 0
 
     def __getattr__(self, name: str) -> Any:
@@ -53,11 +52,13 @@ def test_joint_run_updates_once_per_batch_of_its_epoch_budget(
     clustered_joint: ModuleType,
     clustered_methods: ModuleType,
     clustered_data: Any,
-    tiny_joint_config: Any,
+    tiny_clustered_config: Any,
 ) -> None:
-    method = _RecordingMethod(clustered_methods.bayes_by_backprop(tiny_joint_config))
+    method = _RecordingMethod(
+        clustered_methods.bayes_by_backprop(tiny_clustered_config)
+    )
 
-    clustered_joint.run_joint(clustered_data, tiny_joint_config, method, epochs=3)
+    clustered_joint.run_joint(clustered_data, tiny_clustered_config, method, epochs=3)
 
     assert method.updates == 3 * 10  # 1,000 points in batches of 100
     assert method.problem.epochs == 3
@@ -68,11 +69,13 @@ def test_joint_run_infers_both_heads_from_a_random_initialization(
     clustered_methods: ModuleType,
     clustered_dataset: ModuleType,
     clustered_data: Any,
-    tiny_joint_config: Any,
+    tiny_clustered_config: Any,
 ) -> None:
-    method = _RecordingMethod(clustered_methods.bayes_by_backprop(tiny_joint_config))
+    method = _RecordingMethod(
+        clustered_methods.bayes_by_backprop(tiny_clustered_config)
+    )
 
-    clustered_joint.run_joint(clustered_data, tiny_joint_config, method, epochs=1)
+    clustered_joint.run_joint(clustered_data, tiny_clustered_config, method, epochs=1)
 
     parameters = method.problem.initial_parameters
     assert {"trunk", "mean_head", "variance_head"} <= set(parameters)
@@ -90,12 +93,12 @@ def test_joint_draws_carry_their_own_positive_variances(
     clustered_joint: ModuleType,
     clustered_methods: ModuleType,
     clustered_data: Any,
-    tiny_joint_config: Any,
+    tiny_clustered_config: Any,
 ) -> None:
     draws = clustered_joint.run_joint(
         clustered_data,
-        tiny_joint_config,
-        clustered_methods.bayes_by_backprop(tiny_joint_config),
+        tiny_clustered_config,
+        clustered_methods.bayes_by_backprop(tiny_clustered_config),
         epochs=1,
     )
 
@@ -110,13 +113,13 @@ def test_joint_run_is_reproducible(
     clustered_joint: ModuleType,
     clustered_methods: ModuleType,
     clustered_data: Any,
-    tiny_joint_config: Any,
+    tiny_clustered_config: Any,
 ) -> None:
     first, second = (
         clustered_joint.run_joint(
             clustered_data,
-            tiny_joint_config,
-            clustered_methods.bayes_by_backprop(tiny_joint_config),
+            tiny_clustered_config,
+            clustered_methods.bayes_by_backprop(tiny_clustered_config),
             epochs=1,
         )
         for _ in range(2)
@@ -130,13 +133,13 @@ def test_log_likelihood_is_the_scaled_gaussian_under_the_variance_head(
     clustered_joint: ModuleType,
     clustered_dataset: ModuleType,
     clustered_data: Any,
-    tiny_joint_config: Any,
+    tiny_clustered_config: Any,
 ) -> None:
-    network = clustered_joint.joint_network(tiny_joint_config)
+    network = clustered_joint.joint_network(tiny_clustered_config)
     problem = clustered_joint.joint_problem(
-        network, clustered_data, tiny_joint_config, epochs=1
+        network, clustered_data, tiny_clustered_config, epochs=1
     )
-    loader = clustered_dataset.make_loader(clustered_data, tiny_joint_config)
+    loader = clustered_dataset.make_loader(clustered_data, tiny_clustered_config)
     batch = loader(split="train", epoch=0)[0]
     outputs = network(batch.inputs)
     mean, variance = outputs[:, :1], outputs[:, 1:]
@@ -153,17 +156,18 @@ def test_log_likelihood_is_the_scaled_gaussian_under_the_variance_head(
     assert bool(jnp.all(variance >= 1e-6))
 
 
-@pytest.mark.parametrize("point_epochs", [0, 1, 6, 400])
+@settings(deadline=None, max_examples=25)
+@given(point_epochs=st.integers(min_value=0, max_value=2_000))
 def test_joint_psgld_burns_in_the_staged_point_epochs_too(
-    clustered_methods: ModuleType, tiny_joint_config: Any, point_epochs: int
+    clustered_methods: ModuleType, tiny_clustered_config: Any, point_epochs: int
 ) -> None:
-    staged = clustered_methods.METHODS[clustered_methods.PSGLD](tiny_joint_config)
+    staged = clustered_methods.METHODS[clustered_methods.PSGLD](tiny_clustered_config)
 
     joint = clustered_methods.joint_method(
-        clustered_methods.PSGLD, tiny_joint_config, point_epochs=point_epochs
+        clustered_methods.PSGLD, tiny_clustered_config, point_epochs=point_epochs
     )
 
-    steps_per_epoch = tiny_joint_config.steps_per_epoch
+    steps_per_epoch = tiny_clustered_config.steps_per_epoch
     assert joint.burn_in == staged.burn_in + point_epochs * steps_per_epoch
     assert joint.thinning == staged.thinning
     assert joint.step_size == staged.step_size
@@ -171,11 +175,11 @@ def test_joint_psgld_burns_in_the_staged_point_epochs_too(
 
 @pytest.mark.parametrize("name", ["BBB", "MCD"])
 def test_joint_bbb_and_mcd_are_built_as_their_staged_counterparts(
-    clustered_methods: ModuleType, tiny_joint_config: Any, name: str
+    clustered_methods: ModuleType, tiny_clustered_config: Any, name: str
 ) -> None:
-    staged = clustered_methods.METHODS[name](tiny_joint_config)
+    staged = clustered_methods.METHODS[name](tiny_clustered_config)
 
-    joint = clustered_methods.joint_method(name, tiny_joint_config, point_epochs=6)
+    joint = clustered_methods.joint_method(name, tiny_clustered_config, point_epochs=6)
 
     assert type(joint) is type(staged)
     if name == "BBB":
@@ -186,10 +190,10 @@ def test_joint_psgld_retains_num_draws_over_the_final_posterior_epochs(
     clustered_joint: ModuleType,
     clustered_methods: ModuleType,
     clustered_data: Any,
-    tiny_joint_config: Any,
+    tiny_clustered_config: Any,
 ) -> None:
     point_epochs, posterior_epochs = 1, 2
-    config = tiny_joint_config.__class__(
+    config = tiny_clustered_config.__class__(
         posterior_epochs=posterior_epochs, num_draws=4, seed=3
     )
     method = clustered_methods.joint_method(
@@ -212,16 +216,16 @@ def test_joint_mc_dropout_draws_one_dropout_mask_per_draw(
     clustered_joint: ModuleType,
     clustered_methods: ModuleType,
     clustered_data: Any,
-    tiny_joint_config: Any,
+    tiny_clustered_config: Any,
 ) -> None:
     network = clustered_joint.joint_network(
-        tiny_joint_config, dropout_rate=tiny_joint_config.mc_dropout_rate
+        tiny_clustered_config, dropout_rate=tiny_clustered_config.mc_dropout_rate
     )
 
     draws = clustered_joint.run_joint(
         clustered_data,
-        tiny_joint_config,
-        clustered_methods.mc_dropout(tiny_joint_config),
+        tiny_clustered_config,
+        clustered_methods.mc_dropout(tiny_clustered_config),
         epochs=1,
         network=network,
     )

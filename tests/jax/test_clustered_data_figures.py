@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 jnp = pytest.importorskip("jax.numpy")
 plt = pytest.importorskip("matplotlib.pyplot")
@@ -30,20 +32,19 @@ class _Configuration:
     draws: Any
 
 
-@pytest.fixture(scope="session")
-def clustered_data(clustered_dataset: ModuleType) -> Any:
-    """The training set and evaluation grid at the default settings."""
-    return clustered_dataset.make_clustered_data(
-        clustered_dataset.ClusteredDataConfig()
-    )
-
-
-def _spread_draws(scoring: ModuleType, num_points: int) -> Any:
-    """Draws at `_MEAN ± _SPREAD` with aleatoric variance `_VARIANCE`."""
+def _spread_draws(
+    scoring: ModuleType,
+    num_points: int,
+    *,
+    mean: float = _MEAN,
+    spread: float = _SPREAD,
+    variance: float = _VARIANCE,
+) -> Any:
+    """Draws at `mean ± spread` everywhere, with aleatoric variance `variance`."""
     signs = jnp.asarray([1.0, -1.0, 1.0, -1.0])[:, None]
     return scoring.PredictiveDraws(
-        means=jnp.full((4, num_points), _MEAN) + _SPREAD * signs,
-        variances=jnp.full((4, num_points), _VARIANCE),
+        means=jnp.full((4, num_points), mean) + spread * signs,
+        variances=jnp.full((4, num_points), variance),
     )
 
 
@@ -89,21 +90,47 @@ def test_uncertainty_grid_draws_only_the_configurations_that_exist(
         assert axes.get_ylim() == pytest.approx((-1.5, 2.5))
 
 
+@settings(deadline=None, max_examples=15)
+@given(
+    mean=st.floats(min_value=-1.0, max_value=2.0),
+    spread=st.floats(min_value=0.0, max_value=0.5),
+    variance=st.floats(min_value=0.0, max_value=0.5),
+)
 def test_uncertainty_grid_nests_the_epistemic_band_inside_the_total_band(
     clustered_figures: ModuleType,
+    clustered_scoring: ModuleType,
     clustered_data: Any,
-    staged_bbb_only: list[Any],
-    closed_figures: None,
+    mean: float,
+    spread: float,
+    variance: float,
 ) -> None:
-    figure = clustered_figures.plot_uncertainty_grid(staged_bbb_only, clustered_data)
+    draws = _spread_draws(
+        clustered_scoring,
+        clustered_data.grid_inputs.shape[0],
+        mean=mean,
+        spread=spread,
+        variance=variance,
+    )
+    figure = clustered_figures.plot_uncertainty_grid(
+        [_Configuration("staged", "BBB", draws)], clustered_data
+    )
+    try:
+        axes = np.asarray(figure.axes).reshape(2, 3)[1, 0]
+        epistemic = _band_extent(axes, clustered_figures.EPISTEMIC_BAND_LABEL)
+        total = _band_extent(axes, clustered_figures.TOTAL_BAND_LABEL)
+    finally:
+        plt.close(figure)
 
-    axes = np.asarray(figure.axes).reshape(2, 3)[1, 0]
-    epistemic = _band_extent(axes, clustered_figures.EPISTEMIC_BAND_LABEL)
-    total = _band_extent(axes, clustered_figures.TOTAL_BAND_LABEL)
-    epistemic_half = 1.96 * _SPREAD
-    total_half = 1.96 * np.sqrt(_SPREAD**2 + _VARIANCE)
-    assert epistemic == pytest.approx((_MEAN - epistemic_half, _MEAN + epistemic_half))
-    assert total == pytest.approx((_MEAN - total_half, _MEAN + total_half))
+    # Four draws at mean ± spread have variance spread², around the mean.
+    epistemic_half = 1.96 * spread
+    total_half = 1.96 * np.sqrt(spread**2 + variance)
+    tolerance = 1e-5
+    assert epistemic == pytest.approx(
+        (mean - epistemic_half, mean + epistemic_half), abs=tolerance
+    )
+    assert total == pytest.approx((mean - total_half, mean + total_half), abs=tolerance)
+    assert total[0] <= epistemic[0] + tolerance
+    assert epistemic[1] <= total[1] + tolerance
 
 
 def test_uncertainty_grid_shades_the_gap_and_extrapolation_regions(

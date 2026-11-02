@@ -9,8 +9,9 @@ extra (`jax`, `plot`) or through an example-only dependency group.
 
 Only the commands shown here are entry points. The other modules beside them,
 `xsin/benchmark.py`, `xsin/posterior_benchmark.py`, `cmapss/model.py`,
-`cmapss/preprocessing.py`, `cmapss/plots.py` and
-`tracking/tensorboard_tracker.py`, hold shared code the scripts import.
+`cmapss/preprocessing.py`, `cmapss/plots.py`,
+`tracking/tensorboard_tracker.py` and every `clustered_data/` module but
+`compare.py`, hold shared code the scripts import.
 
 ## Simple regression
 
@@ -142,6 +143,47 @@ a copy you already have.
 
 README:
 [`examples/jax/cmapss/README.md`](https://github.com/GroupiSP/stagereg/blob/main/examples/jax/cmapss/README.md)
+
+## Clustered data
+
+How confident the staged model is inside the training data and away from it,
+on the "Simulate data" set of the UvA DL2 Bayesian neural network tutorial 1:
+two clusters of 500 points on `[-0.2, 0.2]` and `[0.6, 1.0]` (seed 42) with a
+sum-of-sines target and noise σ = 0.02. Every model shares one Tanh MLP
+backbone of 5 hidden layers of 10 units.
+
+```bash
+uv run --extra jax python examples/jax/clustered_data/compare.py
+```
+
+The comparison trains the staged model: a mean stage and a Gamma variance
+stage, each early-stopped on its training loss (at most 3,000 epochs, patience
+100), then the [posterior stage](posterior-stage.md) for a fixed 2,000 epochs
+with Bayes by Backprop under an isotropic Gaussian prior of precision 1. Both
+supervised stages use Adam at learning rate 1e-3 and batches of 100. At the
+defaults the run takes about half a minute on a laptop CPU.
+
+It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,
+with fresh noisy targets drawn from a different seed, split into the glossary's
+[in-distribution, gap and extrapolation regions](../glossary.md). Every
+configuration is reduced to per-draw predictive means and variances on the
+grid, and its predictive is the equal-weight mixture of those Gaussians. The
+table prints one row per configuration: the in-distribution RMSE of the
+predictive mean, then for each region the aleatoric σ (square root of the
+region average of the draw-averaged variance), the epistemic σ (square root of
+the region average of the variance of the means over draws) and the 95%
+coverage of the mixture's exact central interval.
+
+Every setting is a flag, `--noise-std` among them; `--help` lists them with
+their defaults. A quick run at small settings:
+
+```bash
+uv run --extra jax python examples/jax/clustered_data/compare.py \
+    --mean-epochs 50 --variance-epochs 50 --posterior-epochs 20 --num-draws 10
+```
+
+Source:
+[`examples/jax/clustered_data/`](https://github.com/GroupiSP/stagereg/tree/main/examples/jax/clustered_data)
 
 ## Tracking a run
 

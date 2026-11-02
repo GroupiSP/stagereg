@@ -85,6 +85,42 @@ def test_main_prints_a_one_row_table_with_every_region(
     assert all(0.0 <= coverage <= 1.0 for coverage in coverages)
 
 
+def test_main_aggregates_every_configuration_over_two_seeds(
+    clustered_compare: ModuleType,
+    clustered_regions: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["compare.py", *_TINY_FLAGS, "--seeds", "2"])
+
+    clustered_compare.main()
+
+    lines = capsys.readouterr().out.strip().splitlines()
+    runs = [re.match(r"\[(.+) seed=(\d+)\]", line) for line in lines]
+    runs_per_seed: dict[str, list[str]] = {}
+    for run in filter(None, runs):
+        runs_per_seed.setdefault(run[2], []).append(run[1])
+    assert set(runs_per_seed) == {"3", "4"}
+    assert runs_per_seed["3"] == runs_per_seed["4"]
+    header_index = next(
+        i for i, line in enumerate(lines) if line.lstrip().startswith("ID RMSE")
+    )
+    rows = lines[header_index + 1 :]
+    assert [row.split("  ")[0].strip() for row in rows] == runs_per_seed["3"]
+    for row in rows:
+        cells = re.findall(rf"{_NUMBER} ± {_NUMBER}", row)
+        assert len(cells) == 1 + 3 * len(clustered_regions.REGIONS)
+
+
+def test_main_rejects_a_non_positive_number_of_seeds(
+    clustered_compare: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["compare.py", "--seeds", "0"])
+
+    with pytest.raises(SystemExit):
+        clustered_compare.main()
+
+
 def test_main_rejects_invalid_settings(
     clustered_compare: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:

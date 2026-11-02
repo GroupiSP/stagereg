@@ -169,7 +169,8 @@ under the network's own Gaussian likelihood and the same prior. It starts from
 a random initialization with no warm start and no early stopping, and runs
 exactly as many epochs as the staged model of the same seed: its mean-stage,
 variance-stage and posterior epochs together. Each joint draw carries its own
-mean and variance.
+mean and variance. At the defaults the run takes a few minutes on a laptop
+CPU.
 
 It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn from a different seed, split into the glossary's

@@ -11,7 +11,10 @@ seeded with 42. The evaluation grid has 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn the same way from a different seed.
 
 The data never change across run seeds: `ClusteredDataConfig.seed` only
-varies the models' initialization, the batch order and the draws.
+varies the models' initialization, the batch order and the draws. Each of
+those purposes draws from its own named PRNG stream (`PRNG_STREAMS`), a
+`fold_in` of the seed's key, so no two of them, joint or staged, share a
+key.
 """
 
 from __future__ import annotations
@@ -41,6 +44,38 @@ GRID_BOUNDS = (-0.5, 1.5)
 
 GRID_SIZE = 3_000
 """Number of points on the evaluation grid."""
+
+SHUFFLE_STREAM = 0
+"""PRNG stream of the loader's per-epoch shuffles, folded in with the epoch."""
+
+SUPERVISED_STREAM = 1
+"""PRNG stream of the staged mean and variance stages' initializations and state."""
+
+STAGED_POSTERIOR_INIT_STREAM = 2
+"""PRNG stream of the staged posterior network's initialization and dropout."""
+
+STAGED_DRAW_STREAM = 3
+"""PRNG stream of the staged posterior's draws on the grid."""
+
+JOINT_INIT_STREAM = 4
+"""PRNG stream of the joint network's initialization and dropout."""
+
+JOINT_TRAIN_STREAM = 5
+"""PRNG stream of the joint run's per-step update keys."""
+
+JOINT_DRAW_STREAM = 6
+"""PRNG stream of the joint posterior's draws on the grid."""
+
+PRNG_STREAMS: dict[str, int] = {
+    "shuffle": SHUFFLE_STREAM,
+    "supervised": SUPERVISED_STREAM,
+    "staged_posterior_init": STAGED_POSTERIOR_INIT_STREAM,
+    "staged_draws": STAGED_DRAW_STREAM,
+    "joint_init": JOINT_INIT_STREAM,
+    "joint_train": JOINT_TRAIN_STREAM,
+    "joint_draws": JOINT_DRAW_STREAM,
+}
+"""Every PRNG stream of a run, by purpose; each has its own id."""
 
 
 @dataclass(frozen=True)
@@ -264,6 +299,19 @@ def make_clustered_data(config: ClusteredDataConfig) -> ClusteredData:
     )
 
 
+def seed_key(config: ClusteredDataConfig, stream: int) -> jax.Array:
+    """Return the key of one PRNG stream, derived from `config.seed`.
+
+    Args:
+        config: The comparison's settings; `seed` is read.
+        stream: The stream's id, one of `PRNG_STREAMS`' values.
+
+    Returns:
+        The seed's key with the stream folded in.
+    """
+    return jax.random.fold_in(jax.random.key(config.seed), stream)
+
+
 def make_loader(data: ClusteredData, config: ClusteredDataConfig) -> LoaderFactory:
     """Build a loader that reshuffles the training set every epoch.
 
@@ -279,7 +327,8 @@ def make_loader(data: ClusteredData, config: ClusteredDataConfig) -> LoaderFacto
     def loader(*, split: str, epoch: int) -> list[Batch]:
         del split
         permutation = jax.random.permutation(
-            jax.random.fold_in(jax.random.key(config.seed), epoch), config.train_size
+            jax.random.fold_in(seed_key(config, SHUFFLE_STREAM), epoch),
+            config.train_size,
         )
         inputs = data.train_inputs[permutation]
         targets = data.train_targets[permutation]

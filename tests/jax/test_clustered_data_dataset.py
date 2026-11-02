@@ -122,7 +122,7 @@ def test_psgld_schedule_spreads_the_draws_over_the_final_half_at_the_defaults(
     num_draws=st.integers(min_value=1, max_value=40),
     preceding_epochs=st.integers(min_value=0, max_value=30),
 )
-def test_psgld_schedule_retains_every_draw_in_the_final_half_of_the_posterior_phase(
+def test_psgld_schedule_retains_every_draw_in_the_final_half_of_the_posterior_epochs(
     clustered_dataset: ModuleType,
     posterior_epochs: int,
     batch_size: int,
@@ -151,3 +151,18 @@ def test_psgld_schedule_retains_every_draw_in_the_final_half_of_the_posterior_ph
     assert len(retained) == num_draws
     assert retained[0] > final_half_start
     assert retained[-1] == total
+
+
+def test_every_prng_stream_has_its_own_id(clustered_dataset: ModuleType) -> None:
+    streams = clustered_dataset.PRNG_STREAMS
+
+    assert len(set(streams.values())) == len(streams)
+    assert set(streams) == {
+        "shuffle",
+        "supervised",
+        "staged_posterior_init",
+        "staged_draws",
+        "joint_init",
+        "joint_train",
+        "joint_draws",
+    }

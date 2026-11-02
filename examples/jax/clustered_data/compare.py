@@ -53,17 +53,11 @@ if str(_MODULE_DIR) not in sys.path:
 
 from clustered import ClusteredData, ClusteredDataConfig, make_clustered_data
 from figures import draw_figures
-from methods import METHODS, dropout_rate, joint_method
+from methods import JOINT, METHODS, TRAININGS, dropout_rate, joint_method
 from regions import EXTRAPOLATION, GAP, IN_DISTRIBUTION, REGIONS, region_masks
 from scoring import PredictiveDraws, Scores, score
 from joint import joint_network, run_joint
 from staged import posterior_network, run_staged, train_supervised_stages
-
-JOINT = "joint"
-"""Name of the joint posterior's training in the results and the table."""
-
-STAGED = "staged"
-"""Name of the staged training in the results and the table."""
 
 REGION_LABELS: dict[str, str] = {
     IN_DISTRIBUTION: "ID",
@@ -143,40 +137,38 @@ def compare_seed(
     """
     masks = region_masks(data.grid_inputs)
     supervised = train_supervised_stages(data, config)
-    configurations = []
     joint_epochs = supervised.point_epochs + config.posterior_epochs
-    for method in METHODS:
-        draws = run_joint(
-            data,
-            config,
-            joint_method(method, config, point_epochs=supervised.point_epochs),
-            epochs=joint_epochs,
-            network=joint_network(config, dropout_rate=dropout_rate(method, config)),
-        )
-        result = ConfigurationResult(
-            training=JOINT,
-            method=method,
-            draws=draws,
-            scores=score(draws, data.grid_targets, masks),
-        )
-        on_run(config.seed, result)
-        configurations.append(result)
-    for method, make_method in METHODS.items():
-        draws = run_staged(
+
+    def run(training: str, method: str) -> PredictiveDraws:
+        rate = dropout_rate(method, config)
+        if training == JOINT:
+            return run_joint(
+                data,
+                config,
+                joint_method(method, config, point_epochs=supervised.point_epochs),
+                epochs=joint_epochs,
+                network=joint_network(config, dropout_rate=rate),
+            )
+        return run_staged(
             data,
             config,
             supervised,
-            make_method(config),
-            network=posterior_network(config, dropout_rate(method, config)),
+            METHODS[method](config),
+            network=posterior_network(config, rate),
         )
-        result = ConfigurationResult(
-            training=STAGED,
-            method=method,
-            draws=draws,
-            scores=score(draws, data.grid_targets, masks),
-        )
-        on_run(config.seed, result)
-        configurations.append(result)
+
+    configurations = []
+    for training in TRAININGS:
+        for method in METHODS:
+            draws = run(training, method)
+            result = ConfigurationResult(
+                training=training,
+                method=method,
+                draws=draws,
+                scores=score(draws, data.grid_targets, masks),
+            )
+            on_run(config.seed, result)
+            configurations.append(result)
     return SeedComparison(
         seed=config.seed,
         point_epochs=supervised.point_epochs,

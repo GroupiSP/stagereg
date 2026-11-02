@@ -535,7 +535,7 @@ def clustered_compare() -> ModuleType:
 @pytest.fixture(scope="session")
 def clustered_figures() -> ModuleType:
     """The clustered-data example's uncertainty grid and calibration figures."""
-    for dependency in ("jax", "matplotlib"):
+    for dependency in ("jax", "flax.nnx", "optax", "matplotlib"):
         pytest.importorskip(dependency)
     return _import_clustered_data_module("figures")
 
@@ -545,6 +545,24 @@ def clustered_dataset() -> ModuleType:
     """The clustered-data example's configuration, data and loader."""
     pytest.importorskip("jax")
     return _import_clustered_data_module("clustered")
+
+
+@pytest.fixture(scope="session")
+def tiny_clustered_config(clustered_dataset: ModuleType) -> Any:
+    """A clustered-data configuration whose every run trains in a few seconds."""
+    return clustered_dataset.ClusteredDataConfig(
+        mean_epochs=3, variance_epochs=3, posterior_epochs=2, num_draws=4, seed=3
+    )
+
+
+@pytest.fixture(scope="session")
+def clustered_data(clustered_dataset: ModuleType, tiny_clustered_config: Any) -> Any:
+    """The clustered training set and evaluation grid.
+
+    They depend on the noise level alone, which `tiny_clustered_config`
+    keeps at its default.
+    """
+    return clustered_dataset.make_clustered_data(tiny_clustered_config)
 
 
 @pytest.fixture(scope="session")

@@ -14,8 +14,17 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 import optax
-from clustered import ClusteredData, ClusteredDataConfig, make_loader
+from clustered import (
+    STAGED_DRAW_STREAM,
+    STAGED_POSTERIOR_INIT_STREAM,
+    SUPERVISED_STREAM,
+    ClusteredData,
+    ClusteredDataConfig,
+    make_loader,
+    seed_key,
+)
 from flax import nnx
+from methods import draw_on_grid
 from networks import GammaNetwork, MeanNetwork
 from scoring import PredictiveDraws
 
@@ -105,7 +114,9 @@ def train_supervised_stages(
     Returns:
         The trained stages and the epochs they ran.
     """
-    mean_key, variance_key, train_key = jax.random.split(jax.random.key(config.seed), 3)
+    mean_key, variance_key, train_key = jax.random.split(
+        seed_key(config, SUPERVISED_STREAM), 3
+    )
     loader = make_loader(data, config)
     state = TrainingState(rng_state=train_key)
     counter = _EpochCounter()
@@ -171,7 +182,7 @@ def posterior_network(config: ClusteredDataConfig, dropout_rate: float) -> MeanN
     Returns:
         An untrained mean network with that dropout rate.
     """
-    key = jax.random.fold_in(jax.random.key(config.seed), 5)
+    key = seed_key(config, STAGED_POSTERIOR_INIT_STREAM)
     return MeanNetwork(dropout_rate=dropout_rate, rngs=nnx.Rngs(key))
 
 
@@ -213,10 +224,9 @@ def run_staged(
     stage.prepare(state)
     stage.train(state)
 
-    posterior = inference_method.posterior()
-    num_samples = None if posterior.num_draws is not None else config.num_draws
-    draw_key = jax.random.fold_in(jax.random.key(config.seed), 3)
-    means = posterior.sample_means(data.grid_inputs, draw_key, num_samples)[..., 0]
+    means = draw_on_grid(inference_method, data, config, stream=STAGED_DRAW_STREAM)[
+        ..., 0
+    ]
     aleatoric = supervised.variance_model(data.grid_inputs).mean()[..., 0]
     return PredictiveDraws(
         means=means, variances=jnp.broadcast_to(aleatoric, means.shape)

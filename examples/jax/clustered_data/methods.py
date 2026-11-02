@@ -3,14 +3,17 @@
 Joint and staged runs build each method from the same factory, so they share its
 hyperparameters. The methods differ from one another only in the inference method and
 the backbone's dropout rate: MC dropout runs it at `mc_dropout_rate`, the others at 0.
+The module also names both trainings, so the comparison and its figures share one
+source for every training and method name.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 
+import jax
 import optax
-from clustered import ClusteredDataConfig
+from clustered import ClusteredData, ClusteredDataConfig, seed_key
 
 from stagereg.jax import (
     BayesByBackprop,
@@ -30,6 +33,15 @@ MCD = "MCD"
 
 PSGLD = "pSGLD"
 """Name of preconditioned SGLD in the results and the table."""
+
+JOINT = "joint"
+"""Name of the joint posterior's training in the results and the table."""
+
+STAGED = "staged"
+"""Name of the staged training in the results and the table."""
+
+TRAININGS: tuple[str, ...] = (JOINT, STAGED)
+"""Both trainings, in table order: the joint rows precede the staged ones."""
 
 
 def bayes_by_backprop(config: ClusteredDataConfig) -> InferenceMethod:
@@ -81,6 +93,35 @@ def psgld(config: ClusteredDataConfig, *, preceding_epochs: int = 0) -> Inferenc
         step_size=config.psgld_step_size,
         burn_in=schedule.burn_in,
         thinning=schedule.thinning,
+    )
+
+
+def draw_on_grid(
+    inference_method: InferenceMethod,
+    data: ClusteredData,
+    config: ClusteredDataConfig,
+    *,
+    stream: int,
+) -> jax.Array:
+    """Draw the trained inference method's posterior mean function on the grid.
+
+    Joint and staged runs both end here, so they draw alike.
+
+    Args:
+        inference_method: The trained inference method.
+        data: The data whose evaluation grid to draw on.
+        config: The comparison's settings; `num_draws` and `seed` are read.
+        stream: The PRNG stream of the draws, one of `PRNG_STREAMS`' values.
+
+    Returns:
+        The mean function's outputs per draw, shape `[D, N, outputs]`:
+        `config.num_draws` draws, or every retained sample for a finite
+        posterior.
+    """
+    posterior = inference_method.posterior()
+    num_samples = None if posterior.num_draws is not None else config.num_draws
+    return posterior.sample_means(
+        data.grid_inputs, seed_key(config, stream), num_samples
     )
 
 

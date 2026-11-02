@@ -4,7 +4,7 @@ One network shares the trunk between a mean head and a variance head, and
 an inference method infers every weight, variance head included, under the
 network's own predicted variance. The example builds the library's
 [`PosteriorProblem`][stagereg.jax.PosteriorProblem] by hand and drives the
-method with its own loop: a single phase from a random initialization, with
+method with its own loop: a single run from a random initialization, with
 no point-estimate warm start and no early stopping. Any
 [`InferenceMethod`][stagereg.jax.InferenceMethod] runs in it unchanged.
 """
@@ -13,23 +13,23 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from clustered import ClusteredData, ClusteredDataConfig, make_loader
+from clustered import (
+    JOINT_DRAW_STREAM,
+    JOINT_INIT_STREAM,
+    JOINT_TRAIN_STREAM,
+    ClusteredData,
+    ClusteredDataConfig,
+    make_loader,
+    seed_key,
+)
 from flax import nnx
 from jax.scipy.stats import norm
+from methods import draw_on_grid
 from networks import JointNetwork
 from scoring import PredictiveDraws
 
 from stagereg.core.types import Batch, PyTree
 from stagereg.jax import InferenceMethod, IsotropicGaussianPrior, PosteriorProblem
-
-_INIT_STREAM = 4
-_TRAIN_STREAM = 5
-_DRAW_STREAM = 6
-
-
-def _seed_key(config: ClusteredDataConfig, stream: int) -> jax.Array:
-    """Return the joint run's key for one purpose, derived from `config.seed`."""
-    return jax.random.fold_in(jax.random.key(config.seed), stream)
 
 
 def joint_network(
@@ -45,7 +45,7 @@ def joint_network(
         A freshly initialized `JointNetwork`.
     """
     return JointNetwork(
-        dropout_rate=dropout_rate, rngs=nnx.Rngs(_seed_key(config, _INIT_STREAM))
+        dropout_rate=dropout_rate, rngs=nnx.Rngs(seed_key(config, JOINT_INIT_STREAM))
     )
 
 
@@ -127,15 +127,11 @@ def run_joint(
         network = joint_network(config)
     problem = joint_problem(network, data, config, epochs=epochs)
     inference_method.init(problem)
-    key = _seed_key(config, _TRAIN_STREAM)
+    key = seed_key(config, JOINT_TRAIN_STREAM)
     for epoch in range(epochs):
         for batch in problem.train_loader(split="train", epoch=epoch):
             key, step_key = jax.random.split(key)
             inference_method.update(batch, step_key)
 
-    posterior = inference_method.posterior()
-    num_samples = None if posterior.num_draws is not None else config.num_draws
-    outputs = posterior.sample_means(
-        data.grid_inputs, _seed_key(config, _DRAW_STREAM), num_samples
-    )
+    outputs = draw_on_grid(inference_method, data, config, stream=JOINT_DRAW_STREAM)
     return PredictiveDraws(means=outputs[..., 0], variances=outputs[..., 1])

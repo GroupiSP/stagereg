@@ -27,17 +27,20 @@ import numpy as np
 from clustered import GRID_BOUNDS, ClusteredData
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from methods import METHODS, TRAININGS
 from regions import CLUSTERS, EXTRAPOLATION, region_masks
 from scoring import CALIBRATION_LEVELS, PredictiveDraws, calibration_curve
 
-TRAININGS: tuple[str, ...] = ("joint", "staged")
-"""The trainings, one per row of the uncertainty grid and panel of the calibration
-figure."""
+METHOD_COLUMNS: tuple[str, ...] = tuple(METHODS)
+"""The inference methods, one per column of the uncertainty grid, in table order.
 
-METHOD_COLUMNS: tuple[str, ...] = ("BBB", "MCD", "pSGLD")
-"""The inference methods, one per column of the uncertainty grid, in order."""
+The trainings, `methods.TRAININGS`, give the grid's rows and the calibration
+figure's panels.
+"""
 
-METHOD_COLORS: dict[str, str] = {"BBB": "C0", "MCD": "C1", "pSGLD": "C2"}
+METHOD_COLORS: dict[str, str] = {
+    method: f"C{index}" for index, method in enumerate(METHOD_COLUMNS)
+}
 """Each method's fixed color in the calibration figure."""
 
 Y_LIMITS = (-1.5, 2.5)

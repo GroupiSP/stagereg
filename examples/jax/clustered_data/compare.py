@@ -2,11 +2,13 @@
 
 Generates the UvA tutorial's two clusters of training data and a dense
 evaluation grid over `[-0.5, 1.5]`, then, for each seed, trains the staged
-model (mean stage, Gamma variance stage, then the library's posterior stage
-with Bayes by Backprop) and the joint posterior (Bayes by Backprop over a
-network with a mean head and a variance head, from a random initialization,
-for the staged model's total epochs), both on a Tanh MLP backbone of 5
-hidden layers of 10 units.
+model on a Tanh MLP backbone of 5 hidden layers of 10 units: a mean stage
+and a Gamma variance stage, shared by three runs of the library's posterior
+stage, with Bayes by Backprop, MC dropout and pSGLD. The three differ only
+in the inference method and the backbone's dropout rate, which is non-zero
+for MC dropout alone. It also infers the joint posterior (Bayes by Backprop
+over a network with a mean head and a variance head, from a random
+initialization, for the staged model's total epochs) on the same backbone.
 
 Each configuration is reduced to per-draw predictive means and variances
 on the grid and scored on the in-distribution region, the gap region
@@ -49,11 +51,11 @@ if str(_MODULE_DIR) not in sys.path:
 
 from clustered import ClusteredData, ClusteredDataConfig, make_clustered_data
 from figures import draw_figures
-from methods import METHODS
+from methods import BBB, METHODS, dropout_rate
 from regions import EXTRAPOLATION, GAP, IN_DISTRIBUTION, REGIONS, region_masks
 from scoring import PredictiveDraws, Scores, score
 from joint import run_joint
-from staged import run_staged, train_supervised_stages
+from staged import posterior_network, run_staged, train_supervised_stages
 
 JOINT = "joint"
 """Name of the joint posterior's training in the results and the table."""
@@ -141,8 +143,10 @@ def compare_seed(
     supervised = train_supervised_stages(data, config)
     configurations = []
     joint_epochs = supervised.point_epochs + config.posterior_epochs
-    for method, make_method in METHODS.items():
-        draws = run_joint(data, config, make_method(config), epochs=joint_epochs)
+    # Joint MC dropout and pSGLD are not wired in yet: they need the joint
+    # network with dropout and a burn-in over the point epochs.
+    for method in (BBB,):
+        draws = run_joint(data, config, METHODS[method](config), epochs=joint_epochs)
         result = ConfigurationResult(
             training=JOINT,
             method=method,
@@ -152,7 +156,13 @@ def compare_seed(
         on_run(config.seed, result)
         configurations.append(result)
     for method, make_method in METHODS.items():
-        draws = run_staged(data, config, supervised, make_method(config))
+        draws = run_staged(
+            data,
+            config,
+            supervised,
+            make_method(config),
+            network=posterior_network(config, dropout_rate(method, config)),
+        )
         result = ConfigurationResult(
             training=STAGED,
             method=method,
@@ -291,6 +301,9 @@ _FLAG_HELP: dict[str, str] = {
     "prior_precision": "Precision of the isotropic Gaussian prior",
     "bbb_learning_rate": "Adam learning rate of Bayes by Backprop",
     "bbb_initial_std": "Initial standard deviation of Bayes by Backprop",
+    "mc_dropout_rate": "Dropout rate of the backbone under MC dropout",
+    "mc_dropout_learning_rate": "Adam learning rate of MC dropout",
+    "psgld_step_size": "Langevin step size of pSGLD",
     "seed": "Seed of the initialization, batch order and draws; the first seed",
 }
 """Each `ClusteredDataConfig` field's command-line help."""

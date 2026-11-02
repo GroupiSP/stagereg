@@ -32,6 +32,7 @@ _TINY_FLAGS = (
     "3",
 )
 _NUMBER = r"\d+\.\d+"
+_STAGED_NAMES = ["staged BBB", "staged MCD", "staged pSGLD"]
 
 
 @pytest.fixture(autouse=True)
@@ -65,9 +66,9 @@ def test_compare_groups_joint_and_staged_results_per_seed(
     assert [result.seed for result in results] == [3, 4]
     for result in results:
         names = [configuration.name for configuration in result.configurations]
-        assert {"joint BBB", "staged BBB"} <= set(names)
-        assert names.index("joint BBB") < names.index("staged BBB")
+        assert names == ["joint BBB", *_STAGED_NAMES]
         for configuration in result.configurations:
+            # pSGLD retains exactly num_draws samples, like the others draw.
             means = configuration.draws.means
             assert means.shape == (4, data.grid_inputs.shape[0])
             assert configuration.draws.variances.shape == means.shape
@@ -75,7 +76,7 @@ def test_compare_groups_joint_and_staged_results_per_seed(
             for region in configuration.scores.regions.values():
                 assert 0.0 <= region.coverage <= 1.0
                 assert region.aleatoric_std >= 0.0
-                assert region.epistemic_std >= 0.0
+                assert region.epistemic_std > 0.0
         assert result.point_epochs == 6  # patience outlasts both stages
 
 
@@ -117,8 +118,7 @@ def test_main_prints_a_row_per_configuration_with_every_region(
     title = next(i for i, line in enumerate(lines) if line.startswith("Clustered"))
     header, *rows = lines[title + 1 :]
     assert header.split()[:3] == ["ID", "RMSE", "ID"]
-    assert rows[0].startswith("joint BBB")
-    assert any(row.startswith("staged BBB") for row in rows)
+    assert [row.split("  ")[0] for row in rows] == ["joint BBB", *_STAGED_NAMES]
     for row in rows:
         cells = re.findall(_NUMBER, row)
         assert len(cells) == 1 + 3 * len(clustered_regions.REGIONS)
@@ -163,10 +163,16 @@ def test_main_rejects_a_non_positive_number_of_seeds(
         clustered_compare.main()
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [("--num-draws", "0"), ("--mc-dropout-rate", "1.0")],
+)
 def test_main_rejects_invalid_settings(
-    clustered_compare: ModuleType, monkeypatch: pytest.MonkeyPatch
+    clustered_compare: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: tuple[str, ...],
 ) -> None:
-    monkeypatch.setattr(sys, "argv", ["compare.py", "--num-draws", "0"])
+    monkeypatch.setattr(sys, "argv", ["compare.py", *arguments])
 
     with pytest.raises(SystemExit):
         clustered_compare.main()
@@ -206,7 +212,7 @@ def test_main_saves_both_figures_into_the_plot_path_without_showing(
     assert shown_figures == []
 
 
-def test_main_draws_the_joint_and_staged_rows_in_both_figures(
+def test_main_draws_every_configuration_run_in_both_figures(
     clustered_compare: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -228,10 +234,16 @@ def test_main_draws_the_joint_and_staged_rows_in_both_figures(
 
     ((grid, calibration),) = drawn
     titles_with_lines = {axes.get_title() for axes in grid.axes if axes.lines}
-    assert {"joint BBB", "staged BBB"} <= titles_with_lines
+    assert titles_with_lines == {
+        "joint BBB",
+        "staged BBB",
+        "staged MCD",
+        "staged pSGLD",
+    }
     joint, staged = calibration.axes
     assert joint.lines
-    assert staged.lines
+    # One curve per staged method, plus the diagonal.
+    assert len(staged.lines) == 4
 
 
 def test_main_shows_the_figures_without_a_plot_path(

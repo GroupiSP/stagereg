@@ -66,6 +66,10 @@ class ClusteredDataConfig:
         bbb_learning_rate: Adam learning rate of Bayes by Backprop.
         bbb_initial_std: Initial standard deviation of Bayes by Backprop's
             mean-field Gaussian.
+        mc_dropout_rate: The backbone's dropout rate under MC dropout; the
+            other methods run it without dropout.
+        mc_dropout_learning_rate: Adam learning rate of MC dropout.
+        psgld_step_size: Langevin step size of pSGLD.
         seed: Seed of the models' initialization, batch order and draws.
     """
 
@@ -81,6 +85,9 @@ class ClusteredDataConfig:
     prior_precision: float = 1.0
     bbb_learning_rate: float = 1e-2
     bbb_initial_std: float = 1e-2
+    mc_dropout_rate: float = 0.1
+    mc_dropout_learning_rate: float = 1e-3
+    psgld_step_size: float = 3e-3
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -88,8 +95,10 @@ class ClusteredDataConfig:
 
         Raises:
             ValueError: If a count is not positive, a patience is negative,
-                or a scale or rate is not finite and positive (the noise
-                level may be zero).
+                a scale or rate is not finite and positive (the noise level
+                may be zero), the dropout rate is not in `(0, 1)`, or the
+                final half of the posterior epochs has fewer update steps
+                than `num_draws`.
         """
         counts = {
             "batch_size": self.batch_size,
@@ -111,10 +120,17 @@ class ClusteredDataConfig:
             "prior_precision": self.prior_precision,
             "bbb_learning_rate": self.bbb_learning_rate,
             "bbb_initial_std": self.bbb_initial_std,
+            "mc_dropout_learning_rate": self.mc_dropout_learning_rate,
+            "psgld_step_size": self.psgld_step_size,
         }
         for name, value in rates.items():
             if not isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive, got {value}.")
+        if not 0.0 < self.mc_dropout_rate < 1.0:
+            raise ValueError(
+                f"mc_dropout_rate must lie in (0, 1), got {self.mc_dropout_rate}."
+            )
+        self.psgld_schedule()
 
     @property
     def train_size(self) -> int:
@@ -125,6 +141,51 @@ class ClusteredDataConfig:
     def steps_per_epoch(self) -> int:
         """Number of update steps (batches) per epoch."""
         return ceil(self.train_size / self.batch_size)
+
+    def psgld_schedule(self, *, preceding_epochs: int = 0) -> PsgldSchedule:
+        """Place pSGLD's draws evenly over the final half of the posterior epochs.
+
+        The run's last update step retains the last draw, and `num_draws`
+        draws are retained in all, `thinning` steps apart. A run that trains
+        other epochs before its posterior epochs burns them in as well, so
+        the draws keep their place at the end of the run.
+
+        Args:
+            preceding_epochs: Epochs the same run trains before its
+                `posterior_epochs`; 0 for the staged model's posterior stage.
+
+        Returns:
+            The burn-in and thinning, in update steps.
+
+        Raises:
+            ValueError: If the final half of the posterior epochs has fewer
+                update steps than `num_draws`.
+        """
+        final_half_epochs = self.posterior_epochs - self.posterior_epochs // 2
+        thinning = final_half_epochs * self.steps_per_epoch // self.num_draws
+        if thinning < 1:
+            raise ValueError(
+                f"num_draws ({self.num_draws}) exceeds the update steps of the "
+                f"final half of the posterior epochs "
+                f"({final_half_epochs * self.steps_per_epoch})."
+            )
+        total_steps = (preceding_epochs + self.posterior_epochs) * self.steps_per_epoch
+        return PsgldSchedule(
+            burn_in=total_steps - self.num_draws * thinning, thinning=thinning
+        )
+
+
+@dataclass(frozen=True)
+class PsgldSchedule:
+    """Where a pSGLD run retains its draws, in update steps (batches).
+
+    Attributes:
+        burn_in: Update steps before the first draw can be retained.
+        thinning: Update steps between two retained draws.
+    """
+
+    burn_in: int
+    thinning: int
 
 
 @dataclass(frozen=True)

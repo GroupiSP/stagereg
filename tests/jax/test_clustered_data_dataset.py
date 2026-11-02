@@ -7,6 +7,8 @@ from types import ModuleType
 
 import numpy as np
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 jnp = pytest.importorskip("jax.numpy")
 
@@ -67,6 +69,12 @@ def test_grid_targets_carry_fresh_noise(clustered_dataset: ModuleType) -> None:
         {"posterior_epochs": 0},
         {"num_draws": 0},
         {"prior_precision": 0.0},
+        {"mc_dropout_rate": 0.0},
+        {"mc_dropout_rate": 1.0},
+        {"mc_dropout_learning_rate": 0.0},
+        {"psgld_step_size": 0.0},
+        # The final posterior epoch's 10 steps cannot hold 11 draws.
+        {"posterior_epochs": 1, "num_draws": 11},
     ],
 )
 def test_config_rejects_invalid_settings(
@@ -92,3 +100,54 @@ def test_loader_reshuffles_every_epoch_into_full_batches(
         np.sort(np.concatenate([np.asarray(b.inputs[:, 0]) for b in first])),
         np.sort(np.asarray(data.train_inputs[:, 0])),
     )
+
+
+def test_psgld_schedule_spreads_the_draws_over_the_final_half_at_the_defaults(
+    clustered_dataset: ModuleType,
+) -> None:
+    config = clustered_dataset.ClusteredDataConfig()
+
+    staged = config.psgld_schedule()
+    joint = config.psgld_schedule(preceding_epochs=400)
+
+    # 2,000 posterior epochs of 10 steps: the final 10,000 steps hold 100 draws.
+    assert (staged.burn_in, staged.thinning) == (10_000, 100)
+    assert (joint.burn_in, joint.thinning) == (14_000, 100)
+
+
+@settings(deadline=None, max_examples=50)
+@given(
+    posterior_epochs=st.integers(min_value=1, max_value=60),
+    batch_size=st.sampled_from([50, 100, 300, 1000]),
+    num_draws=st.integers(min_value=1, max_value=40),
+    preceding_epochs=st.integers(min_value=0, max_value=30),
+)
+def test_psgld_schedule_retains_every_draw_in_the_final_half_of_the_posterior_phase(
+    clustered_dataset: ModuleType,
+    posterior_epochs: int,
+    batch_size: int,
+    num_draws: int,
+    preceding_epochs: int,
+) -> None:
+    try:
+        config = clustered_dataset.ClusteredDataConfig(
+            posterior_epochs=posterior_epochs,
+            batch_size=batch_size,
+            num_draws=num_draws,
+        )
+    except ValueError:
+        return  # too few steps in the final half for the draws
+    schedule = config.psgld_schedule(preceding_epochs=preceding_epochs)
+
+    # pSGLD retains the position after step t when t = burn_in + k * thinning, k >= 1.
+    steps = config.steps_per_epoch
+    total = (preceding_epochs + posterior_epochs) * steps
+    retained = [
+        t
+        for t in range(1, total + 1)
+        if t > schedule.burn_in and (t - schedule.burn_in) % schedule.thinning == 0
+    ]
+    final_half_start = (preceding_epochs + posterior_epochs // 2) * steps
+    assert len(retained) == num_draws
+    assert retained[0] > final_half_start
+    assert retained[-1] == total

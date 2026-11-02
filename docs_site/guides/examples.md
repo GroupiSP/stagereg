@@ -159,8 +159,20 @@ uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py
 The comparison trains the staged model: a mean stage and a Gamma variance
 stage, each early-stopped on its training loss (at most 3,000 epochs, patience
 100), then the [posterior stage](posterior-stage.md) for a fixed 2,000 epochs
-with Bayes by Backprop under an isotropic Gaussian prior of precision 1. Both
-supervised stages use Adam at learning rate 1e-3 and batches of 100.
+under an isotropic Gaussian prior of precision 1, once for each inference
+method on the same trained stages. Both supervised stages use Adam at learning
+rate 1e-3 and batches of 100.
+
+| Method | Posterior-stage setting | Backbone dropout | Draws |
+| --- | --- | --- | --- |
+| Bayes by Backprop (`BBB`) | Adam at 1e-2, initial σ 1e-2 | 0 | 100 sampled at prediction |
+| MC dropout (`MCD`) | Adam at 1e-3 | 0.1 (`--mc-dropout-rate`) | 100 sampled at prediction |
+| pSGLD (`pSGLD`) | step size 3e-3 | 0 | 100 retained, evenly thinned over the final 1,000 epochs |
+
+The three runs differ only in the inference method and the dropout rate; the
+architecture, prior, batch size and epochs are shared. pSGLD's burn-in and
+thinning count update steps: at the defaults it burns in the first 10,000 of
+its 20,000 steps and keeps every 100th step after them, the last one included.
 
 It also infers the joint posterior, the baseline: one network shares the
 backbone between a mean head and a variance head (a softplus plus a 1e-6

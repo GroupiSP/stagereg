@@ -18,6 +18,11 @@ synthetic windows and prepared data (`synthetic_windows`,
 `synthetic_prepared_data`), and a recording stand-in for the entry points'
 plotting (`plot_recorder`).
 
+The clustered-data example's modules import each other by bare names unique
+across the examples (`regions`, `scoring`, `compare`, ...); its fixtures
+import them under those same names, so tests and the entry point share one
+module object.
+
 Each fixture guards its own optional dependencies, so a test module is
 collected even when the extras it needs are absent and only the tests that
 actually touch that module skip.
@@ -25,6 +30,7 @@ actually touch that module skip.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import sys
 from collections.abc import Callable, Sequence
@@ -41,6 +47,7 @@ from stagereg.core.tracking import TrainingEvent
 _EXAMPLES_DIR = Path(__file__).parents[2] / "examples" / "jax"
 _CMAPSS_DIR = _EXAMPLES_DIR / "cmapss"
 _TRACKING_DIR = _EXAMPLES_DIR / "tracking"
+_CLUSTERED_DATA_DIR = _EXAMPLES_DIR / "clustered_data"
 if str(_CMAPSS_DIR) not in sys.path:
     sys.path.insert(0, str(_CMAPSS_DIR))
 
@@ -482,3 +489,44 @@ def compile_counter() -> type[CompileCounter]:
     """
     pytest.importorskip("jax")
     return CompileCounter
+
+
+def _import_clustered_data_module(name: str) -> ModuleType:
+    """Import one of the clustered-data example's modules by its bare name.
+
+    The example's modules import each other by bare name, so they are
+    imported the same way here, with the example's directory on `sys.path`:
+    a test and the entry point then share one module object, and one set of
+    classes.
+
+    Args:
+        name: The module's bare name, e.g. `"scoring"`.
+
+    Returns:
+        The imported module.
+    """
+    if str(_CLUSTERED_DATA_DIR) not in sys.path:
+        sys.path.insert(0, str(_CLUSTERED_DATA_DIR))
+    return importlib.import_module(name)
+
+
+@pytest.fixture(scope="session")
+def clustered_regions() -> ModuleType:
+    """The clustered-data example's region masks."""
+    pytest.importorskip("jax")
+    return _import_clustered_data_module("regions")
+
+
+@pytest.fixture(scope="session")
+def clustered_scoring() -> ModuleType:
+    """The clustered-data example's shared scoring of per-draw predictions."""
+    pytest.importorskip("jax")
+    return _import_clustered_data_module("scoring")
+
+
+@pytest.fixture(scope="session")
+def clustered_compare() -> ModuleType:
+    """The clustered-data example's comparison entry point."""
+    for dependency in ("jax", "jax.numpy", "flax.nnx", "optax"):
+        pytest.importorskip(dependency)
+    return _import_clustered_data_module("compare")

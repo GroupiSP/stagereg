@@ -1,7 +1,10 @@
 """The clustered-data example's shared backbone and the networks built on it.
 
 Every configuration uses one Tanh MLP trunk with `HIDDEN_LAYERS` hidden
-layers of `HIDDEN_FEATURES` units, with an optional dropout rate. Dropout
+layers of `HIDDEN_FEATURES` units, with an optional dropout rate. The
+trunk first maps the training-input range `INPUT_RANGE` onto `[-1, 1]`
+with a fixed affine map, as the xsin example does, so every network sees
+inputs of order one, identically. Dropout
 draws one mask per call, shared across the batch (`broadcast_dims=(0,)`),
 as MC dropout requires; at rate 0 it is the identity and adds no
 parameters, so networks with and without dropout share one parameter tree.
@@ -13,6 +16,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from regions import CLUSTERS
+
 from stagereg.jax import Gamma, GammaHead
 
 HIDDEN_LAYERS = 5
@@ -20,6 +25,24 @@ HIDDEN_LAYERS = 5
 
 HIDDEN_FEATURES = 10
 """Number of units of each hidden layer."""
+
+
+INPUT_RANGE: tuple[float, float] = (CLUSTERS[0][0], CLUSTERS[-1][1])
+"""The training inputs' range, which the trunk maps onto `[-1, 1]`."""
+
+
+def normalize_inputs(inputs: jax.Array) -> jax.Array:
+    """Map `INPUT_RANGE` affinely onto `[-1, 1]`.
+
+    Args:
+        inputs: Raw inputs, any shape.
+
+    Returns:
+        The normalized inputs, shaped like `inputs`; points outside the
+        training range land outside `[-1, 1]`.
+    """
+    low, high = INPUT_RANGE
+    return 2.0 * (inputs - low) / (high - low) - 1.0
 
 
 class Trunk(nnx.Module):
@@ -51,17 +74,18 @@ class Trunk(nnx.Module):
     def __call__(
         self, inputs: jax.Array, *, dropout_key: jax.Array | None = None
     ) -> jax.Array:
-        """Map inputs to the last hidden layer's features.
+        """Map normalized inputs to the last hidden layer's features.
 
         Args:
-            inputs: Inputs, shape `[B, 1]`.
+            inputs: Raw inputs, shape `[B, 1]`; the trunk normalizes them
+                with `normalize_inputs`.
             dropout_key: Key the dropout masks are drawn from; `None` draws
                 them from the trunk's own stream.
 
         Returns:
             Hidden features, shape `[B, HIDDEN_FEATURES]`.
         """
-        hidden = inputs
+        hidden = normalize_inputs(inputs)
         for index, (layer, dropout) in enumerate(
             zip(self.layers, self.dropouts, strict=True)
         ):

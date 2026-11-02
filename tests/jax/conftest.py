@@ -569,3 +569,11 @@ def clustered_methods() -> ModuleType:
     for dependency in ("jax", "jax.numpy", "flax.nnx", "optax"):
         pytest.importorskip(dependency)
     return _import_clustered_data_module("methods")
+
+
+@pytest.fixture(scope="session")
+def clustered_networks() -> ModuleType:
+    """The clustered-data example's shared backbone and networks."""
+    for dependency in ("jax", "jax.numpy", "flax.nnx"):
+        pytest.importorskip(dependency)
+    return _import_clustered_data_module("networks")

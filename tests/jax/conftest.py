@@ -537,3 +537,11 @@ def clustered_dataset() -> ModuleType:
     """The clustered-data example's configuration, data and loader."""
     pytest.importorskip("jax")
     return _import_clustered_data_module("clustered")
+
+
+@pytest.fixture(scope="session")
+def clustered_staged() -> ModuleType:
+    """The clustered-data example's staged model."""
+    for dependency in ("jax", "jax.numpy", "flax.nnx", "optax"):
+        pytest.importorskip(dependency)
+    return _import_clustered_data_module("staged")

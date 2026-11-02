@@ -6,9 +6,11 @@ model on a Tanh MLP backbone of 5 hidden layers of 10 units: a mean stage
 and a Gamma variance stage, shared by three runs of the library's posterior
 stage, with Bayes by Backprop, MC dropout and pSGLD. The three differ only
 in the inference method and the backbone's dropout rate, which is non-zero
-for MC dropout alone. It also infers the joint posterior (Bayes by Backprop
-over a network with a mean head and a variance head, from a random
-initialization, for the staged model's total epochs) on the same backbone.
+for MC dropout alone. It also infers the joint posterior with the same three
+methods and hyperparameters, on the same backbone: one network with a mean
+head and a variance head, from a random initialization, for the staged
+model's total epochs. Joint pSGLD burns in the staged model's mean and
+variance epochs too, so both pSGLD runs draw over the same final epochs.
 
 Each configuration is reduced to per-draw predictive means and variances
 on the grid and scored on the in-distribution region, the gap region
@@ -51,10 +53,10 @@ if str(_MODULE_DIR) not in sys.path:
 
 from clustered import ClusteredData, ClusteredDataConfig, make_clustered_data
 from figures import draw_figures
-from methods import BBB, METHODS, dropout_rate
+from methods import METHODS, dropout_rate, joint_method
 from regions import EXTRAPOLATION, GAP, IN_DISTRIBUTION, REGIONS, region_masks
 from scoring import PredictiveDraws, Scores, score
-from joint import run_joint
+from joint import joint_network, run_joint
 from staged import posterior_network, run_staged, train_supervised_stages
 
 JOINT = "joint"
@@ -143,10 +145,14 @@ def compare_seed(
     supervised = train_supervised_stages(data, config)
     configurations = []
     joint_epochs = supervised.point_epochs + config.posterior_epochs
-    # Joint MC dropout and pSGLD are not wired in yet: they need the joint
-    # network with dropout and a burn-in over the point epochs.
-    for method in (BBB,):
-        draws = run_joint(data, config, METHODS[method](config), epochs=joint_epochs)
+    for method in METHODS:
+        draws = run_joint(
+            data,
+            config,
+            joint_method(method, config, point_epochs=supervised.point_epochs),
+            epochs=joint_epochs,
+            network=joint_network(config, dropout_rate=dropout_rate(method, config)),
+        )
         result = ConfigurationResult(
             training=JOINT,
             method=method,

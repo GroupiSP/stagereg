@@ -151,3 +151,82 @@ def test_log_likelihood_is_the_scaled_gaussian_under_the_variance_head(
     )
     assert jnp.allclose(log_likelihood, expected, rtol=1e-5)
     assert bool(jnp.all(variance >= 1e-6))
+
+
+@pytest.mark.parametrize("point_epochs", [0, 1, 6, 400])
+def test_joint_psgld_burns_in_the_staged_point_epochs_too(
+    clustered_methods: ModuleType, tiny_joint_config: Any, point_epochs: int
+) -> None:
+    staged = clustered_methods.METHODS[clustered_methods.PSGLD](tiny_joint_config)
+
+    joint = clustered_methods.joint_method(
+        clustered_methods.PSGLD, tiny_joint_config, point_epochs=point_epochs
+    )
+
+    steps_per_epoch = tiny_joint_config.steps_per_epoch
+    assert joint.burn_in == staged.burn_in + point_epochs * steps_per_epoch
+    assert joint.thinning == staged.thinning
+    assert joint.step_size == staged.step_size
+
+
+@pytest.mark.parametrize("name", ["BBB", "MCD"])
+def test_joint_bbb_and_mcd_are_built_as_their_staged_counterparts(
+    clustered_methods: ModuleType, tiny_joint_config: Any, name: str
+) -> None:
+    staged = clustered_methods.METHODS[name](tiny_joint_config)
+
+    joint = clustered_methods.joint_method(name, tiny_joint_config, point_epochs=6)
+
+    assert type(joint) is type(staged)
+    if name == "BBB":
+        assert joint.initial_std == staged.initial_std
+
+
+def test_joint_psgld_retains_num_draws_over_the_final_posterior_epochs(
+    clustered_joint: ModuleType,
+    clustered_methods: ModuleType,
+    clustered_data: Any,
+    tiny_joint_config: Any,
+) -> None:
+    point_epochs, posterior_epochs = 1, 2
+    config = tiny_joint_config.__class__(
+        posterior_epochs=posterior_epochs, num_draws=4, seed=3
+    )
+    method = clustered_methods.joint_method(
+        clustered_methods.PSGLD, config, point_epochs=point_epochs
+    )
+
+    draws = clustered_joint.run_joint(
+        clustered_data, config, method, epochs=point_epochs + posterior_epochs
+    )
+
+    assert draws.means.shape == (4, clustered_data.grid_inputs.shape[0])
+    total_steps = (point_epochs + posterior_epochs) * config.steps_per_epoch
+    first_draw = method.burn_in + method.thinning
+    # Every draw falls in the final half of the posterior epochs.
+    assert first_draw > (point_epochs + posterior_epochs // 2) * config.steps_per_epoch
+    assert method.burn_in + 4 * method.thinning == total_steps
+
+
+def test_joint_mc_dropout_draws_one_dropout_mask_per_draw(
+    clustered_joint: ModuleType,
+    clustered_methods: ModuleType,
+    clustered_data: Any,
+    tiny_joint_config: Any,
+) -> None:
+    network = clustered_joint.joint_network(
+        tiny_joint_config, dropout_rate=tiny_joint_config.mc_dropout_rate
+    )
+
+    draws = clustered_joint.run_joint(
+        clustered_data,
+        tiny_joint_config,
+        clustered_methods.mc_dropout(tiny_joint_config),
+        epochs=1,
+        network=network,
+    )
+
+    assert draws.means.shape == (4, clustered_data.grid_inputs.shape[0])
+    # Each draw is one function of the input: its own mask over every point.
+    assert not bool(jnp.all(draws.means == draws.means[:1]))
+    assert not bool(jnp.all(draws.variances == draws.variances[:1]))

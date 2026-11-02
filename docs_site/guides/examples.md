@@ -176,13 +176,16 @@ its 20,000 steps and keeps every 100th step after them, the last one included.
 
 It also infers the joint posterior, the baseline: one network shares the
 backbone between a mean head and a variance head (a softplus plus a 1e-6
-floor), and Bayes by Backprop infers every weight, variance head included,
-under the network's own Gaussian likelihood and the same prior. It starts from
-a random initialization with no warm start and no early stopping, and runs
-exactly as many epochs as the staged model of the same seed: its mean-stage,
-variance-stage and posterior epochs together. Each joint draw carries its own
-mean and variance. At the defaults the run takes a few minutes on a laptop
-CPU.
+floor), and each of the three methods infers every weight, variance head
+included, under the network's own Gaussian likelihood and the same prior. Each
+joint run uses its staged counterpart's settings, dropout rate and number of
+draws from the table above. It starts from a random initialization with no warm
+start and no early stopping, and runs exactly as many epochs as the staged
+model of the same seed: its mean-stage, variance-stage and posterior epochs
+together. Joint pSGLD burns in the mean-stage and variance-stage epochs as
+well, so its 100 draws fall in the same final 1,000 epochs as the staged
+run's. Each joint draw carries its own mean and variance. The six
+configurations take several minutes at the defaults on a laptop CPU.
 
 It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn from a different seed, split into the glossary's
@@ -211,7 +214,7 @@ band of ±1.96 epistemic σ and an outer band of ±1.96 total σ, with the gap a
 extrapolation regions shaded. The second figure plots one
 [calibration curve](../glossary.md) per method in the extrapolation region, at
 nominal levels 0.05 to 0.95, from the same mixture scoring as the table's
-coverage. Configurations that were not run leave their panels empty. Both
+coverage. Both
 figures are shown on screen, or saved as `uncertainty_grid.png` and
 `extrapolation_calibration.png` into the directory `--plot-path` names, with
 no window opened.

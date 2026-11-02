@@ -103,3 +103,26 @@ METHODS: dict[str, MethodFactory] = {
     PSGLD: psgld,
 }
 """Every inference method the comparison runs, by name, in table order."""
+
+
+def joint_method(
+    method: str, config: ClusteredDataConfig, *, point_epochs: int
+) -> InferenceMethod:
+    """Build an inference method for the joint posterior.
+
+    It has its staged counterpart's hyperparameters. pSGLD also burns in the
+    epochs the staged model spends on its mean and variance stages, so both
+    runs retain their draws over the same final epochs.
+
+    Args:
+        method: The inference method's name, a key of `METHODS`.
+        config: The comparison's settings.
+        point_epochs: Epochs the staged model's mean and variance stages ran
+            together for the same seed.
+
+    Returns:
+        A fresh inference method.
+    """
+    if method == PSGLD:
+        return psgld(config, preceding_epochs=point_epochs)
+    return METHODS[method](config)

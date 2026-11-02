@@ -32,7 +32,14 @@ _TINY_FLAGS = (
     "3",
 )
 _NUMBER = r"\d+\.\d+"
-_STAGED_NAMES = ["staged BBB", "staged MCD", "staged pSGLD"]
+_CONFIGURATION_NAMES = [
+    "joint BBB",
+    "joint MCD",
+    "joint pSGLD",
+    "staged BBB",
+    "staged MCD",
+    "staged pSGLD",
+]
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +73,7 @@ def test_compare_groups_joint_and_staged_results_per_seed(
     assert [result.seed for result in results] == [3, 4]
     for result in results:
         names = [configuration.name for configuration in result.configurations]
-        assert names == ["joint BBB", *_STAGED_NAMES]
+        assert names == _CONFIGURATION_NAMES
         for configuration in result.configurations:
             # pSGLD retains exactly num_draws samples, like the others draw.
             means = configuration.draws.means
@@ -98,10 +105,63 @@ def test_joint_runs_get_the_staged_runs_total_epochs(
 
     (result,) = clustered_compare.compare(data, tiny_clustered_config, seeds=1)
 
-    assert budgets
+    assert len(budgets) == 3
     # Mean and variance stages run 3 epochs each, the posterior stage 2.
     assert all(budget == 3 + 3 + 2 for budget in budgets)
     assert result.point_epochs == 6
+
+
+def test_joint_runs_share_each_methods_hyperparameters_and_draw_schedule(
+    clustered_compare: ModuleType,
+    clustered_dataset: ModuleType,
+    tiny_clustered_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    joint_runs: dict[str, Any] = {}
+    staged_runs: dict[str, Any] = {}
+    run_joint, run_staged = clustered_compare.run_joint, clustered_compare.run_staged
+
+    def recording_run_joint(data: Any, config: Any, method: Any, **kwargs: Any) -> Any:
+        draws = run_joint(data, config, method, **kwargs)
+        joint_runs[type(method).__name__] = (method, kwargs["network"])
+        return draws
+
+    def recording_run_staged(*args: Any, **kwargs: Any) -> Any:
+        draws = run_staged(*args, **kwargs)
+        staged_runs[type(args[3]).__name__] = (args[3], kwargs["network"])
+        return draws
+
+    monkeypatch.setattr(clustered_compare, "run_joint", recording_run_joint)
+    monkeypatch.setattr(clustered_compare, "run_staged", recording_run_staged)
+    data = clustered_dataset.make_clustered_data(tiny_clustered_config)
+
+    (result,) = clustered_compare.compare(data, tiny_clustered_config, seeds=1)
+
+    assert (
+        set(joint_runs)
+        == set(staged_runs)
+        == {
+            "BayesByBackprop",
+            "MCDropout",
+            "PreconditionedSGLD",
+        }
+    )
+    for name, (_, joint_network) in joint_runs.items():
+        staged_network = staged_runs[name][1]
+        joint_rates = [dropout.rate for dropout in joint_network.trunk.dropouts]
+        staged_rates = [dropout.rate for dropout in staged_network.trunk.dropouts]
+        assert joint_rates == staged_rates
+    assert joint_runs["MCDropout"][1].trunk.dropouts[0].rate == 0.1
+    joint_psgld, staged_psgld = (
+        joint_runs["PreconditionedSGLD"][0],
+        staged_runs["PreconditionedSGLD"][0],
+    )
+    steps_per_epoch = tiny_clustered_config.steps_per_epoch
+    assert joint_psgld.burn_in == (
+        staged_psgld.burn_in + result.point_epochs * steps_per_epoch
+    )
+    assert joint_psgld.thinning == staged_psgld.thinning
+    assert joint_psgld.step_size == staged_psgld.step_size
 
 
 def test_main_prints_a_row_per_configuration_with_every_region(
@@ -118,7 +178,7 @@ def test_main_prints_a_row_per_configuration_with_every_region(
     title = next(i for i, line in enumerate(lines) if line.startswith("Clustered"))
     header, *rows = lines[title + 1 :]
     assert header.split()[:3] == ["ID", "RMSE", "ID"]
-    assert [row.split("  ")[0] for row in rows] == ["joint BBB", *_STAGED_NAMES]
+    assert [row.split("  ")[0] for row in rows] == _CONFIGURATION_NAMES
     for row in rows:
         cells = re.findall(_NUMBER, row)
         assert len(cells) == 1 + 3 * len(clustered_regions.REGIONS)
@@ -234,16 +294,9 @@ def test_main_draws_every_configuration_run_in_both_figures(
 
     ((grid, calibration),) = drawn
     titles_with_lines = {axes.get_title() for axes in grid.axes if axes.lines}
-    assert titles_with_lines == {
-        "joint BBB",
-        "staged BBB",
-        "staged MCD",
-        "staged pSGLD",
-    }
-    joint, staged = calibration.axes
-    assert joint.lines
-    # One curve per staged method, plus the diagonal.
-    assert len(staged.lines) == 4
+    assert titles_with_lines == set(_CONFIGURATION_NAMES)
+    # One curve per method, plus the diagonal, in both trainings' panels.
+    assert [len(axes.lines) for axes in calibration.axes] == [4, 4]
 
 
 def test_main_shows_the_figures_without_a_plot_path(

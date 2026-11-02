@@ -120,3 +120,40 @@ class GammaNetwork(nnx.Module):
             The Gamma distribution, whose mean is the aleatoric variance.
         """
         return self.head(self.trunk(inputs))
+
+
+VARIANCE_FLOOR = 1e-6
+"""Smallest variance the joint network's variance head predicts."""
+
+
+class JointNetwork(nnx.Module):
+    """The trunk with a mean head and a variance head: the joint model's network."""
+
+    def __init__(self, *, dropout_rate: float = 0.0, rngs: nnx.Rngs) -> None:
+        """Build the network.
+
+        Args:
+            dropout_rate: The trunk's dropout rate.
+            rngs: Randomness for the weights and the dropout masks.
+        """
+        self.trunk = Trunk(dropout_rate=dropout_rate, rngs=rngs)
+        self.mean_head = nnx.Linear(HIDDEN_FEATURES, 1, rngs=rngs)
+        self.variance_head = nnx.Linear(HIDDEN_FEATURES, 1, rngs=rngs)
+
+    def __call__(
+        self, inputs: jax.Array, *, dropout_key: jax.Array | None = None
+    ) -> jax.Array:
+        """Predict the mean and the aleatoric variance.
+
+        Args:
+            inputs: Inputs, shape `[B, 1]`.
+            dropout_key: Key the trunk's dropout masks are drawn from; `None`
+                draws them from the trunk's own stream.
+
+        Returns:
+            Means and variances stacked on the last axis, shape `[B, 2]`. The
+            variance is a softplus plus `VARIANCE_FLOOR`.
+        """
+        hidden = self.trunk(inputs, dropout_key=dropout_key)
+        variance = jax.nn.softplus(self.variance_head(hidden)) + VARIANCE_FLOOR
+        return jnp.concatenate([self.mean_head(hidden), variance], axis=-1)

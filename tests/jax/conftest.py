@@ -527,9 +527,17 @@ def clustered_scoring() -> ModuleType:
 @pytest.fixture(scope="session")
 def clustered_compare() -> ModuleType:
     """The clustered-data example's comparison entry point."""
-    for dependency in ("jax", "jax.numpy", "flax.nnx", "optax"):
+    for dependency in ("jax", "jax.numpy", "flax.nnx", "optax", "matplotlib"):
         pytest.importorskip(dependency)
     return _import_clustered_data_module("compare")
+
+
+@pytest.fixture(scope="session")
+def clustered_figures() -> ModuleType:
+    """The clustered-data example's uncertainty grid and calibration figures."""
+    for dependency in ("jax", "matplotlib"):
+        pytest.importorskip(dependency)
+    return _import_clustered_data_module("figures")
 
 
 @pytest.fixture(scope="session")

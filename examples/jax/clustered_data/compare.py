@@ -15,9 +15,14 @@ reports the in-distribution RMSE of the predictive mean, then each region's
 aleatoric sigma, epistemic sigma and 95% coverage of the predictive
 mixture's central interval.
 
+It then draws the first seed's configurations twice: a grid of predictive
+bands and the calibration curves in the extrapolation region (see
+`figures.py`). Both are shown on screen, or saved into the `--plot-path`
+directory instead.
+
 Run it with:
 
-    uv run --extra jax python examples/jax/clustered_data/compare.py
+    uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py
 
 Pass `--seeds N` to repeat the whole comparison over seeds `--seed` to
 `--seed + N - 1` on the same data; the table then reports each cell as
@@ -43,6 +48,7 @@ if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
 from clustered import ClusteredData, ClusteredDataConfig, make_clustered_data
+from figures import draw_figures
 from methods import METHODS
 from regions import EXTRAPOLATION, GAP, IN_DISTRIBUTION, REGIONS, region_masks
 from scoring import PredictiveDraws, Scores, score
@@ -291,7 +297,8 @@ _FLAG_HELP: dict[str, str] = {
 
 
 def _parser() -> argparse.ArgumentParser:
-    """Build the command line: one flag per `ClusteredDataConfig` field."""
+    """Build the command line: one flag per `ClusteredDataConfig` field, and
+    `--seeds` and `--plot-path`."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -312,16 +319,26 @@ def _parser() -> argparse.ArgumentParser:
             "(default: 1)."
         ),
     )
+    parser.add_argument(
+        "--plot-path",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to save both figures into, created if needed, instead of "
+            "showing them."
+        ),
+    )
     return parser
 
 
 def main() -> None:
-    """Run the comparison from the command line and print its table."""
+    """Run the comparison from the command line, print its table and draw it."""
     parser = _parser()
     arguments = vars(parser.parse_args())
     seeds = arguments.pop("seeds")
     if seeds <= 0:
         parser.error("--seeds must be positive.")
+    plot_path: Path | None = arguments.pop("plot_path")
     try:
         config = ClusteredDataConfig(**arguments)
     except ValueError as error:
@@ -334,6 +351,7 @@ def main() -> None:
         last = config.seed + seeds - 1
         print(f"\nClustered data, seeds {config.seed}-{last} (mean ± std):")
     print(format_table(results))
+    draw_figures(results[0].configurations, data, plot_path=plot_path)
 
 
 if __name__ == "__main__":

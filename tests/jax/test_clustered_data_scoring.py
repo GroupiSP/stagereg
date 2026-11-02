@@ -178,3 +178,50 @@ def test_score_reports_rmse_on_the_in_distribution_region_only(
     scores = clustered_scoring.score(draws, targets, grid_masks)
 
     assert scores.rmse == pytest.approx(2.0)
+
+
+@settings(deadline=None, max_examples=5)
+@given(seed=st.integers(min_value=0, max_value=2**16))
+def test_calibration_curve_follows_the_diagonal_when_targets_come_from_the_predictive(
+    clustered_scoring: ModuleType, seed: int
+) -> None:
+    rng = np.random.default_rng(seed)
+    means = rng.normal(size=(5, 20_000))
+    variances = rng.uniform(0.1, 2.0, size=(5, 20_000))
+    targets = _mixture_samples(rng, means, variances)
+    draws = clustered_scoring.PredictiveDraws(
+        means=jnp.asarray(means), variances=jnp.asarray(variances)
+    )
+    levels = clustered_scoring.CALIBRATION_LEVELS
+
+    curve = clustered_scoring.calibration_curve(draws, jnp.asarray(targets), levels)
+
+    assert np.asarray(curve) == pytest.approx(np.asarray(levels), abs=0.02)
+
+
+def test_calibration_levels_run_from_5_to_95_percent_in_steps_of_5(
+    clustered_scoring: ModuleType,
+) -> None:
+    levels = clustered_scoring.CALIBRATION_LEVELS
+
+    assert np.asarray(levels) == pytest.approx(np.arange(1, 20) / 20)
+
+
+def test_calibration_curve_counts_only_the_masked_points(
+    clustered_scoring: ModuleType,
+) -> None:
+    # The masked half sits at the predictive's mean, so every interval covers
+    # it; the other half lies far outside every interval.
+    targets = jnp.concatenate([jnp.zeros(50), jnp.full(50, 100.0)])
+    draws = clustered_scoring.PredictiveDraws(
+        means=jnp.zeros((_NUM_DRAWS, 100)), variances=jnp.ones((_NUM_DRAWS, 100))
+    )
+    where = jnp.arange(100) < 50
+
+    masked = clustered_scoring.calibration_curve(
+        draws, targets, (0.1, 0.5), where=where
+    )
+    unmasked = clustered_scoring.calibration_curve(draws, targets, (0.1, 0.5))
+
+    assert np.asarray(masked) == pytest.approx([1.0, 1.0])
+    assert np.asarray(unmasked) == pytest.approx([0.5, 0.5])

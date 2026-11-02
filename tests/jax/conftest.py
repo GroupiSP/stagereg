@@ -530,3 +530,10 @@ def clustered_compare() -> ModuleType:
     for dependency in ("jax", "jax.numpy", "flax.nnx", "optax"):
         pytest.importorskip(dependency)
     return _import_clustered_data_module("compare")
+
+
+@pytest.fixture(scope="session")
+def clustered_dataset() -> ModuleType:
+    """The clustered-data example's configuration, data and loader."""
+    pytest.importorskip("jax")
+    return _import_clustered_data_module("clustered")

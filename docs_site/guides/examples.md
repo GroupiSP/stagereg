@@ -149,8 +149,12 @@ README:
 How confident the joint and staged models are inside the training data and
 away from it, on the "Simulate data" set of the UvA DL2 Bayesian neural
 network tutorial 1: two clusters of 500 points on `[-0.2, 0.2]` and `[0.6, 1.0]` (seed 42) with a
-sum-of-sines target and noise σ = 0.02. Every model shares one Tanh MLP
-backbone of 5 hidden layers of 10 units.
+sum-of-sines target and noise σ = 0.02. The noise also enters the sines'
+arguments, so the targets scatter about the noise-free curve by about 0.075
+(RMS) inside the clusters: no mean can reach an in-distribution RMSE much
+below that. Every model shares one Tanh MLP backbone of 5 hidden layers of 10
+units, which first maps the training inputs' range `[-0.2, 1.0]` onto
+`[-1, 1]` with a fixed affine map.
 
 ```bash
 uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py
@@ -197,6 +201,16 @@ predictive mean, then for each region the aleatoric σ (square root of the
 region average of the draw-averaged variance), the epistemic σ (square root of
 the region average of the variance of the means over draws) and the 95%
 coverage of the mixture's exact central interval.
+
+The staged rows' extrapolation σ_ale can be very large, hundreds at the
+default seed. The Gamma variance network predicts the variance as
+concentration / rate, and nothing in the training data constrains its rate
+beyond the clusters. Past about `x = 1.3` the rate can fall onto the Gamma
+head's 1e-6 floor, so the predicted σ there grows to the hundreds. The
+region's aleatoric σ is the square root of the region average of the
+variance, so those few points dominate it, although the median σ over the
+region stays near 0.2. The example reports the number as is, and does not
+clip it.
 
 `--seeds N` (default 1) repeats the whole comparison over seeds `--seed` to
 `--seed + N - 1`. The training data and the grid stay fixed, so only the

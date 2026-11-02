@@ -185,7 +185,7 @@ model of the same seed: its mean-stage, variance-stage and posterior epochs
 together. Joint pSGLD burns in the mean-stage and variance-stage epochs as
 well, so its 100 draws fall in the same final 1,000 epochs as the staged
 run's. Each joint draw carries its own mean and variance. The six
-configurations take several minutes at the defaults on a laptop CPU.
+configurations take a few minutes at the defaults on a laptop CPU.
 
 It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn from a different seed, split into the glossary's

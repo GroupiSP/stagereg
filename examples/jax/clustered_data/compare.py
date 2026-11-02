@@ -19,7 +19,10 @@ Run it with:
 
     uv run --extra jax python examples/jax/clustered_data/compare.py
 
-Every setting is a flag; `--help` lists them with their defaults.
+Pass `--seeds N` to repeat the whole comparison over seeds `--seed` to
+`--seed + N - 1` on the same data; the table then reports each cell as
+mean ± std over seeds. Every setting is a flag; `--help` lists them with
+their defaults.
 """
 
 from __future__ import annotations
@@ -271,7 +274,7 @@ _FLAG_HELP: dict[str, str] = {
     "mc_dropout_rate": "Dropout rate of the backbone under MC dropout",
     "mc_dropout_learning_rate": "Adam learning rate of MC dropout",
     "psgld_step_size": "Langevin step size of pSGLD",
-    "seed": "Seed of the initialization, batch order and draws",
+    "seed": "Seed of the initialization, batch order and draws; the first seed",
 }
 """Each `ClusteredDataConfig` field's command-line help."""
 
@@ -289,6 +292,15 @@ def _parser() -> argparse.ArgumentParser:
             default=default,
             help=f"{_FLAG_HELP[field.name]} (default: {default}).",
         )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=1,
+        help=(
+            "Number of seeds to repeat the comparison over, from --seed up "
+            "(default: 1)."
+        ),
+    )
     return parser
 
 
@@ -296,13 +308,20 @@ def main() -> None:
     """Run the comparison from the command line and print its table."""
     parser = _parser()
     arguments = vars(parser.parse_args())
+    seeds = arguments.pop("seeds")
+    if seeds <= 0:
+        parser.error("--seeds must be positive.")
     try:
         config = ClusteredDataConfig(**arguments)
     except ValueError as error:
         parser.error(str(error))
     data = make_clustered_data(config)
-    results = compare(data, config, seeds=1, on_run=print_run)
-    print(f"\nClustered data, seed {config.seed}:")
+    results = compare(data, config, seeds=seeds, on_run=print_run)
+    if seeds == 1:
+        print(f"\nClustered data, seed {config.seed}:")
+    else:
+        last = config.seed + seeds - 1
+        print(f"\nClustered data, seeds {config.seed}-{last} (mean ± std):")
     print(format_table(results))
 
 

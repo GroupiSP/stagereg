@@ -173,8 +173,7 @@ The three runs differ only in the inference method and the dropout rate; the
 architecture, prior, batch size and epochs are shared. pSGLD's burn-in and
 thinning count update steps: at the defaults it burns in the first 10,000 of
 its 20,000 steps and keeps every 100th step after them, the last one included.
-At the defaults the three runs take about two and a half minutes on a laptop
-CPU.
+At the defaults one seed takes about two and a half minutes on a laptop CPU.
 
 It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn from a different seed, split into the glossary's
@@ -186,6 +185,15 @@ predictive mean, then for each region the aleatoric σ (square root of the
 region average of the draw-averaged variance), the epistemic σ (square root of
 the region average of the variance of the means over draws) and the 95%
 coverage of the mixture's exact central interval.
+
+`--seeds N` (default 1) repeats the whole comparison over seeds `--seed` to
+`--seed + N - 1`. The training data and the grid stay fixed, so only the
+initialization, the batch order and the draws vary. With more than one seed,
+every table cell reports `mean ± std` over seeds:
+
+```bash
+uv run --extra jax python examples/jax/clustered_data/compare.py --seeds 5
+```
 
 Every setting is a flag, `--noise-std` among them; `--help` lists them with
 their defaults. A quick run at small settings:

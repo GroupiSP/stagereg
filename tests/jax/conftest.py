@@ -545,3 +545,19 @@ def clustered_staged() -> ModuleType:
     for dependency in ("jax", "jax.numpy", "flax.nnx", "optax"):
         pytest.importorskip(dependency)
     return _import_clustered_data_module("staged")
+
+
+@pytest.fixture(scope="session")
+def clustered_joint() -> ModuleType:
+    """The clustered-data example's joint posterior."""
+    for dependency in ("jax", "jax.numpy", "flax.nnx", "optax"):
+        pytest.importorskip(dependency)
+    return _import_clustered_data_module("joint")
+
+
+@pytest.fixture(scope="session")
+def clustered_methods() -> ModuleType:
+    """The clustered-data example's inference methods."""
+    for dependency in ("jax", "jax.numpy", "flax.nnx", "optax"):
+        pytest.importorskip(dependency)
+    return _import_clustered_data_module("methods")

@@ -6,6 +6,8 @@ from a random initialization, under the network's own predicted variance.
 
 from __future__ import annotations
 
+import dataclasses
+
 from collections.abc import Mapping
 from types import ModuleType
 from typing import Any
@@ -156,21 +158,37 @@ def test_log_likelihood_is_the_scaled_gaussian_under_the_variance_head(
     assert bool(jnp.all(variance >= 1e-6))
 
 
-@settings(deadline=None, max_examples=25)
-@given(point_epochs=st.integers(min_value=0, max_value=2_000))
-def test_joint_psgld_burns_in_the_staged_point_epochs_too(
-    clustered_methods: ModuleType, tiny_clustered_config: Any, point_epochs: int
+def test_joint_psgld_spreads_its_draws_over_the_final_half_of_the_mean_epochs(
+    clustered_methods: ModuleType, tiny_clustered_config: Any
 ) -> None:
-    staged = clustered_methods.METHODS[clustered_methods.PSGLD](tiny_clustered_config)
+    config = dataclasses.replace(tiny_clustered_config, mean_epochs=8)
+    staged = clustered_methods.METHODS[clustered_methods.PSGLD](config)
 
-    joint = clustered_methods.joint_method(
-        clustered_methods.PSGLD, tiny_clustered_config, point_epochs=point_epochs
-    )
+    joint = clustered_methods.joint_method(clustered_methods.PSGLD, config)
 
-    steps_per_epoch = tiny_clustered_config.steps_per_epoch
-    assert joint.burn_in == staged.burn_in + point_epochs * steps_per_epoch
-    assert joint.thinning == staged.thinning
+    # 8 epochs of 10 steps: the final 40 steps hold 4 draws, 10 steps apart.
+    assert (joint.burn_in, joint.thinning) == (40, 10)
+    # 2 posterior epochs of 10 steps: the final 10 steps hold 4 draws.
+    assert (staged.burn_in, staged.thinning) == (12, 2)
     assert joint.step_size == staged.step_size
+
+
+@settings(deadline=None, max_examples=25)
+@given(mean_epochs=st.integers(min_value=1, max_value=2_000))
+def test_joint_psgld_draws_end_at_the_last_step_of_the_mean_epochs(
+    clustered_methods: ModuleType, tiny_clustered_config: Any, mean_epochs: int
+) -> None:
+    try:
+        config = dataclasses.replace(tiny_clustered_config, mean_epochs=mean_epochs)
+    except ValueError:
+        return  # too few steps in the final half for the draws
+
+    joint = clustered_methods.joint_method(clustered_methods.PSGLD, config)
+
+    steps = config.steps_per_epoch
+    last_draw = joint.burn_in + config.num_draws * joint.thinning
+    assert last_draw == mean_epochs * steps
+    assert joint.burn_in + joint.thinning > mean_epochs // 2 * steps
 
 
 @pytest.mark.parametrize("name", ["BBB", "MCD"])
@@ -179,37 +197,31 @@ def test_joint_bbb_and_mcd_are_built_as_their_staged_counterparts(
 ) -> None:
     staged = clustered_methods.METHODS[name](tiny_clustered_config)
 
-    joint = clustered_methods.joint_method(name, tiny_clustered_config, point_epochs=6)
+    joint = clustered_methods.joint_method(name, tiny_clustered_config)
 
     assert type(joint) is type(staged)
     if name == "BBB":
         assert joint.initial_std == staged.initial_std
 
 
-def test_joint_psgld_retains_num_draws_over_the_final_posterior_epochs(
+def test_joint_psgld_retains_num_draws_over_the_final_half_of_its_run(
     clustered_joint: ModuleType,
     clustered_methods: ModuleType,
     clustered_data: Any,
     tiny_clustered_config: Any,
 ) -> None:
-    point_epochs, posterior_epochs = 1, 2
-    config = tiny_clustered_config.__class__(
-        posterior_epochs=posterior_epochs, num_draws=4, seed=3
-    )
     method = clustered_methods.joint_method(
-        clustered_methods.PSGLD, config, point_epochs=point_epochs
+        clustered_methods.PSGLD, tiny_clustered_config
     )
 
     draws = clustered_joint.run_joint(
-        clustered_data, config, method, epochs=point_epochs + posterior_epochs
+        clustered_data, tiny_clustered_config, method, epochs=3
     )
 
     assert draws.means.shape == (4, clustered_data.grid_inputs.shape[0])
-    total_steps = (point_epochs + posterior_epochs) * config.steps_per_epoch
-    first_draw = method.burn_in + method.thinning
-    # Every draw falls in the final half of the posterior epochs.
-    assert first_draw > (point_epochs + posterior_epochs // 2) * config.steps_per_epoch
-    assert method.burn_in + 4 * method.thinning == total_steps
+    # 3 epochs of 10 steps: every draw falls after step 10 and the last at 30.
+    assert method.burn_in + method.thinning > 10
+    assert method.burn_in + 4 * method.thinning == 30
 
 
 def test_joint_mc_dropout_draws_one_dropout_mask_per_draw(

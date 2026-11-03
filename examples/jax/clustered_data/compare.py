@@ -8,9 +8,10 @@ stage, with Bayes by Backprop, MC dropout and pSGLD. The three differ only
 in the inference method and the backbone's dropout rate, which is non-zero
 for MC dropout alone. It also infers the joint posterior with the same three
 methods and hyperparameters, on the same backbone: one network with a mean
-head and a variance head, from a random initialization, for the staged
-model's total epochs. Joint pSGLD burns in the staged model's mean and
-variance epochs too, so both pSGLD runs draw over the same final epochs.
+head and a variance head, from a random initialization, for as many epochs
+as the staged model's mean stage. The variance and posterior stages have
+budgets of their own, and no stage or run stops early. Every pSGLD run
+draws over the final half of its own epochs.
 
 Each configuration is reduced to per-draw predictive means and variances
 on the grid and scored on the in-distribution region, the gap region
@@ -95,14 +96,10 @@ class SeedComparison:
 
     Attributes:
         seed: The seed the configurations were trained from.
-        point_epochs: Epochs the staged model's mean and variance stages ran
-            together. Every joint run of the seed ran these plus the
-            posterior epochs.
         configurations: Each configuration's result, in table order.
     """
 
     seed: int
-    point_epochs: int
     configurations: tuple[ConfigurationResult, ...]
 
 
@@ -123,9 +120,8 @@ def compare_seed(
 ) -> SeedComparison:
     """Train and score every configuration from `config.seed`, silently.
 
-    The staged model's mean and variance stages train first: every joint run
-    reads its epoch budget from them, then the joint rows precede the staged
-    ones.
+    Every joint run trains `config.mean_epochs`, as the staged model's mean
+    stage does. The joint rows precede the staged ones.
 
     Args:
         data: The training set and the evaluation grid.
@@ -137,7 +133,6 @@ def compare_seed(
     """
     masks = region_masks(data.grid_inputs)
     supervised = train_supervised_stages(data, config)
-    joint_epochs = supervised.point_epochs + config.posterior_epochs
 
     def run(training: str, method: str) -> PredictiveDraws:
         rate = dropout_rate(method, config)
@@ -145,8 +140,8 @@ def compare_seed(
             return run_joint(
                 data,
                 config,
-                joint_method(method, config, point_epochs=supervised.point_epochs),
-                epochs=joint_epochs,
+                joint_method(method, config),
+                epochs=config.mean_epochs,
                 network=joint_network(config, dropout_rate=rate),
             )
         return run_staged(
@@ -171,7 +166,6 @@ def compare_seed(
             configurations.append(result)
     return SeedComparison(
         seed=config.seed,
-        point_epochs=supervised.point_epochs,
         configurations=tuple(configurations),
     )
 
@@ -290,11 +284,9 @@ _FLAG_HELP: dict[str, str] = {
     "noise_std": "Standard deviation of the target noise",
     "batch_size": "Training points per batch",
     "learning_rate": "Adam learning rate of the mean and variance stages",
-    "mean_epochs": "Maximum mean-stage epochs",
-    "mean_patience": "Mean-stage early-stopping patience, in epochs",
-    "variance_epochs": "Maximum variance-stage epochs",
-    "variance_patience": "Variance-stage early-stopping patience, in epochs",
-    "posterior_epochs": "Fixed posterior-stage epochs",
+    "mean_epochs": "Mean-stage epochs, and every joint run's epochs",
+    "variance_epochs": "Variance-stage epochs",
+    "posterior_epochs": "Posterior-stage epochs",
     "num_draws": "Posterior draws to score",
     "prior_precision": "Precision of the isotropic Gaussian prior",
     "bbb_learning_rate": "Adam learning rate of Bayes by Backprop",

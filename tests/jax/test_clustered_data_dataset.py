@@ -66,6 +66,8 @@ def test_grid_targets_carry_fresh_noise(clustered_dataset: ModuleType) -> None:
     [
         {"noise_std": -0.1},
         {"batch_size": 0},
+        {"mean_epochs": 0},
+        {"variance_epochs": 0},
         {"posterior_epochs": 0},
         {"num_draws": 0},
         {"prior_precision": 0.0},
@@ -75,6 +77,8 @@ def test_grid_targets_carry_fresh_noise(clustered_dataset: ModuleType) -> None:
         {"psgld_step_size": 0.0},
         # The final posterior epoch's 10 steps cannot hold 11 draws.
         {"posterior_epochs": 1, "num_draws": 11},
+        # Nor can the joint run's final mean epoch.
+        {"mean_epochs": 1, "num_draws": 11},
     ],
 )
 def test_config_rejects_invalid_settings(
@@ -107,49 +111,48 @@ def test_psgld_schedule_spreads_the_draws_over_the_final_half_at_the_defaults(
 ) -> None:
     config = clustered_dataset.ClusteredDataConfig()
 
-    staged = config.psgld_schedule()
-    joint = config.psgld_schedule(preceding_epochs=400)
+    staged = config.psgld_schedule(config.posterior_epochs)
+    joint = config.psgld_schedule(config.mean_epochs)
 
     # 2,000 posterior epochs of 10 steps: the final 10,000 steps hold 100 draws.
     assert (staged.burn_in, staged.thinning) == (10_000, 100)
-    assert (joint.burn_in, joint.thinning) == (14_000, 100)
+    # 3,000 joint epochs of 10 steps: the final 15,000 steps hold 100 draws.
+    assert (joint.burn_in, joint.thinning) == (15_000, 150)
 
 
 @settings(deadline=None, max_examples=50)
 @given(
-    posterior_epochs=st.integers(min_value=1, max_value=60),
+    epochs=st.integers(min_value=1, max_value=60),
     batch_size=st.sampled_from([50, 100, 300, 1000]),
     num_draws=st.integers(min_value=1, max_value=40),
-    preceding_epochs=st.integers(min_value=0, max_value=30),
 )
-def test_psgld_schedule_retains_every_draw_in_the_final_half_of_the_posterior_epochs(
+def test_psgld_schedule_retains_every_draw_in_the_final_half_of_the_run(
     clustered_dataset: ModuleType,
-    posterior_epochs: int,
+    epochs: int,
     batch_size: int,
     num_draws: int,
-    preceding_epochs: int,
 ) -> None:
     try:
         config = clustered_dataset.ClusteredDataConfig(
-            posterior_epochs=posterior_epochs,
             batch_size=batch_size,
             num_draws=num_draws,
+            mean_epochs=epochs,
+            posterior_epochs=epochs,
         )
     except ValueError:
         return  # too few steps in the final half for the draws
-    schedule = config.psgld_schedule(preceding_epochs=preceding_epochs)
+    schedule = config.psgld_schedule(epochs)
 
     # pSGLD retains the position after step t when t = burn_in + k * thinning, k >= 1.
     steps = config.steps_per_epoch
-    total = (preceding_epochs + posterior_epochs) * steps
+    total = epochs * steps
     retained = [
         t
         for t in range(1, total + 1)
         if t > schedule.burn_in and (t - schedule.burn_in) % schedule.thinning == 0
     ]
-    final_half_start = (preceding_epochs + posterior_epochs // 2) * steps
     assert len(retained) == num_draws
-    assert retained[0] > final_half_start
+    assert retained[0] > epochs // 2 * steps
     assert retained[-1] == total
 
 

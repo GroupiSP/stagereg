@@ -2,9 +2,9 @@
 
 A mean stage, then a Gamma variance stage on its squared residuals, then the library's
 posterior stage over the mean network: one outer pass, as in the xsin example. The mean
-and variance stages are trained once per seed, early-stopped on their training loss, and
-shared by every inference method's posterior stage; the posterior stage runs a fixed
-number of epochs.
+and variance stages are trained once per seed and shared by every inference method's
+posterior stage. Every stage runs a fixed number of epochs, without early stopping: the
+mean stage as many as a joint run, the variance and posterior stages their own budgets.
 """
 
 from __future__ import annotations
@@ -28,8 +28,6 @@ from methods import draw_on_grid
 from networks import GammaNetwork, MeanNetwork
 from scoring import PredictiveDraws
 
-from stagereg.core import EarlyStopper, InMemoryCheckpointStore
-from stagereg.core.tracking import TrainingEvent
 from stagereg.core.types import TrainingState
 from stagereg.jax import (
     GammaVarianceStage,
@@ -43,30 +41,6 @@ from stagereg.jax import (
 )
 
 
-class _EpochCounter:
-    """An event sink counting the training epochs a stage runs.
-
-    A stage that restores its best epoch also rolls its metric history back
-    to that epoch, so the history undercounts the epochs actually trained.
-
-    Attributes:
-        epochs: Training epochs completed so far.
-    """
-
-    def __init__(self) -> None:
-        """Start counting from zero."""
-        self.epochs = 0
-
-    def on_event(self, event: TrainingEvent) -> None:
-        """Count one epoch at the end of each training epoch.
-
-        Args:
-            event: The training event.
-        """
-        if event.name == "epoch_end" and event.split == "train":
-            self.epochs += 1
-
-
 @dataclass(frozen=True)
 class SupervisedStages:
     """The trained mean and variance stages of one seed.
@@ -76,29 +50,11 @@ class SupervisedStages:
             posterior stage. Fork it before running one.
         mean_model: The trained mean network.
         variance_model: The trained Gamma variance network.
-        point_epochs: Epochs the mean and variance stages actually ran,
-            together. A joint run of the same seed adds them to its
-            posterior epochs, so both trainings get the same budget.
     """
 
     state: TrainingState
     mean_model: MeanNetwork
     variance_model: GammaNetwork
-    point_epochs: int
-
-
-def _early_stopped(
-    epochs: int, patience: int, counter: _EpochCounter
-) -> SupervisedStageOptions:
-    """Options that stop on a stalled training loss and restore its best epoch."""
-    return SupervisedStageOptions(
-        epochs=epochs,
-        event_sinks=(counter,),
-        early_stopper=EarlyStopper(
-            metric="loss", mode="min", patience=patience, source="train"
-        ),
-        checkpoint_store=InMemoryCheckpointStore(),
-    )
 
 
 def train_supervised_stages(
@@ -106,27 +62,28 @@ def train_supervised_stages(
 ) -> SupervisedStages:
     """Train the mean stage, then the Gamma variance stage, silently.
 
+    Each runs its full `mean_epochs` or `variance_epochs`.
+
     Args:
         data: The training set to fit.
         config: The comparison's settings; `seed` sets the initialization
             and the batch order.
 
     Returns:
-        The trained stages and the epochs they ran.
+        The trained stages.
     """
     mean_key, variance_key, train_key = jax.random.split(
         seed_key(config, SUPERVISED_STREAM), 3
     )
     loader = make_loader(data, config)
     state = TrainingState(rng_state=train_key)
-    counter = _EpochCounter()
 
     mean_model = MeanNetwork(rngs=nnx.Rngs(mean_key))
     mean_stage = MeanStage(
         model=mean_model,
         optimizer=create_optimizer(mean_model, optax.adam(config.learning_rate)),
         train_loader=loader,
-        options=_early_stopped(config.mean_epochs, config.mean_patience, counter),
+        options=SupervisedStageOptions(epochs=config.mean_epochs),
     )
     mean_stage.prepare(state)
     mean_stage.train(state)
@@ -136,9 +93,7 @@ def train_supervised_stages(
         model=variance_model,
         optimizer=create_optimizer(variance_model, optax.adam(config.learning_rate)),
         source_loader=loader,
-        options=_early_stopped(
-            config.variance_epochs, config.variance_patience, counter
-        ),
+        options=SupervisedStageOptions(epochs=config.variance_epochs),
         splits=("train",),
     )
     variance_stage.prepare(state)
@@ -148,7 +103,6 @@ def train_supervised_stages(
         state=state,
         mean_model=mean_model,
         variance_model=variance_model,
-        point_epochs=counter.epochs,
     )
 
 

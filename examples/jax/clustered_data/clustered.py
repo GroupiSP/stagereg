@@ -87,13 +87,11 @@ class ClusteredDataConfig:
             grid targets alike.
         batch_size: Number of training points per batch.
         learning_rate: Adam learning rate of the mean and variance stages.
-        mean_epochs: Maximum number of mean-stage epochs.
-        mean_patience: Epochs without a lower training loss before the
-            mean stage stops early and restores its best epoch.
-        variance_epochs: Maximum number of variance-stage epochs.
-        variance_patience: Epochs without a lower training loss before the
-            variance stage stops early and restores its best epoch.
-        posterior_epochs: Fixed number of posterior-stage epochs.
+        mean_epochs: Number of mean-stage epochs, and of every joint run's
+            epochs: the joint network trains as long as the staged model's
+            mean network.
+        variance_epochs: Number of variance-stage epochs.
+        posterior_epochs: Number of posterior-stage epochs.
         num_draws: Number of posterior draws every configuration is scored
             on.
         prior_precision: Precision of the isotropic Gaussian prior over the
@@ -112,9 +110,7 @@ class ClusteredDataConfig:
     batch_size: int = 100
     learning_rate: float = 1e-3
     mean_epochs: int = 3_000
-    mean_patience: int = 100
     variance_epochs: int = 3_000
-    variance_patience: int = 100
     posterior_epochs: int = 2_000
     num_draws: int = 100
     prior_precision: float = 1.0
@@ -129,11 +125,11 @@ class ClusteredDataConfig:
         """Validate the settings.
 
         Raises:
-            ValueError: If a count is not positive, a patience is negative,
-                a scale or rate is not finite and positive (the noise level
-                may be zero), the dropout rate is not in `(0, 1)`, or the
-                final half of the posterior epochs has fewer update steps
-                than `num_draws`.
+            ValueError: If a count is not positive, a scale or rate is not
+                finite and positive (the noise level may be zero), the
+                dropout rate is not in `(0, 1)`, or the final half of the
+                posterior epochs or of the joint run's epochs has fewer
+                update steps than `num_draws`.
         """
         counts = {
             "batch_size": self.batch_size,
@@ -145,9 +141,6 @@ class ClusteredDataConfig:
         for name, value in counts.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}.")
-        for name in ("mean_patience", "variance_patience"):
-            if getattr(self, name) < 0:
-                raise ValueError(f"{name} must be non-negative.")
         if not isfinite(self.noise_std) or self.noise_std < 0:
             raise ValueError("noise_std must be finite and non-negative.")
         rates = {
@@ -165,7 +158,8 @@ class ClusteredDataConfig:
             raise ValueError(
                 f"mc_dropout_rate must lie in (0, 1), got {self.mc_dropout_rate}."
             )
-        self.psgld_schedule()
+        self.psgld_schedule(self.posterior_epochs)
+        self.psgld_schedule(self.mean_epochs)
 
     @property
     def train_size(self) -> int:
@@ -177,36 +171,33 @@ class ClusteredDataConfig:
         """Number of update steps (batches) per epoch."""
         return ceil(self.train_size / self.batch_size)
 
-    def psgld_schedule(self, *, preceding_epochs: int = 0) -> PsgldSchedule:
-        """Place pSGLD's draws evenly over the final half of the posterior epochs.
+    def psgld_schedule(self, epochs: int) -> PsgldSchedule:
+        """Place pSGLD's draws evenly over the final half of a run's epochs.
 
         The run's last update step retains the last draw, and `num_draws`
-        draws are retained in all, `thinning` steps apart. A run that trains
-        other epochs before its posterior epochs burns them in as well, so
-        the draws keep their place at the end of the run.
+        draws are retained in all, `thinning` steps apart.
 
         Args:
-            preceding_epochs: Epochs the same run trains before its
-                `posterior_epochs`; 0 for the staged model's posterior stage.
+            epochs: Epochs the pSGLD run trains: `posterior_epochs` for the
+                staged model's posterior stage, `mean_epochs` for a joint run.
 
         Returns:
             The burn-in and thinning, in update steps.
 
         Raises:
-            ValueError: If the final half of the posterior epochs has fewer
-                update steps than `num_draws`.
+            ValueError: If the final half of the run has fewer update steps
+                than `num_draws`.
         """
-        final_half_epochs = self.posterior_epochs - self.posterior_epochs // 2
-        thinning = final_half_epochs * self.steps_per_epoch // self.num_draws
+        final_half_steps = (epochs - epochs // 2) * self.steps_per_epoch
+        thinning = final_half_steps // self.num_draws
         if thinning < 1:
             raise ValueError(
                 f"num_draws ({self.num_draws}) exceeds the update steps of the "
-                f"final half of the posterior epochs "
-                f"({final_half_epochs * self.steps_per_epoch})."
+                f"final half of {epochs} epochs ({final_half_steps})."
             )
-        total_steps = (preceding_epochs + self.posterior_epochs) * self.steps_per_epoch
         return PsgldSchedule(
-            burn_in=total_steps - self.num_draws * thinning, thinning=thinning
+            burn_in=epochs * self.steps_per_epoch - self.num_draws * thinning,
+            thinning=thinning,
         )
 
 

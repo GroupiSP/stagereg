@@ -6,6 +6,7 @@ training run: the shape of the results and the table, and metrics in range.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import sys
 from collections.abc import Iterator
@@ -74,15 +75,15 @@ def test_compare_groups_joint_and_staged_results_per_seed(
                 assert 0.0 <= region.coverage <= 1.0
                 assert region.aleatoric_std >= 0.0
                 assert region.epistemic_std > 0.0
-        assert result.point_epochs == 6  # patience outlasts both stages
 
 
-def test_joint_runs_get_the_staged_runs_total_epochs(
+def test_joint_runs_train_as_many_epochs_as_the_mean_stage(
     clustered_compare: ModuleType,
     clustered_data: Any,
     tiny_clustered_config: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    config = dataclasses.replace(tiny_clustered_config, mean_epochs=4)
     budgets = []
     run_joint = clustered_compare.run_joint
 
@@ -91,14 +92,10 @@ def test_joint_runs_get_the_staged_runs_total_epochs(
         return run_joint(*args, epochs=epochs, **kwargs)
 
     monkeypatch.setattr(clustered_compare, "run_joint", recording_run_joint)
-    (result,) = clustered_compare.compare(
-        clustered_data, tiny_clustered_config, seeds=1
-    )
+    clustered_compare.compare(clustered_data, config, seeds=1)
 
-    assert len(budgets) == 3
-    # Mean and variance stages run 3 epochs each, the posterior stage 2.
-    assert all(budget == 3 + 3 + 2 for budget in budgets)
-    assert result.point_epochs == 6
+    # Neither the variance stage's 3 epochs nor the posterior stage's 2 add up.
+    assert budgets == [4, 4, 4]
 
 
 def test_joint_runs_share_each_methods_hyperparameters_and_draw_schedule(
@@ -123,9 +120,7 @@ def test_joint_runs_share_each_methods_hyperparameters_and_draw_schedule(
 
     monkeypatch.setattr(clustered_compare, "run_joint", recording_run_joint)
     monkeypatch.setattr(clustered_compare, "run_staged", recording_run_staged)
-    (result,) = clustered_compare.compare(
-        clustered_data, tiny_clustered_config, seeds=1
-    )
+    clustered_compare.compare(clustered_data, tiny_clustered_config, seeds=1)
 
     assert (
         set(joint_runs)
@@ -146,11 +141,10 @@ def test_joint_runs_share_each_methods_hyperparameters_and_draw_schedule(
         joint_runs["PreconditionedSGLD"][0],
         staged_runs["PreconditionedSGLD"][0],
     )
-    steps_per_epoch = tiny_clustered_config.steps_per_epoch
-    assert joint_psgld.burn_in == (
-        staged_psgld.burn_in + result.point_epochs * steps_per_epoch
-    )
-    assert joint_psgld.thinning == staged_psgld.thinning
+    # The joint run's 3 epochs of 10 steps put 4 draws 5 steps apart over the
+    # final 20; the posterior stage's 2 epochs, 2 apart over the final 10.
+    assert (joint_psgld.burn_in, joint_psgld.thinning) == (10, 5)
+    assert (staged_psgld.burn_in, staged_psgld.thinning) == (12, 2)
     assert joint_psgld.step_size == staged_psgld.step_size
 
 
@@ -228,19 +222,21 @@ def test_main_rejects_invalid_settings(
         clustered_compare.main()
 
 
-def test_point_epochs_count_every_epoch_run_not_only_up_to_the_best(
+def test_supervised_stages_run_their_full_epochs_without_stopping_early(
     clustered_staged: ModuleType, clustered_dataset: ModuleType
 ) -> None:
-    # A learning rate this high makes the training loss oscillate, so the best
-    # epoch comes early; the patience still outlasts both stages' maximum.
+    # A learning rate this high makes the training loss oscillate, so an
+    # early stopper would stop and restore an early best epoch.
     config = clustered_dataset.ClusteredDataConfig(
-        learning_rate=0.3, mean_epochs=20, variance_epochs=20, seed=3
+        learning_rate=0.3, mean_epochs=20, variance_epochs=15, seed=3
     )
     data = clustered_dataset.make_clustered_data(config)
 
     supervised = clustered_staged.train_supervised_stages(data, config)
 
-    assert supervised.point_epochs == 40
+    history = supervised.state.metric_history
+    assert len(history["mean/train/loss"]) == 20
+    assert len(history["variance/train/loss"]) == 15
 
 
 def test_main_saves_both_figures_into_the_plot_path_without_showing(

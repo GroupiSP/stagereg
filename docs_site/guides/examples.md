@@ -160,12 +160,12 @@ units, which first maps the training inputs' range `[-0.2, 1.0]` onto
 uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py
 ```
 
-The comparison trains the staged model: a mean stage and a Gamma variance
-stage, each early-stopped on its training loss (at most 3,000 epochs, patience
-100), then the [posterior stage](posterior-stage.md) for a fixed 2,000 epochs
-under an isotropic Gaussian prior of precision 1, once for each inference
-method on the same trained stages. Both supervised stages use Adam at learning
-rate 1e-3 and batches of 100.
+The comparison trains the staged model: a mean stage for 3,000 epochs and a
+Gamma variance stage for 3,000 epochs, then the
+[posterior stage](posterior-stage.md) for 2,000 epochs under an isotropic
+Gaussian prior of precision 1, once for each inference method on the same
+trained stages. Every stage runs its full budget, with no early stopping. Both
+supervised stages use Adam at learning rate 1e-3 and batches of 100.
 
 | Method | Posterior-stage setting | Backbone dropout | Draws |
 | --- | --- | --- | --- |
@@ -184,11 +184,12 @@ floor), and each of the three methods infers every weight, variance head
 included, under the network's own Gaussian likelihood and the same prior. Each
 joint run uses its staged counterpart's settings, dropout rate and number of
 draws from the table above. It starts from a random initialization with no warm
-start and no early stopping, and runs exactly as many epochs as the staged
-model of the same seed: its mean-stage, variance-stage and posterior epochs
-together. Joint pSGLD burns in the mean-stage and variance-stage epochs as
-well, so its 100 draws fall in the same final 1,000 epochs as the staged
-run's. Each joint draw carries its own mean and variance. The six
+start and no early stopping, and runs as many epochs as the staged model's
+mean stage (`--mean-epochs`, 3,000 at the defaults); the variance and posterior
+stages' budgets are the staged model's alone. Joint pSGLD spreads its 100 draws
+evenly over the final half of its own run, the final 1,500 epochs at the
+defaults: it burns in the first 15,000 of its 30,000 steps and keeps every
+150th step after them. Each joint draw carries its own mean and variance. The six
 configurations take a few minutes at the defaults on a laptop CPU.
 
 It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,

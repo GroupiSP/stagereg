@@ -113,8 +113,8 @@ def run_joint(
         data: The training set and the evaluation grid.
         config: The comparison's settings.
         inference_method: A fresh inference method.
-        epochs: Epochs to run; the staged run's total epochs of the same
-            seed, so both trainings get the same budget.
+        epochs: Epochs to run; the comparison runs `config.mean_epochs`,
+            as the staged model's mean stage does.
         network: The joint network to infer over, or `None` for a fresh one
             without dropout.
 

@@ -75,20 +75,25 @@ def mc_dropout(config: ClusteredDataConfig) -> InferenceMethod:
     return MCDropout(optimizer=optax.adam(config.mc_dropout_learning_rate))
 
 
-def psgld(config: ClusteredDataConfig, *, preceding_epochs: int = 0) -> InferenceMethod:
-    """Build pSGLD retaining `num_draws` draws over the final half of the posterior.
+def psgld(config: ClusteredDataConfig, *, epochs: int | None = None) -> InferenceMethod:
+    """Build pSGLD retaining `num_draws` draws over the final half of its run.
 
     Args:
         config: The comparison's settings; `psgld_step_size` is read, and
             the draw schedule comes from `config.psgld_schedule`.
-        preceding_epochs: Epochs the same run trains before its posterior
-            epochs, burned in as well; 0 for the staged model's posterior
-            stage.
+        epochs: Epochs the run trains, or `None` for the staged model's
+            `posterior_epochs`.
 
     Returns:
         A fresh `PreconditionedSGLD`.
+
+    Raises:
+        ValueError: If the final half of `epochs` has fewer update steps
+            than `num_draws`.
     """
-    schedule = config.psgld_schedule(preceding_epochs=preceding_epochs)
+    schedule = config.psgld_schedule(
+        config.posterior_epochs if epochs is None else epochs
+    )
     return PreconditionedSGLD(
         step_size=config.psgld_step_size,
         burn_in=schedule.burn_in,
@@ -146,24 +151,20 @@ METHODS: dict[str, MethodFactory] = {
 """Every inference method the comparison runs, by name, in table order."""
 
 
-def joint_method(
-    method: str, config: ClusteredDataConfig, *, point_epochs: int
-) -> InferenceMethod:
+def joint_method(method: str, config: ClusteredDataConfig) -> InferenceMethod:
     """Build an inference method for the joint posterior.
 
-    It has its staged counterpart's hyperparameters. pSGLD also burns in the
-    epochs the staged model spends on its mean and variance stages, so both
-    runs retain their draws over the same final epochs.
+    It has its staged counterpart's hyperparameters. pSGLD spreads its draws
+    over the final half of the joint run's `mean_epochs`, as the staged one
+    does over the final half of the posterior epochs.
 
     Args:
         method: The inference method's name, a key of `METHODS`.
         config: The comparison's settings.
-        point_epochs: Epochs the staged model's mean and variance stages ran
-            together for the same seed.
 
     Returns:
         A fresh inference method.
     """
     if method == PSGLD:
-        return psgld(config, preceding_epochs=point_epochs)
+        return psgld(config, epochs=config.mean_epochs)
     return METHODS[method](config)

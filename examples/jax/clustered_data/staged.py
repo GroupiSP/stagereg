@@ -5,6 +5,8 @@ posterior stage over the mean network: one outer pass, as in the xsin example. T
 and variance stages are trained once per seed and shared by every inference method's
 posterior stage. Every stage runs a fixed number of epochs, without early stopping: the
 mean stage as many as a joint run, the variance and posterior stages their own budgets.
+The mean and variance stages are L2-regularized under the posterior stage's isotropic
+Gaussian prior, as in VeBNN: each fits the MAP estimate of its network.
 """
 
 from __future__ import annotations
@@ -57,6 +59,28 @@ class SupervisedStages:
     variance_model: GammaNetwork
 
 
+def l2_regularized_adam(config: ClusteredDataConfig) -> optax.GradientTransformation:
+    """Adam on a mean loss plus the isotropic Gaussian prior's negative log density.
+
+    The stages' losses average over a batch, so the prior's
+    `prior_precision / 2 * ||w||**2`, which goes with the loss summed over the
+    training set, enters with weight `1 / train_size`. Its gradient
+    `prior_precision / train_size * w` is added before Adam's rescaling, as an
+    L2 penalty in the loss would be.
+
+    Args:
+        config: The comparison's settings; `prior_precision`, `learning_rate`
+            and `train_size` are read.
+
+    Returns:
+        The gradient transformation of the mean and variance stages.
+    """
+    return optax.chain(
+        optax.add_decayed_weights(config.prior_precision / config.train_size),
+        optax.adam(config.learning_rate),
+    )
+
+
 def train_supervised_stages(
     data: ClusteredData, config: ClusteredDataConfig
 ) -> SupervisedStages:
@@ -81,7 +105,7 @@ def train_supervised_stages(
     mean_model = MeanNetwork(rngs=nnx.Rngs(mean_key))
     mean_stage = MeanStage(
         model=mean_model,
-        optimizer=create_optimizer(mean_model, optax.adam(config.learning_rate)),
+        optimizer=create_optimizer(mean_model, l2_regularized_adam(config)),
         train_loader=loader,
         options=SupervisedStageOptions(epochs=config.mean_epochs),
     )
@@ -91,7 +115,7 @@ def train_supervised_stages(
     variance_model = GammaNetwork(rngs=nnx.Rngs(variance_key))
     variance_stage = GammaVarianceStage(
         model=variance_model,
-        optimizer=create_optimizer(variance_model, optax.adam(config.learning_rate)),
+        optimizer=create_optimizer(variance_model, l2_regularized_adam(config)),
         source_loader=loader,
         options=SupervisedStageOptions(epochs=config.variance_epochs),
         splits=("train",),
@@ -162,7 +186,7 @@ def run_staged(
     Returns:
         `config.num_draws` draws of the predictive mean on the grid (all
         retained samples for a finite posterior), each paired with the
-        variance stage's aleatoric variance.
+        variance stage's aleatoric variance, in the targets' units.
     """
     state = _fork(supervised.state)
     stage = PosteriorStage(
@@ -182,6 +206,7 @@ def run_staged(
         ..., 0
     ]
     aleatoric = supervised.variance_model(data.grid_inputs).mean()[..., 0]
-    return PredictiveDraws(
+    draws = PredictiveDraws(
         means=means, variances=jnp.broadcast_to(aleatoric, means.shape)
     )
+    return draws.in_target_units(data.target_mean, data.target_std)

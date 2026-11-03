@@ -15,6 +15,11 @@ varies the models' initialization, the batch order and the draws. Each of
 those purposes draws from its own named PRNG stream (`PRNG_STREAMS`), a
 `fold_in` of the seed's key, so no two of them, joint or staged, share a
 key.
+
+As in VeBNN, every model trains on standardized targets: the loader serves
+`(y - target_mean) / target_std`, with the training targets' mean and
+population standard deviation, and each configuration maps its predictions
+back to the targets' units before it is scored.
 """
 
 from __future__ import annotations
@@ -95,7 +100,8 @@ class ClusteredDataConfig:
         num_draws: Number of posterior draws every configuration is scored
             on.
         prior_precision: Precision of the isotropic Gaussian prior over the
-            network's weights.
+            network's weights: the posterior stage's prior and the mean and
+            variance stages' L2 penalty.
         bbb_learning_rate: Adam learning rate of Bayes by Backprop.
         bbb_initial_std: Initial standard deviation of Bayes by Backprop's
             mean-field Gaussian.
@@ -232,6 +238,30 @@ class ClusteredData:
     grid_truth: jax.Array
     grid_targets: jax.Array
 
+    @property
+    def target_mean(self) -> float:
+        """Mean of the training targets, which the loader subtracts."""
+        return float(jnp.mean(self.train_targets))
+
+    @property
+    def target_std(self) -> float:
+        """Population standard deviation of the training targets.
+
+        The loader divides the centered targets by it.
+        """
+        return float(jnp.std(self.train_targets))
+
+    def standardize(self, targets: jax.Array) -> jax.Array:
+        """Map targets to the standardized units the models train in.
+
+        Args:
+            targets: Targets in their own units, of any shape.
+
+        Returns:
+            `(targets - target_mean) / target_std`.
+        """
+        return (targets - self.target_mean) / self.target_std
+
 
 def true_function(inputs: np.ndarray) -> np.ndarray:
     """Return the noise-free sum-of-sines curve at the inputs.
@@ -311,9 +341,12 @@ def make_loader(data: ClusteredData, config: ClusteredDataConfig) -> LoaderFacto
         config: The comparison's settings; `batch_size` and `seed` are read.
 
     Returns:
-        A loader serving the shuffled training set in batches for any split
-        it is asked for: the example has no held-out split.
+        A loader serving the shuffled training set, with standardized
+        targets, in batches for any split it is asked for: the example has
+        no held-out split.
     """
+
+    standardized_targets = data.standardize(data.train_targets)
 
     def loader(*, split: str, epoch: int) -> list[Batch]:
         del split
@@ -322,7 +355,7 @@ def make_loader(data: ClusteredData, config: ClusteredDataConfig) -> LoaderFacto
             config.train_size,
         )
         inputs = data.train_inputs[permutation]
-        targets = data.train_targets[permutation]
+        targets = standardized_targets[permutation]
         return [
             Batch(
                 inputs=inputs[start : start + config.batch_size],

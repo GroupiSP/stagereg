@@ -23,6 +23,13 @@ All notable changes to `stagereg` are recorded here. The format follows
 - `ResidualScale`: the `nnx.Variable` a custom Gamma variance model holds and
   divides its rate by to get the same scaling (ADR 0016).
 
+### Changed
+
+- The clustered-data example trains every model on standardized targets and
+  its mean and variance stages under an L2 penalty from the posterior prior,
+  as VeBNN does; scores stay in the targets' units. Its staged extrapolation
+  σ_ale stays between 0.11 and 0.37 over seeds 0 to 9 (ADR 0017).
+
 ## [0.5.0] - 2026-10-23
 
 Closed-form CRPS release (#143): Gaussian and Gaussian-mixture predictives

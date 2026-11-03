@@ -121,7 +121,7 @@ def run_joint(
     Returns:
         `config.num_draws` draws (all retained samples for a finite
         posterior), each with its own predictive mean and aleatoric variance
-        on the grid.
+        on the grid, in the targets' units.
     """
     if network is None:
         network = joint_network(config)
@@ -134,4 +134,5 @@ def run_joint(
             inference_method.update(batch, step_key)
 
     outputs = draw_on_grid(inference_method, data, config, stream=JOINT_DRAW_STREAM)
-    return PredictiveDraws(means=outputs[..., 0], variances=outputs[..., 1])
+    draws = PredictiveDraws(means=outputs[..., 0], variances=outputs[..., 1])
+    return draws.in_target_units(data.target_mean, data.target_std)

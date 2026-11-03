@@ -225,3 +225,44 @@ def test_calibration_curve_counts_only_the_masked_points(
 
     assert np.asarray(masked) == pytest.approx([1.0, 1.0])
     assert np.asarray(unmasked) == pytest.approx([0.5, 0.5])
+
+
+@settings(deadline=None, max_examples=25)
+@given(
+    mean=st.floats(min_value=-10.0, max_value=10.0),
+    std=st.floats(min_value=1e-2, max_value=10.0),
+)
+def test_draws_in_target_units_keep_the_pit_and_scale_the_sigma(
+    clustered_scoring: ModuleType,
+    clustered_regions: ModuleType,
+    mean: float,
+    std: float,
+) -> None:
+    # Standardization is affine, so the PIT is invariant under it and the
+    # aleatoric σ scales with the standard deviation.
+    grid = jnp.linspace(-0.5, 1.5, 40)[:, None]
+    masks = clustered_regions.region_masks(grid)
+    targets = jnp.sin(3.0 * grid[:, 0])
+    draws = clustered_scoring.PredictiveDraws(
+        means=jnp.stack([0.9 * targets, 1.1 * targets]),
+        variances=jnp.full((2, 40), 0.05),
+    )
+
+    rescaled = draws.in_target_units(mean, std)
+    standardized = clustered_scoring.score(draws, targets, masks)
+    original = clustered_scoring.score(rescaled, mean + std * targets, masks)
+
+    np.testing.assert_allclose(
+        np.asarray(rescaled.variances), std**2 * np.asarray(draws.variances), rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(clustered_scoring.mixture_cdf(rescaled, mean + std * targets)),
+        np.asarray(clustered_scoring.mixture_cdf(draws, targets)),
+        atol=1e-4,
+    )
+    for region in standardized.regions:
+        np.testing.assert_allclose(
+            original.regions[region].aleatoric_std,
+            std * standardized.regions[region].aleatoric_std,
+            rtol=1e-4,
+        )

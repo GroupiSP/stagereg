@@ -106,6 +106,24 @@ def test_loader_reshuffles_every_epoch_into_full_batches(
     )
 
 
+def test_loader_serves_standardized_targets(clustered_dataset: ModuleType) -> None:
+    config = clustered_dataset.ClusteredDataConfig()
+    data = clustered_dataset.make_clustered_data(config)
+    loader = clustered_dataset.make_loader(data, config)
+
+    targets = np.concatenate(
+        [np.asarray(b.targets[:, 0]) for b in loader(split="train", epoch=0)]
+    )
+
+    np.testing.assert_allclose(targets.mean(), 0.0, atol=1e-5)
+    np.testing.assert_allclose(targets.std(), 1.0, atol=1e-5)
+    np.testing.assert_allclose(
+        np.sort(data.target_mean + data.target_std * targets),
+        np.sort(np.asarray(data.train_targets[:, 0])),
+        atol=1e-5,
+    )
+
+
 def test_psgld_schedule_spreads_the_draws_over_the_final_half_at_the_defaults(
     clustered_dataset: ModuleType,
 ) -> None:

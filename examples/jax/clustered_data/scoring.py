@@ -34,6 +34,22 @@ class PredictiveDraws:
     means: jax.Array
     variances: jax.Array
 
+    def in_target_units(self, mean: float, std: float) -> PredictiveDraws:
+        """Map draws predicted on standardized targets back to the targets' units.
+
+        Args:
+            mean: The targets' mean, which standardization subtracted.
+            std: The targets' standard deviation, which standardization
+                divided by.
+
+        Returns:
+            The draws with means `mean + std * means` and variances
+            `std**2 * variances`.
+        """
+        return PredictiveDraws(
+            means=mean + std * self.means, variances=std**2 * self.variances
+        )
+
 
 def mixture_cdf(draws: PredictiveDraws, targets: jax.Array) -> jax.Array:
     """Evaluate the equal-weight Gaussian mixture's CDF at the targets.

@@ -165,7 +165,13 @@ Gamma variance stage for 3,000 epochs, then the
 [posterior stage](posterior-stage.md) for 2,000 epochs under an isotropic
 Gaussian prior of precision 1, once for each inference method on the same
 trained stages. Every stage runs its full budget, with no early stopping. Both
-supervised stages use Adam at learning rate 1e-3 and batches of 100.
+supervised stages use Adam at learning rate 1e-3 and batches of 100, with an L2
+penalty from the same prior: weight decay `prior_precision / 1000` added to the
+gradient before Adam, so each fits its network's MAP estimate. As in
+[VeBNN](https://github.com/bessagroup/VeBNN), every model, joint or staged,
+trains on targets standardized by the training targets' mean and standard
+deviation, and its predictions are mapped back to the targets' units before
+scoring.
 
 | Method | Posterior-stage setting | Backbone dropout | Draws |
 | --- | --- | --- | --- |
@@ -203,13 +209,16 @@ region average of the draw-averaged variance), the epistemic σ (square root of
 the region average of the variance of the means over draws) and the 95%
 coverage of the mixture's exact central interval.
 
-The squared residuals here are about 1e-3, far from unit scale. The
+Standardizing the targets does not put the squared residuals at unit scale:
+the noise is small against the curve's spread, and they stay about 4e-3. The
 variance stage divides the Gamma head's rate by their mean (see
 [Residual scale](two-step-training.md#residual-scale)), which keeps the
-staged extrapolation σ_ale near 0.13 at the default seed. Without that
-division, the head's raw rate output had to reach about +100 to fit the
+staged extrapolation σ_ale between 0.11 and 0.37 over seeds 0 to 9. Without
+that division, the head's raw rate output had to reach about +100 to fit the
 data. Its drift past `x = 1.2` then pushed the rate onto its 1e-6 floor, and
-the extrapolation σ_ale grew to 331.
+the extrapolation σ_ale grew to the hundreds at several seeds, standardized
+or not
+([ADR 0017](https://github.com/GroupiSP/stagereg/blob/main/docs/adr/0017-the-clustered-data-example-trains-on-standardized-targets-under-l2.md)).
 
 `--seeds N` (default 1) repeats the whole comparison over seeds `--seed` to
 `--seed + N - 1`. The training data and the grid stay fixed, so only the

@@ -8,6 +8,7 @@ from stagereg.jax.distributions import (
     GaussianHead,
     MomentMatchedPredictive,
     PosteriorPredictive,
+    ResidualScale,
 )
 from stagereg.jax.evaluation import (
     SupervisedLoss,
@@ -87,6 +88,7 @@ __all__ = [
     "Predictor",
     "Prior",
     "ReferenceSamplesExtractor",
+    "ResidualScale",
     "RetainedSamplesPosterior",
     "SupervisedLoss",
     "SupervisedStageOptions",

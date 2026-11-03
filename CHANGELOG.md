@@ -5,6 +5,24 @@ All notable changes to `stagereg` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `GammaHead` divides its rate by a new non-trainable `ResidualScale`, which
+  `GammaVarianceStage.prepare` sets to the mean training squared residual. The
+  head now trains at unit scale whatever the targets' units, and its mean
+  stays in those units; trained variances differ from earlier versions.
+  Without it, squared residuals of order 1e-3 forced rate logits of order 1e2
+  and blew the variance up away from the data (the clustered-data example's
+  staged extrapolation σ_ale fell from 331 to 0.13). `GammaHead` checkpoints
+  saved earlier do not restore into the new head (ADR 0016).
+- `GammaVarianceStage.prepare` raises when `"train"` is not among its `splits`,
+  or when the training squared residuals' mean is not positive and finite.
+
+### Added
+
+- `ResidualScale`: the `nnx.Variable` a custom Gamma variance model holds and
+  divides its rate by to get the same scaling (ADR 0016).
+
 ## [0.5.0] - 2026-10-23
 
 Closed-form CRPS release (#143): Gaussian and Gaussian-mixture predictives

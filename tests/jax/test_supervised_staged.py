@@ -746,6 +746,71 @@ def test_gamma_variance_stage_updates_variance_and_preserves_mean(
     assert bool(jnp.all(high_variance > low_variance))
 
 
+class ZeroMeanModel(nnx.Module):
+    """A mean model predicting zero, whose squared residuals are the targets squared."""
+
+    def __init__(self) -> None:
+        self.weight = nnx.Param(jnp.zeros((1,)))
+
+    def __call__(self, inputs: jax.Array) -> jax.Array:
+        return inputs * self.weight
+
+
+def _variance_trained_on_targets_scaled_by(
+    factor: float, query_inputs: jax.Array
+) -> jax.Array:
+    """Train a Gamma head on squared residuals scaled by ``factor**2``.
+
+    The mean model predicts zero and never moves, so the residual targets are
+    exactly the source targets squared. Data, initialization and optimizer are
+    the same for every ``factor``.
+
+    Returns:
+        The trained head's variance at ``query_inputs``.
+    """
+    data_key, noise_key = jax.random.split(jax.random.key(7))
+    inputs = jax.random.uniform(data_key, (128, 1), minval=-1.0, maxval=1.0)
+    targets = factor * (0.5 + inputs) * jax.random.normal(noise_key, inputs.shape)
+    source_loader = make_two_step_loader(inputs, targets)
+
+    mean_model = ZeroMeanModel()
+    state = TrainingState(rng_state=jax.random.key(0))
+    mean_stage = MeanStage(
+        model=mean_model,
+        optimizer=create_optimizer(mean_model, optax.sgd(0.0)),
+        train_loader=source_loader,
+        options=SupervisedStageOptions(epochs=1),
+    )
+    mean_stage.prepare(state)
+    mean_stage.train(state)
+
+    variance_model = GammaHead(1, 1, rngs=nnx.Rngs(3))
+    variance_stage = GammaVarianceStage(
+        model=variance_model,
+        optimizer=create_optimizer(variance_model, optax.adam(0.05)),
+        source_loader=source_loader,
+        options=SupervisedStageOptions(epochs=50),
+        splits=("train",),
+    )
+    variance_stage.prepare(state)
+    variance_stage.train(state)
+    return variance_model(query_inputs).mean()
+
+
+@pytest.mark.parametrize("factor", [0.03, 30.0])
+def test_gamma_variance_scales_with_the_squared_residuals(factor: float) -> None:
+    # Scaling the targets by `factor` scales the squared residuals by
+    # `factor**2`; the trained variance must follow by the same factor, inside
+    # and outside the data. Without it, small residuals force large rate
+    # logits that blow the variance up beyond the data.
+    query_inputs = jnp.array([[-3.0], [-1.0], [0.0], [1.0], [3.0]])
+
+    unit = _variance_trained_on_targets_scaled_by(1.0, query_inputs)
+    scaled = _variance_trained_on_targets_scaled_by(factor, query_inputs)
+
+    assert jnp.allclose(scaled, factor**2 * unit, rtol=1e-3)
+
+
 def test_gamma_variance_stage_requires_ready_mean() -> None:
     model = GammaHead(1, 1, rngs=nnx.Rngs(0))
     stage = GammaVarianceStage(

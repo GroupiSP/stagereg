@@ -32,7 +32,7 @@ from stagereg.core.protocols import LoaderFactory
 from stagereg.core.tracking import EventSink
 from stagereg.core.types import Batch, PyTree, TrainingState
 from stagereg.jax import (
-    GammaHead,
+    Gamma,
     GammaVarianceStage,
     HeldOutValidation,
     InferenceMethod,
@@ -106,6 +106,25 @@ class MeanAndVarianceStages:
 MakeStages = Callable[..., MeanAndVarianceStages]
 
 
+class UnscaledGammaHead(nnx.Module):
+    """A Gamma head without a `ResidualScale`: `GammaHead` as of stagereg 0.1.0.
+
+    The posterior tests pin losses and best epochs that this variance model
+    produces. A model without a `ResidualScale` trains on the raw residuals,
+    so the variance stage's residual scale leaves these runs unchanged.
+    """
+
+    def __init__(self, *, rngs: nnx.Rngs) -> None:
+        self.linear = nnx.Linear(1, 2, rngs=rngs)
+
+    def __call__(self, features: jax.Array) -> Gamma:
+        raw_concentration, raw_rate = jnp.split(self.linear(features), 2, axis=-1)
+        return Gamma(
+            concentration=jax.nn.softplus(raw_concentration) + 1e-6,
+            rate=jax.nn.softplus(raw_rate) + 1e-6,
+        )
+
+
 def build_stages(
     linear_model: type[Any],
     squared_error: SupervisedLoss,
@@ -148,7 +167,7 @@ def build_stages(
             checkpoint_store=checkpoint_store,
         ),
     )
-    variance_model = GammaHead(1, 1, rngs=nnx.Rngs(seed + 2))
+    variance_model = UnscaledGammaHead(rngs=nnx.Rngs(seed + 2))
     variance_stage = GammaVarianceStage(
         model=variance_model,
         optimizer=create_optimizer(variance_model, optax.adam(0.05)),

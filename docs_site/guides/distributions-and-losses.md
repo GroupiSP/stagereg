@@ -27,7 +27,13 @@ The JAX backend supplies two heads, each with its distribution:
 [`GammaHead`][stagereg.jax.GammaHead] produces a
 [`Gamma`][stagereg.jax.Gamma] (concentration and rate) for strictly positive
 targets. Both keep their parameters positive with a `softplus` and a small
-offset, so the network's raw outputs are unconstrained.
+offset, so the network's raw outputs are unconstrained. The Gamma head also
+divides its rate by a [`ResidualScale`][stagereg.jax.ResidualScale], a fixed
+variable that
+[`GammaVarianceStage`][stagereg.jax.GammaVarianceStage] sets to the mean
+training squared residual. The network therefore predicts at unit scale
+whatever the targets' units, and the distribution's mean stays in those
+units.
 
 To give a head something to work with, put it after a feature extractor in an
 ordinary Flax NNX module. The model's call then returns the distribution:

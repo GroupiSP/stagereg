@@ -202,15 +202,13 @@ region average of the draw-averaged variance), the epistemic σ (square root of
 the region average of the variance of the means over draws) and the 95%
 coverage of the mixture's exact central interval.
 
-The staged rows' extrapolation σ_ale can be very large, hundreds at the
-default seed. The Gamma variance network predicts the variance as
-concentration / rate, and nothing in the training data constrains its rate
-beyond the clusters. Past about `x = 1.3` the rate can fall onto the Gamma
-head's 1e-6 floor, so the predicted σ there grows to the hundreds. The
-region's aleatoric σ is the square root of the region average of the
-variance, so those few points dominate it, although the median σ over the
-region stays near 0.2. The example reports the number as is, and does not
-clip it.
+The squared residuals here are about 1e-3, far from unit scale. The
+variance stage divides the Gamma head's rate by their mean (see
+[Residual scale](two-step-training.md#residual-scale)), which keeps the
+staged extrapolation σ_ale near 0.13 at the default seed. Without that
+division, the head's raw rate output had to reach about +100 to fit the
+data. Its drift past `x = 1.2` then pushed the rate onto its 1e-6 floor, and
+the extrapolation σ_ale grew to 331.
 
 `--seeds N` (default 1) repeats the whole comparison over seeds `--seed` to
 `--seed + N - 1`. The training data and the grid stay fixed, so only the

@@ -89,6 +89,10 @@ _Avoid_: Checkpoint name, checkpoint ID
 The variance of the noise in the targets around their true mean, as estimated by the variance stage. It is a property of the data and does not shrink with more data.
 _Avoid_: Noise variance (ambiguous with the noise of an inference method), data uncertainty
 
+**Residual scale**:
+The mean squared residual of the training split, which the variance stage hands its model so the variance network predicts at unit scale while its aleatoric variance stays in the targets' units.
+_Avoid_: Target scale, normalization constant
+
 **Epistemic variance**:
 The spread of the mean function across the draws of a posterior, i.e. the uncertainty about the mean that more data would reduce.
 _Avoid_: Model uncertainty, parameter variance

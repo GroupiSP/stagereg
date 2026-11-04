@@ -27,7 +27,7 @@ def test_training_data_carry_heteroscedastic_noise(
     x = np.hstack([np.linspace(-0.2, 0.2, 200), np.linspace(0.6, 1.0, 200)])
     eps = 0.02 * np.random.RandomState(42).randn(400)
     y = x + 0.3 * np.sin(2 * np.pi * (x + eps)) + 0.3 * np.sin(4 * np.pi * (x + eps))
-    y = y + 0.1 * eps / np.abs(x)
+    y = y + 0.1 * eps / (np.abs(x) + 0.01)
     assert data.train_inputs.shape == data.train_targets.shape == (400, 1)
     np.testing.assert_allclose(np.asarray(data.train_inputs[:, 0]), x, atol=1e-6)
     np.testing.assert_allclose(np.asarray(data.train_targets[:, 0]), y, atol=1e-5)

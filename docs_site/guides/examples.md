@@ -152,14 +152,14 @@ UvA DL2 Bayesian neural network tutorial 1: two clusters of 200 points on
 `[-0.2, 0.2]` and `[0.6, 1.0]` (seed 42) with a sum-of-sines target:
 
 ```text
-y = x + 0.3 sin(2π(x + ε)) + 0.3 sin(4π(x + ε)) + 0.1 ε / |x|,   ε ~ N(0, 0.02²)
+y = x + 0.3 sin(2π(x + ε)) + 0.3 sin(4π(x + ε)) + 0.1 ε / (|x| + 0.01),   ε ~ N(0, 0.02²)
 ```
 
 The noise enters the sines' arguments and an additive term that grows as `x`
 approaches 0, so the noise is heteroscedastic. The targets scatter about the
-noise-free curve by about 0.03 (RMS) at the left cluster's edges, 0.07 over
-the right cluster and 0.7 within 0.02 of `x = 0`, where single residuals
-reach 3. Every model shares one Tanh MLP backbone of 5 hidden layers of 10
+noise-free curve by about 0.02 (RMS) at the left cluster's edges, 0.07 over
+the right cluster and 0.16 within 0.02 of `x = 0`, where single residuals
+reach 0.4. The offset 0.01 bounds the additive term's σ at 0.2. Every model shares one Tanh MLP backbone of 5 hidden layers of 10
 units, which first maps the training inputs' range `[-0.2, 1.0]` onto
 `[-1, 1]` with a fixed affine map.
 
@@ -219,7 +219,7 @@ square root of the region average of the draw-averaged variance, and
 σ_total = √(σ_epi² + σ_ale²).
 
 Standardizing the targets does not put the squared residuals at unit scale:
-the noise is small against the curve's spread, and their mean is about 0.12. The
+the noise is small against the curve's spread, and their mean is about 0.03. The
 variance stage divides the Gamma head's rate by their mean (see
 [Residual scale](two-step-training.md#residual-scale)), which keeps the
 staged extrapolation σ_ale between 0.11 and 0.37 over seeds 0 to 9 on the

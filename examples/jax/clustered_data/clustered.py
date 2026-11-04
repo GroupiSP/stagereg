@@ -4,11 +4,11 @@ The training data adapt the "Simulate data" section of the UvA DL2
 Bayesian neural network tutorial 1: two clusters of 200 inputs on
 `[-0.2, 0.2]` and `[0.6, 1.0]`, with the heteroscedastic sum-of-sines target
 
-    y = x + 0.3 sin(2 pi (x + eps)) + 0.3 sin(4 pi (x + eps)) + 0.1 eps / |x|,
+    y = x + 0.3 sin(2 pi (x + eps)) + 0.3 sin(4 pi (x + eps)) + 0.1 eps / (|x| + delta),
 
 where `eps ~ N(0, noise_std^2)` is drawn from NumPy's legacy generator
-seeded with 42. The additive noise grows as `x` approaches 0; no training
-or grid input is exactly 0. The evaluation grid has 3,000 points over `[-0.5, 1.5]`,
+seeded with 42, and `delta = NOISE_OFFSET`. The additive noise grows as `x`
+approaches 0, up to a standard deviation of `0.1 noise_std / delta` at 0. The evaluation grid has 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn the same way from a different seed.
 
 The data never change across run seeds: `ClusteredDataConfig.seed` only
@@ -44,6 +44,9 @@ TRAIN_SEED = 42
 
 GRID_SEED = 7
 """Seed of the evaluation grid's noise; differs from `TRAIN_SEED`."""
+
+NOISE_OFFSET = 0.01
+"""Offset `delta` of `|x|` in the additive noise's scale, bounding it at 0."""
 
 GRID_BOUNDS = (-0.5, 1.5)
 """The evaluation grid's input range."""
@@ -284,7 +287,7 @@ def _noisy_function(inputs: np.ndarray, noise: np.ndarray) -> np.ndarray:
         inputs
         + 0.3 * np.sin(2 * np.pi * shifted)
         + 0.3 * np.sin(4 * np.pi * shifted)
-        + 0.1 * noise / np.abs(inputs)
+        + 0.1 * noise / (np.abs(inputs) + NOISE_OFFSET)
     )
 
 

@@ -141,10 +141,10 @@ def test_joint_runs_share_each_methods_hyperparameters_and_draw_schedule(
         joint_runs["PreconditionedSGLD"][0],
         staged_runs["PreconditionedSGLD"][0],
     )
-    # The joint run's 3 epochs of 10 steps put 4 draws 5 steps apart over the
-    # final 20; the posterior stage's 2 epochs, 2 apart over the final 10.
-    assert (joint_psgld.burn_in, joint_psgld.thinning) == (10, 5)
-    assert (staged_psgld.burn_in, staged_psgld.thinning) == (12, 2)
+    # The joint run's 3 epochs of 4 steps put 4 draws 2 steps apart over the
+    # final 8; the posterior stage's 2 epochs, 1 apart over the final 4.
+    assert (joint_psgld.burn_in, joint_psgld.thinning) == (4, 2)
+    assert (staged_psgld.burn_in, staged_psgld.thinning) == (4, 1)
     assert joint_psgld.step_size == staged_psgld.step_size
 
 
@@ -227,7 +227,7 @@ def test_supervised_stages_run_their_full_epochs_without_stopping_early(
     # A learning rate this high makes the training loss oscillate, so an
     # early stopper would stop and restore an early best epoch.
     config = clustered_dataset.ClusteredDataConfig(
-        learning_rate=0.3, mean_epochs=20, variance_epochs=15, seed=3
+        learning_rate=0.3, mean_epochs=20, variance_epochs=15, num_draws=4, seed=3
     )
     data = clustered_dataset.make_clustered_data(config)
 

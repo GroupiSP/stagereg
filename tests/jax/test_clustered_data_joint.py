@@ -62,7 +62,7 @@ def test_joint_run_updates_once_per_batch_of_its_epoch_budget(
 
     clustered_joint.run_joint(clustered_data, tiny_clustered_config, method, epochs=3)
 
-    assert method.updates == 3 * 10  # 1,000 points in batches of 100
+    assert method.updates == 3 * 4  # 400 points in batches of 100
     assert method.problem.epochs == 3
 
 
@@ -150,8 +150,8 @@ def test_log_likelihood_is_the_scaled_gaussian_under_the_variance_head(
         problem.initial_parameters, batch, jax.random.key(0)
     )
 
-    # 1,000 training points over a batch of 100 scale the batch sum by 10.
-    expected = 10 * jnp.sum(
+    # 400 training points over a batch of 100 scale the batch sum by 4.
+    expected = 4 * jnp.sum(
         jax.scipy.stats.norm.logpdf(batch.targets, mean, jnp.sqrt(variance))
     )
     assert jnp.allclose(log_likelihood, expected, rtol=1e-5)
@@ -166,10 +166,10 @@ def test_joint_psgld_spreads_its_draws_over_the_final_half_of_the_mean_epochs(
 
     joint = clustered_methods.joint_method(clustered_methods.PSGLD, config)
 
-    # 8 epochs of 10 steps: the final 40 steps hold 4 draws, 10 steps apart.
-    assert (joint.burn_in, joint.thinning) == (40, 10)
-    # 2 posterior epochs of 10 steps: the final 10 steps hold 4 draws.
-    assert (staged.burn_in, staged.thinning) == (12, 2)
+    # 8 epochs of 4 steps: the final 16 steps hold 4 draws, 4 steps apart.
+    assert (joint.burn_in, joint.thinning) == (16, 4)
+    # 2 posterior epochs of 4 steps: the final 4 steps hold 4 draws.
+    assert (staged.burn_in, staged.thinning) == (4, 1)
     assert joint.step_size == staged.step_size
 
 
@@ -219,9 +219,9 @@ def test_joint_psgld_retains_num_draws_over_the_final_half_of_its_run(
     )
 
     assert draws.means.shape == (4, clustered_data.grid_inputs.shape[0])
-    # 3 epochs of 10 steps: every draw falls after step 10 and the last at 30.
-    assert method.burn_in + method.thinning > 10
-    assert method.burn_in + 4 * method.thinning == 30
+    # 3 epochs of 4 steps: every draw falls after step 4 and the last at 12.
+    assert method.burn_in + method.thinning > 4
+    assert method.burn_in + 4 * method.thinning == 12
 
 
 def test_joint_mc_dropout_draws_one_dropout_mask_per_draw(

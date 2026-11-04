@@ -147,12 +147,19 @@ README:
 ## Clustered data
 
 How confident the joint and staged models are inside the training data and
-away from it, on the "Simulate data" set of the UvA DL2 Bayesian neural
-network tutorial 1: two clusters of 500 points on `[-0.2, 0.2]` and `[0.6, 1.0]` (seed 42) with a
-sum-of-sines target and noise σ = 0.02. The noise also enters the sines'
-arguments, so the targets scatter about the noise-free curve by about 0.075
-(RMS) inside the clusters: no mean can reach an in-distribution RMSE much
-below that. Every model shares one Tanh MLP backbone of 5 hidden layers of 10
+away from it, on a heteroscedastic variant of the "Simulate data" set of the
+UvA DL2 Bayesian neural network tutorial 1: two clusters of 200 points on
+`[-0.2, 0.2]` and `[0.6, 1.0]` (seed 42) with a sum-of-sines target:
+
+```text
+y = x + 0.3 sin(2π(x + ε)) + 0.3 sin(4π(x + ε)) + 0.1 ε / |x|,   ε ~ N(0, 0.02²)
+```
+
+The noise enters the sines' arguments and an additive term that grows as `x`
+approaches 0, so the noise is heteroscedastic. The targets scatter about the
+noise-free curve by about 0.03 (RMS) at the left cluster's edges, 0.07 over
+the right cluster and 0.7 within 0.02 of `x = 0`, where single residuals
+reach 3. Every model shares one Tanh MLP backbone of 5 hidden layers of 10
 units, which first maps the training inputs' range `[-0.2, 1.0]` onto
 `[-1, 1]` with a fixed affine map.
 
@@ -163,11 +170,11 @@ uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py
 The comparison trains the staged model: a mean stage for 3,000 epochs and a
 Gamma variance stage for 3,000 epochs, then the
 [posterior stage](posterior-stage.md) for 2,000 epochs under an isotropic
-Gaussian prior of precision 0.04 (`--prior-precision`, a standard deviation
-of 5), once for each inference method on the same trained stages. Every stage
+Gaussian prior of precision 0.25 (`--prior-precision`, a standard deviation
+of 2), once for each inference method on the same trained stages. Every stage
 runs its full budget, with no early stopping. Both supervised stages use Adam
 at learning rate 1e-3 and batches of 100, with an L2 penalty from the same
-prior: weight decay `prior_precision / 1000` added to the gradient before Adam,
+prior: weight decay `prior_precision / 400` added to the gradient before Adam,
 so each fits its network's MAP estimate. As in
 [VeBNN](https://github.com/bessagroup/VeBNN), every model, joint or staged,
 trains on targets standardized by the training targets' mean and standard
@@ -182,8 +189,8 @@ scoring.
 
 The three runs differ only in the inference method and the dropout rate; the
 architecture, prior, batch size and epochs are shared. pSGLD's burn-in and
-thinning count update steps: at the defaults it burns in the first 10,000 of
-its 20,000 steps and keeps every 100th step after them, the last one included.
+thinning count update steps: at the defaults it burns in the first 4,000 of
+its 8,000 steps and keeps every 40th step after them, the last one included.
 
 It also infers the joint posterior, the baseline: one network shares the
 backbone between a mean head and a variance head (a softplus plus a 1e-6
@@ -195,9 +202,9 @@ start and no early stopping, and runs as many epochs as the staged model's
 mean stage (`--mean-epochs`, 3,000 at the defaults); the variance and posterior
 stages' budgets are the staged model's alone. Joint pSGLD spreads its 100 draws
 evenly over the final half of its own run, the final 1,500 epochs at the
-defaults: it burns in the first 15,000 of its 30,000 steps and keeps every
-150th step after them. Each joint draw carries its own mean and variance. The six
-configurations take a few minutes at the defaults on a laptop CPU.
+defaults: it burns in the first 6,000 of its 12,000 steps and keeps every
+60th step after them. Each joint draw carries its own mean and variance. The six
+configurations take about a minute at the defaults on a laptop CPU.
 
 It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn from a different seed, split into the glossary's
@@ -212,10 +219,11 @@ square root of the region average of the draw-averaged variance, and
 σ_total = √(σ_epi² + σ_ale²).
 
 Standardizing the targets does not put the squared residuals at unit scale:
-the noise is small against the curve's spread, and they stay about 4e-3. The
+the noise is small against the curve's spread, and their mean is about 0.12. The
 variance stage divides the Gamma head's rate by their mean (see
 [Residual scale](two-step-training.md#residual-scale)), which keeps the
-staged extrapolation σ_ale between 0.11 and 0.37 over seeds 0 to 9. Without
+staged extrapolation σ_ale between 0.11 and 0.37 over seeds 0 to 9 on the
+earlier homoscedastic data of 500 points per cluster. Without
 that division, the head's raw rate output had to reach about +100 to fit the
 data. Its drift past `x = 1.2` then pushed the rate onto its 1e-6 floor, and
 the extrapolation σ_ale grew to the hundreds at several seeds, standardized

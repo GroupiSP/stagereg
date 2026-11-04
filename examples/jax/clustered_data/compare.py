@@ -1,7 +1,8 @@
 """Compare how confident the joint and staged models are in and out of distribution.
 
-Generates the UvA tutorial's two clusters of training data and a dense
-evaluation grid over `[-0.5, 1.5]`, then, for each seed, trains the staged
+Generates two clusters of heteroscedastic training data, adapted from the UvA
+tutorial, and a dense evaluation grid over `[-0.5, 1.5]`, then, for each
+seed, trains the staged
 model on a Tanh MLP backbone of 5 hidden layers of 10 units: a mean stage
 and a Gamma variance stage, shared by three runs of the library's posterior
 stage, with Bayes by Backprop, MC dropout and pSGLD. The three differ only

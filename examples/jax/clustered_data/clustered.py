@@ -1,13 +1,14 @@
 """The clustered-data example's configuration, data and loader.
 
-The training data reproduce the "Simulate data" section of the UvA DL2
-Bayesian neural network tutorial 1: two clusters of 500 inputs on
-`[-0.2, 0.2]` and `[0.6, 1.0]`, with the sum-of-sines target
+The training data adapt the "Simulate data" section of the UvA DL2
+Bayesian neural network tutorial 1: two clusters of 200 inputs on
+`[-0.2, 0.2]` and `[0.6, 1.0]`, with the heteroscedastic sum-of-sines target
 
-    y = x + 0.3 sin(2 pi (x + eps)) + 0.3 sin(4 pi (x + eps)) + eps,
+    y = x + 0.3 sin(2 pi (x + eps)) + 0.3 sin(4 pi (x + eps)) + 0.1 eps / |x|,
 
 where `eps ~ N(0, noise_std^2)` is drawn from NumPy's legacy generator
-seeded with 42. The evaluation grid has 3,000 points over `[-0.5, 1.5]`,
+seeded with 42. The additive noise grows as `x` approaches 0; no training
+or grid input is exactly 0. The evaluation grid has 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn the same way from a different seed.
 
 The data never change across run seeds: `ClusteredDataConfig.seed` only
@@ -35,7 +36,7 @@ from regions import CLUSTERS
 from stagereg.core.protocols import LoaderFactory
 from stagereg.core.types import Batch
 
-CLUSTER_SIZE = 500
+CLUSTER_SIZE = 200
 """Number of training inputs in each cluster."""
 
 TRAIN_SEED = 42
@@ -102,7 +103,7 @@ class ClusteredDataConfig:
         prior_precision: Precision of the isotropic Gaussian prior over the
             network's weights: every method's posterior prior, joint or
             staged, and the mean and variance stages' L2 penalty. The
-            default 0.04 is a prior standard deviation of 5.
+            default 0.25 is a prior standard deviation of 2.
         bbb_learning_rate: Adam learning rate of Bayes by Backprop.
         bbb_initial_std: Initial standard deviation of Bayes by Backprop's
             mean-field Gaussian.
@@ -120,7 +121,7 @@ class ClusteredDataConfig:
     variance_epochs: int = 3_000
     posterior_epochs: int = 2_000
     num_draws: int = 100
-    prior_precision: float = 0.04
+    prior_precision: float = 0.25
     bbb_learning_rate: float = 1e-2
     bbb_initial_std: float = 1e-2
     mc_dropout_rate: float = 0.1
@@ -226,8 +227,8 @@ class ClusteredData:
     """The training set and the evaluation grid.
 
     Attributes:
-        train_inputs: Training inputs, shape `[1000, 1]`.
-        train_targets: Noisy training targets, shape `[1000, 1]`.
+        train_inputs: Training inputs, shape `[400, 1]`.
+        train_targets: Noisy training targets, shape `[400, 1]`.
         grid_inputs: Evaluation-grid inputs, shape `[3000, 1]`.
         grid_truth: The noise-free curve on the grid, shape `[3000]`.
         grid_targets: Fresh noisy targets on the grid, shape `[3000]`.
@@ -273,17 +274,17 @@ def true_function(inputs: np.ndarray) -> np.ndarray:
     Returns:
         `x + 0.3 sin(2 pi x) + 0.3 sin(4 pi x)`, shaped like the inputs.
     """
-    return _noisy_function(inputs, np.zeros_like(inputs))
+    return inputs + 0.3 * np.sin(2 * np.pi * inputs) + 0.3 * np.sin(4 * np.pi * inputs)
 
 
 def _noisy_function(inputs: np.ndarray, noise: np.ndarray) -> np.ndarray:
-    """Return the UvA tutorial's target, with the noise inside the sines too."""
+    """Return the heteroscedastic target, with the noise inside the sines too."""
     shifted = inputs + noise
     return (
         inputs
         + 0.3 * np.sin(2 * np.pi * shifted)
         + 0.3 * np.sin(4 * np.pi * shifted)
-        + noise
+        + 0.1 * noise / np.abs(inputs)
     )
 
 

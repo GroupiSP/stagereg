@@ -16,9 +16,9 @@ draws over the final half of its own epochs.
 Each configuration is reduced to per-draw predictive means and variances
 on the grid and scored on the in-distribution region, the gap region
 between the clusters and the extrapolation region beyond them. The table
-reports the in-distribution RMSE of the predictive mean, then each region's
-aleatoric sigma, epistemic sigma and 95% coverage of the predictive
-mixture's central interval.
+reports the in-distribution R² of the predictive mean, then each region's
+epistemic share of the predictive sigma, `σ_epi / σ_total`, and 95%
+coverage of the predictive mixture's central interval.
 
 It then draws the first seed's configurations twice: a grid of predictive
 bands and the calibration curves in the extrapolation region (see
@@ -199,20 +199,16 @@ def compare(
 
 
 def _metric_columns() -> list[tuple[str, Callable[[Scores], float]]]:
-    """The table's columns: in-distribution RMSE, then three per region."""
+    """The table's columns: in-distribution R², then two per region."""
     columns: list[tuple[str, Callable[[Scores], float]]] = [
-        (f"{REGION_LABELS[IN_DISTRIBUTION]} RMSE", lambda scores: scores.rmse)
+        (f"{REGION_LABELS[IN_DISTRIBUTION]} R²", lambda scores: scores.r2)
     ]
     for region in REGIONS:
         label = REGION_LABELS[region]
         columns += [
             (
-                f"{label} σ_ale",
-                lambda scores, r=region: scores.regions[r].aleatoric_std,
-            ),
-            (
-                f"{label} σ_epi",
-                lambda scores, r=region: scores.regions[r].epistemic_std,
+                f"{label} σe/σt",
+                lambda scores, r=region: scores.regions[r].epistemic_share,
             ),
             (f"{label} cov95", lambda scores, r=region: scores.regions[r].coverage),
         ]
@@ -235,7 +231,7 @@ def format_table(results: Sequence[SeedComparison]) -> str:
 
     Returns:
         The table: a header, then each configuration's row of in-distribution
-        RMSE and every region's aleatoric sigma, epistemic sigma and 95%
+        R² and every region's epistemic share `σ_epi / σ_total` and 95%
         coverage, aggregated over seeds.
     """
     columns = _metric_columns()
@@ -277,7 +273,7 @@ def print_run(seed: int, result: ConfigurationResult) -> None:
         f"{REGION_LABELS[name]} cov95={region.coverage:.4f}"
         for name, region in result.scores.regions.items()
     )
-    print(f"[{result.name} seed={seed}] ID RMSE={result.scores.rmse:.4f}, {regions}")
+    print(f"[{result.name} seed={seed}] ID R²={result.scores.r2:.4f}, {regions}")
 
 
 _FLAG_HELP: dict[str, str] = {
@@ -288,7 +284,10 @@ _FLAG_HELP: dict[str, str] = {
     "variance_epochs": "Variance-stage epochs",
     "posterior_epochs": "Posterior-stage epochs",
     "num_draws": "Posterior draws to score",
-    "prior_precision": "Precision of the isotropic Gaussian prior",
+    "prior_precision": (
+        "Precision of every method's isotropic Gaussian prior, and the "
+        "supervised stages' L2"
+    ),
     "bbb_learning_rate": "Adam learning rate of Bayes by Backprop",
     "bbb_initial_std": "Initial standard deviation of Bayes by Backprop",
     "mc_dropout_rate": "Dropout rate of the backbone under MC dropout",

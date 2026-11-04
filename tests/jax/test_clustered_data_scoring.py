@@ -6,6 +6,7 @@ whose answers are known by construction.
 
 from __future__ import annotations
 
+import math
 from types import ModuleType
 
 import numpy as np
@@ -141,7 +142,8 @@ def test_score_splits_constant_means_and_equal_variances(
     for region in scores.regions.values():
         assert region.epistemic_std == pytest.approx(0.0, abs=1e-6)
         assert region.aleatoric_std == pytest.approx(std, rel=1e-5)
-    assert scores.rmse == pytest.approx(0.0, abs=1e-6)
+        assert region.epistemic_share == pytest.approx(0.0, abs=1e-5)
+    assert scores.r2 == pytest.approx(1.0, abs=1e-6)
 
 
 @settings(deadline=None, max_examples=15)
@@ -162,22 +164,30 @@ def test_score_recovers_a_known_spread_of_means_as_epistemic_std(
         assert region.epistemic_std == pytest.approx(spread, rel=1e-4, abs=1e-6)
         assert region.aleatoric_std == pytest.approx(1.0, rel=1e-5)
         assert 0.0 <= region.coverage <= 1.0
-    assert scores.rmse == pytest.approx(0.0, abs=1e-5)
+        assert region.epistemic_share == pytest.approx(
+            spread / math.hypot(spread, 1.0), rel=1e-4, abs=1e-6
+        )
+    assert scores.r2 == pytest.approx(1.0, abs=1e-5)
 
 
-def test_score_reports_rmse_on_the_in_distribution_region_only(
+def test_score_reports_r2_on_the_in_distribution_region_only(
     clustered_scoring: ModuleType, clustered_regions: ModuleType, grid_masks: object
 ) -> None:
     in_distribution = grid_masks[clustered_regions.IN_DISTRIBUTION]
-    targets = jnp.where(in_distribution, 2.0, 100.0)
+    targets = jnp.where(in_distribution, jnp.cos(4.0 * _GRID[:, 0]), 100.0)
+    # Predicting the in-distribution targets' own mean there explains none of
+    # their variance, whatever is predicted outside.
+    level = jnp.mean(targets, where=in_distribution)
     draws = clustered_scoring.PredictiveDraws(
-        means=jnp.zeros((_NUM_DRAWS, targets.size)),
+        means=jnp.broadcast_to(
+            jnp.where(in_distribution, level, 0.0), (_NUM_DRAWS, targets.size)
+        ),
         variances=jnp.ones((_NUM_DRAWS, targets.size)),
     )
 
     scores = clustered_scoring.score(draws, targets, grid_masks)
 
-    assert scores.rmse == pytest.approx(2.0)
+    assert scores.r2 == pytest.approx(0.0, abs=1e-5)
 
 
 @settings(deadline=None, max_examples=5)

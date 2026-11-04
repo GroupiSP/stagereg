@@ -12,6 +12,7 @@ probability integral transform `F(y)` satisfies `|F(y) - 1/2| <= p/2`.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -109,18 +110,24 @@ class RegionScores:
     epistemic_std: float
     coverage: float
 
+    @property
+    def epistemic_share(self) -> float:
+        """`σ_epi / σ_total`, with `σ_total = hypot(σ_epi, σ_ale)`; 0 if both are 0."""
+        total = math.hypot(self.epistemic_std, self.aleatoric_std)
+        return self.epistemic_std / total if total > 0.0 else 0.0
+
 
 @dataclass(frozen=True)
 class Scores:
     """One configuration's scores on the evaluation grid.
 
     Attributes:
-        rmse: RMSE of the predictive mean against the targets, over the
-            in-distribution region only.
+        r2: Coefficient of determination of the predictive mean against
+            the targets, over the in-distribution region only.
         regions: Each region's uncertainty and coverage, by region name.
     """
 
-    rmse: float
+    r2: float
     regions: dict[str, RegionScores]
 
 
@@ -133,11 +140,17 @@ def score(draws: PredictiveDraws, targets: jax.Array, masks: RegionMasks) -> Sco
         masks: The grid's region masks, as `region_masks` returns them.
 
     Returns:
-        The in-distribution RMSE and every region's `RegionScores`.
+        The in-distribution R² and every region's `RegionScores`.
     """
     aleatoric = jnp.mean(draws.variances, axis=0)
     epistemic = jnp.var(draws.means, axis=0)
-    squared_error = (jnp.mean(draws.means, axis=0) - targets) ** 2
+    in_distribution = masks[IN_DISTRIBUTION]
+    residual = jnp.sum(
+        (jnp.mean(draws.means, axis=0) - targets) ** 2, where=in_distribution
+    )
+    spread = jnp.sum(
+        (targets - jnp.mean(targets, where=in_distribution)) ** 2, where=in_distribution
+    )
 
     def region_scores(mask: jax.Array) -> RegionScores:
         return RegionScores(
@@ -147,7 +160,7 @@ def score(draws: PredictiveDraws, targets: jax.Array, masks: RegionMasks) -> Sco
         )
 
     return Scores(
-        rmse=float(jnp.sqrt(jnp.mean(squared_error, where=masks[IN_DISTRIBUTION]))),
+        r2=float(1.0 - residual / spread),
         regions={name: region_scores(masks[name]) for name in REGIONS},
     )
 

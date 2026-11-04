@@ -163,11 +163,12 @@ uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py
 The comparison trains the staged model: a mean stage for 3,000 epochs and a
 Gamma variance stage for 3,000 epochs, then the
 [posterior stage](posterior-stage.md) for 2,000 epochs under an isotropic
-Gaussian prior of precision 1, once for each inference method on the same
-trained stages. Every stage runs its full budget, with no early stopping. Both
-supervised stages use Adam at learning rate 1e-3 and batches of 100, with an L2
-penalty from the same prior: weight decay `prior_precision / 1000` added to the
-gradient before Adam, so each fits its network's MAP estimate. As in
+Gaussian prior of precision 0.04 (`--prior-precision`, a standard deviation
+of 5), once for each inference method on the same trained stages. Every stage
+runs its full budget, with no early stopping. Both supervised stages use Adam
+at learning rate 1e-3 and batches of 100, with an L2 penalty from the same
+prior: weight decay `prior_precision / 1000` added to the gradient before Adam,
+so each fits its network's MAP estimate. As in
 [VeBNN](https://github.com/bessagroup/VeBNN), every model, joint or staged,
 trains on targets standardized by the training targets' mean and standard
 deviation, and its predictions are mapped back to the targets' units before
@@ -203,11 +204,12 @@ with fresh noisy targets drawn from a different seed, split into the glossary's
 [in-distribution, gap and extrapolation regions](../glossary.md). Every
 configuration is reduced to per-draw predictive means and variances on the
 grid, and its predictive is the equal-weight mixture of those Gaussians. The
-table prints one row per configuration: the in-distribution RMSE of the
-predictive mean, then for each region the aleatoric σ (square root of the
-region average of the draw-averaged variance), the epistemic σ (square root of
-the region average of the variance of the means over draws) and the 95%
-coverage of the mixture's exact central interval.
+table prints one row per configuration: the in-distribution R² of the
+predictive mean, then for each region the epistemic share σ_epi / σ_total and
+the 95% coverage of the mixture's exact central interval. σ_epi is the square
+root of the region average of the variance of the means over draws, σ_ale the
+square root of the region average of the draw-averaged variance, and
+σ_total = √(σ_epi² + σ_ale²).
 
 Standardizing the targets does not put the squared residuals at unit scale:
 the noise is small against the curve's spread, and they stay about 4e-3. The

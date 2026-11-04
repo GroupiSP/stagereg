@@ -100,8 +100,9 @@ class ClusteredDataConfig:
         num_draws: Number of posterior draws every configuration is scored
             on.
         prior_precision: Precision of the isotropic Gaussian prior over the
-            network's weights: the posterior stage's prior and the mean and
-            variance stages' L2 penalty.
+            network's weights: every method's posterior prior, joint or
+            staged, and the mean and variance stages' L2 penalty. The
+            default 0.04 is a prior standard deviation of 5.
         bbb_learning_rate: Adam learning rate of Bayes by Backprop.
         bbb_initial_std: Initial standard deviation of Bayes by Backprop's
             mean-field Gaussian.
@@ -119,7 +120,7 @@ class ClusteredDataConfig:
     variance_epochs: int = 3_000
     posterior_epochs: int = 2_000
     num_draws: int = 100
-    prior_precision: float = 1.0
+    prior_precision: float = 0.04
     bbb_learning_rate: float = 1e-2
     bbb_initial_std: float = 1e-2
     mc_dropout_rate: float = 0.1

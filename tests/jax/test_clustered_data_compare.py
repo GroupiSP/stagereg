@@ -161,14 +161,13 @@ def test_main_prints_a_row_per_configuration_with_every_region(
     lines = capsys.readouterr().out.strip().splitlines()
     title = next(i for i, line in enumerate(lines) if line.startswith("Clustered"))
     header, *rows = lines[title + 1 :]
-    assert header.split()[:3] == ["ID", "RMSE", "ID"]
+    assert header.split()[:3] == ["ID", "R²", "ID"]
     assert [row.split("  ")[0] for row in rows] == _CONFIGURATION_NAMES
     for row in rows:
         cells = re.findall(_NUMBER, row)
-        assert len(cells) == 1 + 3 * len(clustered_regions.REGIONS)
-        coverages = [float(cell) for cell in cells[3::3]]
-        assert len(coverages) == 3
-        assert all(0.0 <= coverage <= 1.0 for coverage in coverages)
+        assert len(cells) == 1 + 2 * len(clustered_regions.REGIONS)
+        shares_and_coverages = [float(cell) for cell in cells[1:]]
+        assert all(0.0 <= value <= 1.0 for value in shares_and_coverages)
 
 
 def test_main_aggregates_every_configuration_over_two_seeds(
@@ -189,13 +188,13 @@ def test_main_aggregates_every_configuration_over_two_seeds(
     assert set(runs_per_seed) == {"3", "4"}
     assert runs_per_seed["3"] == runs_per_seed["4"]
     header_index = next(
-        i for i, line in enumerate(lines) if line.lstrip().startswith("ID RMSE")
+        i for i, line in enumerate(lines) if line.lstrip().startswith("ID R²")
     )
     rows = lines[header_index + 1 :]
     assert [row.split("  ")[0].strip() for row in rows] == runs_per_seed["3"]
     for row in rows:
         cells = re.findall(rf"{_NUMBER} ± {_NUMBER}", row)
-        assert len(cells) == 1 + 3 * len(clustered_regions.REGIONS)
+        assert len(cells) == 1 + 2 * len(clustered_regions.REGIONS)
 
 
 def test_main_rejects_a_non_positive_number_of_seeds(

@@ -34,5 +34,8 @@ Before presenting changes for review, all four must pass:
 
 ## Replies
 
-Answer concisely. Reach for a table, diagram, code snippet or worked example when prose alone
-would not carry the point — not by default.
+Always include a TL;DR summary at the top of your reply. Complement it with a table, diagram or code snippet if it helps delivering the point.
+
+Avoid long paragraphs. Sacrifice grammar for the sake of clarity.
+
+ Use bullet points, numbered lists, and headings to structure your reply.

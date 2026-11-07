@@ -239,6 +239,23 @@ assert reads == [("train", 0)]
 The splits default to `("train", "validation")`, so the source loader has to
 serve both, or the stage has to be told otherwise with `splits=("train",)`.
 
+### Residual scale
+
+Squared residuals are often far from one: a mean model that fits to within
+0.03 leaves residuals near 1e-3. To reach such a variance, a Gamma head would
+need a rate near a thousand times its concentration, and so huge raw outputs
+and weights. Away from the data, a small drift in the features then swings
+those outputs through zero, and the predicted variance blows up by orders of
+magnitude. `prepare` therefore also sets every
+[`ResidualScale`][stagereg.jax.ResidualScale] in the variance model to the
+mean squared residual of the training split. A
+[`GammaHead`][stagereg.jax.GammaHead] divides its rate by that scale, so its
+network predicts at unit scale and its mean stays in the targets' units.
+Scaling the targets by `k` scales the trained variance by `k**2`. A custom
+variance model gets the same behavior by holding a `ResidualScale` and
+dividing its rate by it; one without a `ResidualScale` trains on the raw
+residuals.
+
 !!! warning "Residuals are held in memory"
 
     Materialization caches every batch of every configured split, inputs and

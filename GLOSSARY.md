@@ -1,8 +1,8 @@
 # stagereg
 
-The shared vocabulary of this repository: the language of a training run and of recording one with an experiment tracker, which the library itself declares, and the language of the NASA CMAPSS FD001 remaining-useful-life example — obtaining the dataset, and describing the targets the models predict and the curves that visualize them.
+The shared vocabulary of this repository: the language of a training run and of recording one with an experiment tracker, which the library itself declares, the language of the NASA CMAPSS FD001 remaining-useful-life example — obtaining the dataset, and describing the targets the models predict and the curves that visualize them — and the language of the clustered-data example, which compares how confident joint and staged posteriors are in and out of distribution.
 
-One section per area. A term belongs in the training-and-tracking section when the library uses it, and in the CMAPSS section when only that example does.
+One section per area. A term belongs in the training-and-tracking section when the library uses it, and in an example's section when only that example does.
 
 ## Training and tracking
 
@@ -88,6 +88,10 @@ _Avoid_: Checkpoint name, checkpoint ID
 **Aleatoric variance**:
 The variance of the noise in the targets around their true mean, as estimated by the variance stage. It is a property of the data and does not shrink with more data.
 _Avoid_: Noise variance (ambiguous with the noise of an inference method), data uncertainty
+
+**Residual scale**:
+The mean squared residual of the training split, which the variance stage hands its model so the variance network predicts at unit scale while its aleatoric variance stays in the targets' units.
+_Avoid_: Target scale, normalization constant
 
 **Epistemic variance**:
 The spread of the mean function across the draws of a posterior, i.e. the uncertainty about the mean that more data would reduce.
@@ -184,3 +188,25 @@ _Avoid_: Representative units, extreme units, best/worst units (none of the thre
 **Predictive interval**:
 The `loc ± 1.96 * scale` band of the composite Gaussian predictive distribution, covering 95% of its mass and left unclipped at zero, so that a band extending below zero remains visible as evidence of the Gaussian assumption breaking down near end of life.
 _Avoid_: Confidence interval (this is an interval over a predicted value, not over a parameter estimate)
+
+## Clustered-data example
+
+**In-distribution region**:
+The inputs the training data cover: two clusters, `[-0.2, 0.2]` and `[0.6, 1.0]`.
+_Avoid_: Training region, interpolation region (the gap also lies between the clusters)
+
+**Gap region**:
+The inputs between the two clusters, `(0.2, 0.6)`: out of distribution, but bracketed by training data on both sides.
+_Avoid_: Interpolation region, hole
+
+**Extrapolation region**:
+The inputs beyond both clusters on the evaluation grid, `[-0.5, -0.2)` and `(1.0, 1.5]`: out of distribution with training data on one side only.
+_Avoid_: Out-of-distribution region (the gap is out of distribution too), tails
+
+**Joint posterior**:
+A posterior over the whole network of a joint model, inferred from a random initialization under the Gaussian likelihood with the variance the network itself predicts, so that each draw gives a mean and a variance. The baseline the staged model's posterior predictive is compared against; its aleatoric variance is the average of the draws' variances.
+_Avoid_: Bayesian MVE, end-to-end BNN, joint BNN
+
+**Calibration curve**:
+The observed fraction of targets inside a predictive distribution's central interval, plotted against the interval's nominal level. A calibrated predictive lies on the diagonal; a curve below it is overconfident.
+_Avoid_: Reliability diagram (usually for classification), coverage plot

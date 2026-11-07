@@ -9,8 +9,9 @@ extra (`jax`, `plot`) or through an example-only dependency group.
 
 Only the commands shown here are entry points. The other modules beside them,
 `xsin/benchmark.py`, `xsin/posterior_benchmark.py`, `cmapss/model.py`,
-`cmapss/preprocessing.py`, `cmapss/plots.py` and
-`tracking/tensorboard_tracker.py`, hold shared code the scripts import.
+`cmapss/preprocessing.py`, `cmapss/plots.py`,
+`tracking/tensorboard_tracker.py` and every `clustered_data/` module but
+`compare.py`, hold shared code the scripts import.
 
 ## Simple regression
 
@@ -142,6 +143,131 @@ a copy you already have.
 
 README:
 [`examples/jax/cmapss/README.md`](https://github.com/GroupiSP/stagereg/blob/main/examples/jax/cmapss/README.md)
+
+## Clustered data
+
+How confident the joint and staged models are inside the training data and
+away from it, on a heteroscedastic variant of the "Simulate data" set of the
+UvA DL2 Bayesian neural network tutorial 1: two clusters of 200 points on
+`[-0.2, 0.2]` and `[0.6, 1.0]` (seed 42) with a sum-of-sines target:
+
+```text
+y = x + 0.3 sin(2π(x + ε)) + 0.3 sin(4π(x + ε)) + 0.1 ε / (|x| + 0.01),   ε ~ N(0, 0.02²)
+```
+
+The noise enters the sines' arguments and an additive term that grows as `x`
+approaches 0, so the noise is heteroscedastic. The targets scatter about the
+noise-free curve by about 0.02 (RMS) at the left cluster's edges, 0.07 over
+the right cluster and 0.16 within 0.02 of `x = 0`, where single residuals
+reach 0.4. The offset 0.01 bounds the additive term's σ at 0.2. Every model shares one Tanh MLP backbone of 5 hidden layers of 10
+units, which first maps the training inputs' range `[-0.2, 1.0]` onto
+`[-1, 1]` with a fixed affine map.
+
+```bash
+uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py
+```
+
+The comparison trains the staged model: a mean stage for 3,000 epochs and a
+Gamma variance stage for 3,000 epochs, then the
+[posterior stage](posterior-stage.md) for 2,000 epochs under an isotropic
+Gaussian prior of precision 0.25 (`--prior-precision`, a standard deviation
+of 2), once for each inference method on the same trained stages, except
+pSGLD (see below). Every stage
+runs its full budget, with no early stopping. Both supervised stages use Adam
+at learning rate 1e-3 and batches of 100, with an L2 penalty from the same
+prior: weight decay `prior_precision / 400` added to the gradient before Adam,
+so each fits its network's MAP estimate. As in
+[VeBNN](https://github.com/bessagroup/VeBNN), every model, joint or staged,
+trains on targets standardized by the training targets' mean and standard
+deviation, and its predictions are mapped back to the targets' units before
+scoring.
+
+| Method | Posterior-stage setting | Backbone dropout | Draws |
+| --- | --- | --- | --- |
+| Bayes by Backprop (`BBB`) | Adam at 1e-2, initial σ 1e-2 | 0 | 100 sampled at prediction |
+| MC dropout (`MCD`) | Adam at 1e-3 | 0.1 (`--mc-dropout-rate`) | 100 sampled at prediction |
+| pSGLD (`pSGLD`) | step size 3e-3, 5 chains (`--psgld-chains`) | 0 | 20 retained per chain, evenly thinned over the final 1,000 epochs; 100 pooled |
+
+The three runs differ only in the inference method and the dropout rate; the
+architecture, prior, batch size and epochs are shared. A single pSGLD chain
+stays near the mode it starts from, so the staged pSGLD runs 5 chains, each
+from the MAP of its own mean and variance stages, trained from their own
+initialization, and pools their draws; the other two methods share the first
+chain's stages. Each chain's burn-in and thinning count update steps: at the
+defaults it burns in the first 4,000 of its 8,000 steps and keeps every 200th
+step after them, the last one included.
+
+It also infers the joint posterior, the baseline: one network shares the
+backbone between a mean head and a variance head (a softplus plus a 1e-6
+floor), and each of the three methods infers every weight, variance head
+included, under the network's own Gaussian likelihood and the same prior. Each
+joint run uses its staged counterpart's settings, dropout rate and number of
+draws from the table above. It starts from a random initialization with no warm
+start and no early stopping, and runs as many epochs as the staged model's
+mean stage (`--mean-epochs`, 3,000 at the defaults); the variance and posterior
+stages' budgets are the staged model's alone. Joint pSGLD also runs 5
+chains, each from its own random initialization, and pools their draws. Each
+chain spreads its 20 draws evenly over the final half of its own run, the
+final 1,500 epochs at the defaults: it burns in the first 6,000 of its 12,000
+steps and keeps every 300th step after them. Each joint draw carries its own mean and variance. The six
+configurations take about a minute and a half at the defaults on a laptop CPU.
+
+It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,
+with fresh noisy targets drawn from a different seed, split into the glossary's
+[in-distribution, gap and extrapolation regions](../glossary.md). Every
+configuration is reduced to per-draw predictive means and variances on the
+grid, and its predictive is the equal-weight mixture of those Gaussians. The
+table prints one row per configuration: the in-distribution R² of the
+predictive mean, then for each region the epistemic share σ_epi / σ_total and
+the 95% coverage of the mixture's exact central interval. σ_epi is the square
+root of the region average of the variance of the means over draws, σ_ale the
+square root of the region average of the draw-averaged variance, and
+σ_total = √(σ_epi² + σ_ale²).
+
+Standardizing the targets does not put the squared residuals at unit scale:
+the noise is small against the curve's spread, and their mean is about 0.03. The
+variance stage divides the Gamma head's rate by their mean (see
+[Residual scale](two-step-training.md#residual-scale)), which keeps the
+staged extrapolation σ_ale between 0.11 and 0.37 over seeds 0 to 9 on the
+earlier homoscedastic data of 500 points per cluster. Without
+that division, the head's raw rate output had to reach about +100 to fit the
+data. Its drift past `x = 1.2` then pushed the rate onto its 1e-6 floor, and
+the extrapolation σ_ale grew to the hundreds at several seeds, standardized
+or not
+([ADR 0017](https://github.com/GroupiSP/stagereg/blob/main/docs/adr/0017-the-clustered-data-example-trains-on-standardized-targets-under-l2.md)).
+
+`--seeds N` (default 1) repeats the whole comparison over seeds `--seed` to
+`--seed + N - 1`. The training data and the grid stay fixed, so only the
+initialization, the batch order and the draws vary. With more than one seed,
+every table cell reports `mean ± std` over seeds:
+
+```bash
+uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py --seeds 5
+```
+
+It then draws the first seed's configurations in two figures. The uncertainty
+grid has one row per training and one column per inference method; each panel
+shows the training points, the noise-free truth, the predictive mean, an inner
+band of ±1.96 epistemic σ and an outer band of ±1.96 total σ, with the gap and
+extrapolation regions shaded. The second figure plots one
+[calibration curve](../glossary.md) per method in the extrapolation region, at
+nominal levels 0.05 to 0.95, from the same mixture scoring as the table's
+coverage. Both
+figures are shown on screen, or saved as `uncertainty_grid.png` and
+`extrapolation_calibration.png` into the directory `--plot-path` names, with
+no window opened.
+
+Every setting is a flag, `--noise-std` among them; `--help` lists them with
+their defaults. A quick run at small settings, saving the figures:
+
+```bash
+uv run --extra jax --extra plot python examples/jax/clustered_data/compare.py \
+    --mean-epochs 50 --variance-epochs 50 --posterior-epochs 20 --num-draws 10 \
+    --plot-path figures/
+```
+
+Source:
+[`examples/jax/clustered_data/`](https://github.com/GroupiSP/stagereg/tree/main/examples/jax/clustered_data)
 
 ## Tracking a run
 

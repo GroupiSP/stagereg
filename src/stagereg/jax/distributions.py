@@ -715,8 +715,38 @@ class GaussianHead(nnx.Module):
         return Gaussian(loc=raw_loc, scale=scale)
 
 
+class ResidualScale(nnx.Variable):
+    """The mean squared residual a Gamma head's rate is divided by.
+
+    A non-trainable variable: optimizers built by
+    [`create_optimizer`][stagereg.jax.create_optimizer] update only
+    ``nnx.Param``, so training leaves it alone, while checkpoints and clones
+    carry it with the rest of the model.
+    [`GammaVarianceStage`][stagereg.jax.GammaVarianceStage] sets every
+    ``ResidualScale`` in its model to the mean training squared residual
+    before training.
+    """
+
+
 class GammaHead(nnx.Module):
-    """An NNX head producing a shape/rate [`Gamma`][stagereg.jax.Gamma] distribution."""
+    """An NNX head producing a shape/rate [`Gamma`][stagereg.jax.Gamma] distribution.
+
+    The rate is ``(softplus(raw_rate) + eps) / residual_scale``, so the head's
+    linear layer predicts the rate at unit residual scale and the
+    distribution's mean stays in the targets' units. The
+    [`ResidualScale`][stagereg.jax.ResidualScale] starts at one;
+    [`GammaVarianceStage`][stagereg.jax.GammaVarianceStage] sets it from the
+    data. Without it, squared residuals of order ``1e-3`` would need rate
+    logits of order ``1e2``, and a drift of such a logit through zero away
+    from the data blows the predicted variance up onto the ``eps`` floor.
+
+    Attributes:
+        out_features: Number of predicted target dimensions.
+        eps: Positive offset added to the rate and concentration after
+            ``softplus``, before the rate is divided by the residual scale.
+        linear: Projection from features to the raw concentration and rate.
+        residual_scale: The scalar residual scale the rate is divided by.
+    """
 
     def __init__(
         self,
@@ -744,6 +774,7 @@ class GammaHead(nnx.Module):
         self.out_features = out_features
         self.eps = eps
         self.linear = nnx.Linear(in_features, 2 * out_features, rngs=rngs)
+        self.residual_scale = ResidualScale(jnp.ones(()))
 
     def __call__(self, features: jax.Array) -> Gamma:
         """Produce a Gamma prediction from model features.
@@ -761,5 +792,5 @@ class GammaHead(nnx.Module):
             axis=-1,
         )
         concentration = jax.nn.softplus(raw_concentration) + self.eps
-        rate = jax.nn.softplus(raw_rate) + self.eps
+        rate = (jax.nn.softplus(raw_rate) + self.eps) / self.residual_scale.get_value()
         return Gamma(concentration=concentration, rate=rate)

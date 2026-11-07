@@ -3,7 +3,9 @@
 A mean stage, then a Gamma variance stage on its squared residuals, then the library's
 posterior stage over the mean network: one outer pass, as in the xsin example. The mean
 and variance stages are trained once per seed and shared by every inference method's
-posterior stage. Every stage runs a fixed number of epochs, without early stopping: the
+posterior stage. pSGLD runs `psgld_chains` chains instead, each from the MAP of its own
+mean and variance stages (see `train_supervised_stages`' `chain`), whose draws the
+comparison pools. Every stage runs a fixed number of epochs, without early stopping: the
 mean stage as many as a joint run, the variance and posterior stages their own budgets.
 The mean and variance stages are L2-regularized under the posterior stage's isotropic
 Gaussian prior, as in VeBNN: each fits the MAP estimate of its network.
@@ -82,7 +84,7 @@ def l2_regularized_adam(config: ClusteredDataConfig) -> optax.GradientTransforma
 
 
 def train_supervised_stages(
-    data: ClusteredData, config: ClusteredDataConfig
+    data: ClusteredData, config: ClusteredDataConfig, *, chain: int = 0
 ) -> SupervisedStages:
     """Train the mean stage, then the Gamma variance stage, silently.
 
@@ -92,13 +94,17 @@ def train_supervised_stages(
         data: The training set to fit.
         config: The comparison's settings; `seed` sets the initialization
             and the batch order.
+        chain: Index of the pSGLD chain the stages start; each index has its
+            own initialization and state. Chain 0 is the stages every other
+            method shares.
 
     Returns:
         The trained stages.
     """
-    mean_key, variance_key, train_key = jax.random.split(
-        seed_key(config, SUPERVISED_STREAM), 3
-    )
+    key = seed_key(config, SUPERVISED_STREAM)
+    if chain:
+        key = jax.random.fold_in(key, chain)
+    mean_key, variance_key, train_key = jax.random.split(key, 3)
     loader = make_loader(data, config)
     state = TrainingState(rng_state=train_key)
 

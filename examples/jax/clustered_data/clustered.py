@@ -114,6 +114,10 @@ class ClusteredDataConfig:
             other methods run it without dropout.
         mc_dropout_learning_rate: Adam learning rate of MC dropout.
         psgld_step_size: Langevin step size of pSGLD.
+        psgld_chains: Number of pSGLD chains per run. They split the
+            `num_draws` draws evenly and are pooled. Each staged chain
+            starts from its own mean stage's MAP, with its own variance
+            stage; each joint chain from its own random initialization.
         seed: Seed of the models' initialization, batch order and draws.
     """
 
@@ -130,6 +134,7 @@ class ClusteredDataConfig:
     mc_dropout_rate: float = 0.1
     mc_dropout_learning_rate: float = 1e-3
     psgld_step_size: float = 3e-3
+    psgld_chains: int = 5
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -138,9 +143,10 @@ class ClusteredDataConfig:
         Raises:
             ValueError: If a count is not positive, a scale or rate is not
                 finite and positive (the noise level may be zero), the
-                dropout rate is not in `(0, 1)`, or the final half of the
-                posterior epochs or of the joint run's epochs has fewer
-                update steps than `num_draws`.
+                dropout rate is not in `(0, 1)`, `psgld_chains` does not
+                divide `num_draws`, or the final half of the posterior
+                epochs or of the joint run's epochs has fewer update steps
+                than a pSGLD chain's draws.
         """
         counts = {
             "batch_size": self.batch_size,
@@ -148,6 +154,7 @@ class ClusteredDataConfig:
             "variance_epochs": self.variance_epochs,
             "posterior_epochs": self.posterior_epochs,
             "num_draws": self.num_draws,
+            "psgld_chains": self.psgld_chains,
         }
         for name, value in counts.items():
             if value <= 0:
@@ -169,8 +176,14 @@ class ClusteredDataConfig:
             raise ValueError(
                 f"mc_dropout_rate must lie in (0, 1), got {self.mc_dropout_rate}."
             )
-        self.psgld_schedule(self.posterior_epochs)
-        self.psgld_schedule(self.mean_epochs)
+        if self.num_draws % self.psgld_chains:
+            raise ValueError(
+                f"psgld_chains ({self.psgld_chains}) must divide num_draws "
+                f"({self.num_draws})."
+            )
+        chain_draws = self.num_draws // self.psgld_chains
+        self.psgld_schedule(self.posterior_epochs, chain_draws)
+        self.psgld_schedule(self.mean_epochs, chain_draws)
 
     @property
     def train_size(self) -> int:
@@ -182,7 +195,9 @@ class ClusteredDataConfig:
         """Number of update steps (batches) per epoch."""
         return ceil(self.train_size / self.batch_size)
 
-    def psgld_schedule(self, epochs: int) -> PsgldSchedule:
+    def psgld_schedule(
+        self, epochs: int, num_draws: int | None = None
+    ) -> PsgldSchedule:
         """Place pSGLD's draws evenly over the final half of a run's epochs.
 
         The run's last update step retains the last draw, and `num_draws`
@@ -191,6 +206,7 @@ class ClusteredDataConfig:
         Args:
             epochs: Epochs the pSGLD run trains: `posterior_epochs` for the
                 staged model's posterior stage, `mean_epochs` for a joint run.
+            num_draws: Draws the run retains, or `None` for `self.num_draws`.
 
         Returns:
             The burn-in and thinning, in update steps.
@@ -199,15 +215,17 @@ class ClusteredDataConfig:
             ValueError: If the final half of the run has fewer update steps
                 than `num_draws`.
         """
+        if num_draws is None:
+            num_draws = self.num_draws
         final_half_steps = (epochs - epochs // 2) * self.steps_per_epoch
-        thinning = final_half_steps // self.num_draws
+        thinning = final_half_steps // num_draws
         if thinning < 1:
             raise ValueError(
-                f"num_draws ({self.num_draws}) exceeds the update steps of the "
+                f"num_draws ({num_draws}) exceeds the update steps of the "
                 f"final half of {epochs} epochs ({final_half_steps})."
             )
         return PsgldSchedule(
-            burn_in=epochs * self.steps_per_epoch - self.num_draws * thinning,
+            burn_in=epochs * self.steps_per_epoch - num_draws * thinning,
             thinning=thinning,
         )
 

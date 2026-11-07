@@ -12,7 +12,10 @@ methods and hyperparameters, on the same backbone: one network with a mean
 head and a variance head, from a random initialization, for as many epochs
 as the staged model's mean stage. The variance and posterior stages have
 budgets of their own, and no stage or run stops early. Every pSGLD run
-draws over the final half of its own epochs.
+draws over the final half of its own epochs, in `--psgld-chains` chains
+that split the draws and are pooled: each staged chain starts from its own
+mean and variance stages' MAP, each joint chain from its own random
+initialization.
 
 Each configuration is reduced to per-draw predictive means and variances
 on the grid and scored on the in-distribution region, the gap region
@@ -55,9 +58,17 @@ if str(_MODULE_DIR) not in sys.path:
 
 from clustered import ClusteredData, ClusteredDataConfig, make_clustered_data
 from figures import draw_figures
-from methods import JOINT, METHODS, TRAININGS, dropout_rate, joint_method
+from methods import (
+    JOINT,
+    METHODS,
+    PSGLD,
+    TRAININGS,
+    dropout_rate,
+    joint_method,
+    psgld_chain_config,
+)
 from regions import EXTRAPOLATION, GAP, IN_DISTRIBUTION, REGIONS, region_masks
-from scoring import PredictiveDraws, Scores, score
+from scoring import PredictiveDraws, Scores, pool_draws, score
 from joint import joint_network, run_joint
 from staged import posterior_network, run_staged, train_supervised_stages
 
@@ -122,7 +133,10 @@ def compare_seed(
     """Train and score every configuration from `config.seed`, silently.
 
     Every joint run trains `config.mean_epochs`, as the staged model's mean
-    stage does. The joint rows precede the staged ones.
+    stage does. Each pSGLD pools `config.psgld_chains` chains: a staged
+    chain starts from its own trained stages' MAP, a joint chain from its
+    own random initialization. The first chain's stages serve every other
+    staged method. The joint rows precede the staged ones.
 
     Args:
         data: The training set and the evaluation grid.
@@ -133,24 +147,41 @@ def compare_seed(
         The seed's configurations and their scores.
     """
     masks = region_masks(data.grid_inputs)
-    supervised = train_supervised_stages(data, config)
+    supervised = [
+        train_supervised_stages(data, config, chain=chain)
+        for chain in range(config.psgld_chains)
+    ]
 
-    def run(training: str, method: str) -> PredictiveDraws:
+    def run_chain(
+        training: str, method: str, run_config: ClusteredDataConfig, chain: int
+    ) -> PredictiveDraws:
         rate = dropout_rate(method, config)
         if training == JOINT:
             return run_joint(
                 data,
-                config,
-                joint_method(method, config),
+                run_config,
+                joint_method(method, run_config),
                 epochs=config.mean_epochs,
-                network=joint_network(config, dropout_rate=rate),
+                network=joint_network(config, dropout_rate=rate, chain=chain),
+                chain=chain,
             )
         return run_staged(
             data,
-            config,
-            supervised,
-            METHODS[method](config),
+            run_config,
+            supervised[chain],
+            METHODS[method](run_config),
             network=posterior_network(config, rate),
+        )
+
+    def run(training: str, method: str) -> PredictiveDraws:
+        if method != PSGLD:
+            return run_chain(training, method, config, 0)
+        chain_config = psgld_chain_config(config)
+        return pool_draws(
+            [
+                run_chain(training, method, chain_config, chain)
+                for chain in range(config.psgld_chains)
+            ]
         )
 
     configurations = []
@@ -294,6 +325,10 @@ _FLAG_HELP: dict[str, str] = {
     "mc_dropout_rate": "Dropout rate of the backbone under MC dropout",
     "mc_dropout_learning_rate": "Adam learning rate of MC dropout",
     "psgld_step_size": "Langevin step size of pSGLD",
+    "psgld_chains": (
+        "pSGLD chains per run, staged from own MAPs, joint from own random "
+        "initializations; they split --num-draws"
+    ),
     "seed": "Seed of the initialization, batch order and draws; the first seed",
 }
 """Each `ClusteredDataConfig` field's command-line help."""

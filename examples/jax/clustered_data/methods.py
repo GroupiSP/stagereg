@@ -10,6 +10,7 @@ source for every training and method name.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 
 import jax
 import optax
@@ -98,6 +99,24 @@ def psgld(config: ClusteredDataConfig, *, epochs: int | None = None) -> Inferenc
         step_size=config.psgld_step_size,
         burn_in=schedule.burn_in,
         thinning=schedule.thinning,
+    )
+
+
+def psgld_chain_config(config: ClusteredDataConfig) -> ClusteredDataConfig:
+    """Return the settings of one pSGLD chain, joint or staged.
+
+    One chain stays near the mode it starts in, so every pSGLD run is
+    `psgld_chains` chains, each from its own start, whose draws are pooled.
+
+    Args:
+        config: The comparison's settings.
+
+    Returns:
+        `config` with a single chain retaining its even share of
+        `num_draws`.
+    """
+    return replace(
+        config, num_draws=config.num_draws // config.psgld_chains, psgld_chains=1
     )
 
 

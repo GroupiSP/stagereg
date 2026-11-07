@@ -171,7 +171,8 @@ The comparison trains the staged model: a mean stage for 3,000 epochs and a
 Gamma variance stage for 3,000 epochs, then the
 [posterior stage](posterior-stage.md) for 2,000 epochs under an isotropic
 Gaussian prior of precision 0.25 (`--prior-precision`, a standard deviation
-of 2), once for each inference method on the same trained stages. Every stage
+of 2), once for each inference method on the same trained stages, except
+pSGLD (see below). Every stage
 runs its full budget, with no early stopping. Both supervised stages use Adam
 at learning rate 1e-3 and batches of 100, with an L2 penalty from the same
 prior: weight decay `prior_precision / 400` added to the gradient before Adam,
@@ -185,12 +186,16 @@ scoring.
 | --- | --- | --- | --- |
 | Bayes by Backprop (`BBB`) | Adam at 1e-2, initial σ 1e-2 | 0 | 100 sampled at prediction |
 | MC dropout (`MCD`) | Adam at 1e-3 | 0.1 (`--mc-dropout-rate`) | 100 sampled at prediction |
-| pSGLD (`pSGLD`) | step size 3e-3 | 0 | 100 retained, evenly thinned over the final 1,000 epochs |
+| pSGLD (`pSGLD`) | step size 3e-3, 5 chains (`--psgld-chains`) | 0 | 20 retained per chain, evenly thinned over the final 1,000 epochs; 100 pooled |
 
 The three runs differ only in the inference method and the dropout rate; the
-architecture, prior, batch size and epochs are shared. pSGLD's burn-in and
-thinning count update steps: at the defaults it burns in the first 4,000 of
-its 8,000 steps and keeps every 40th step after them, the last one included.
+architecture, prior, batch size and epochs are shared. A single pSGLD chain
+stays near the mode it starts from, so the staged pSGLD runs 5 chains, each
+from the MAP of its own mean and variance stages, trained from their own
+initialization, and pools their draws; the other two methods share the first
+chain's stages. Each chain's burn-in and thinning count update steps: at the
+defaults it burns in the first 4,000 of its 8,000 steps and keeps every 200th
+step after them, the last one included.
 
 It also infers the joint posterior, the baseline: one network shares the
 backbone between a mean head and a variance head (a softplus plus a 1e-6
@@ -200,11 +205,12 @@ joint run uses its staged counterpart's settings, dropout rate and number of
 draws from the table above. It starts from a random initialization with no warm
 start and no early stopping, and runs as many epochs as the staged model's
 mean stage (`--mean-epochs`, 3,000 at the defaults); the variance and posterior
-stages' budgets are the staged model's alone. Joint pSGLD spreads its 100 draws
-evenly over the final half of its own run, the final 1,500 epochs at the
-defaults: it burns in the first 6,000 of its 12,000 steps and keeps every
-60th step after them. Each joint draw carries its own mean and variance. The six
-configurations take about a minute at the defaults on a laptop CPU.
+stages' budgets are the staged model's alone. Joint pSGLD also runs 5
+chains, each from its own random initialization, and pools their draws. Each
+chain spreads its 20 draws evenly over the final half of its own run, the
+final 1,500 epochs at the defaults: it burns in the first 6,000 of its 12,000
+steps and keeps every 300th step after them. Each joint draw carries its own mean and variance. The six
+configurations take about a minute and a half at the defaults on a laptop CPU.
 
 It scores 100 posterior draws on a grid of 3,000 points over `[-0.5, 1.5]`,
 with fresh noisy targets drawn from a different seed, split into the glossary's

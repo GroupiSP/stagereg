@@ -77,10 +77,13 @@ def test_grid_targets_carry_fresh_noise(clustered_dataset: ModuleType) -> None:
         {"mc_dropout_rate": 1.0},
         {"mc_dropout_learning_rate": 0.0},
         {"psgld_step_size": 0.0},
-        # The final posterior epoch's 4 steps cannot hold 5 draws.
-        {"posterior_epochs": 1, "num_draws": 5},
+        {"psgld_chains": 0},
+        # 3 chains cannot split 100 draws evenly.
+        {"psgld_chains": 3},
+        # The final posterior epoch's 4 steps cannot hold a lone chain's 5 draws.
+        {"posterior_epochs": 1, "num_draws": 5, "psgld_chains": 1},
         # Nor can the joint run's final mean epoch.
-        {"mean_epochs": 1, "num_draws": 5},
+        {"mean_epochs": 1, "num_draws": 5, "psgld_chains": 1},
     ],
 )
 def test_config_rejects_invalid_settings(
@@ -138,6 +141,9 @@ def test_psgld_schedule_spreads_the_draws_over_the_final_half_at_the_defaults(
     assert (staged.burn_in, staged.thinning) == (4_000, 40)
     # 3,000 joint epochs of 4 steps: the final 6,000 steps hold 100 draws.
     assert (joint.burn_in, joint.thinning) == (6_000, 60)
+    # Each of the 5 staged chains holds its 20 draws in the same final 4,000.
+    chain = config.psgld_schedule(config.posterior_epochs, 20)
+    assert (chain.burn_in, chain.thinning) == (4_000, 200)
 
 
 @settings(deadline=None, max_examples=50)
@@ -156,6 +162,7 @@ def test_psgld_schedule_retains_every_draw_in_the_final_half_of_the_run(
         config = clustered_dataset.ClusteredDataConfig(
             batch_size=batch_size,
             num_draws=num_draws,
+            psgld_chains=1,
             mean_epochs=epochs,
             posterior_epochs=epochs,
         )

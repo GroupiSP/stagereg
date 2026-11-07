@@ -14,10 +14,11 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import numpy as np
 import pytest
 
-pytest.importorskip("jax")
-pytest.importorskip("flax.nnx")
+jax = pytest.importorskip("jax")
+nnx = pytest.importorskip("flax.nnx")
 pytest.importorskip("optax")
 
 _TINY_FLAGS = (
@@ -29,6 +30,8 @@ _TINY_FLAGS = (
     "2",
     "--num-draws",
     "4",
+    "--psgld-chains",
+    "2",
     "--seed",
     "3",
 )
@@ -94,8 +97,9 @@ def test_joint_runs_train_as_many_epochs_as_the_mean_stage(
     monkeypatch.setattr(clustered_compare, "run_joint", recording_run_joint)
     clustered_compare.compare(clustered_data, config, seeds=1)
 
-    # Neither the variance stage's 3 epochs nor the posterior stage's 2 add up.
-    assert budgets == [4, 4, 4]
+    # Neither the variance stage's 3 epochs nor the posterior stage's 2 add up;
+    # BBB and MCD run once, then each of pSGLD's 2 chains.
+    assert budgets == [4, 4, 4, 4]
 
 
 def test_joint_runs_share_each_methods_hyperparameters_and_draw_schedule(
@@ -141,10 +145,11 @@ def test_joint_runs_share_each_methods_hyperparameters_and_draw_schedule(
         joint_runs["PreconditionedSGLD"][0],
         staged_runs["PreconditionedSGLD"][0],
     )
-    # The joint run's 3 epochs of 4 steps put 4 draws 2 steps apart over the
-    # final 8; the posterior stage's 2 epochs, 1 apart over the final 4.
-    assert (joint_psgld.burn_in, joint_psgld.thinning) == (4, 2)
-    assert (staged_psgld.burn_in, staged_psgld.thinning) == (4, 1)
+    # Each of the 2 joint chains' 3 epochs of 4 steps puts its 2 draws 4 steps
+    # apart over the final 8; each of the 2 staged chains' 2 epochs, its 2
+    # draws 2 apart over the final 4.
+    assert (joint_psgld.burn_in, joint_psgld.thinning) == (4, 4)
+    assert (staged_psgld.burn_in, staged_psgld.thinning) == (4, 2)
     assert joint_psgld.step_size == staged_psgld.step_size
 
 
@@ -221,13 +226,90 @@ def test_main_rejects_invalid_settings(
         clustered_compare.main()
 
 
+def test_staged_psgld_pools_one_chain_per_map_of_its_own_stages(
+    clustered_compare: ModuleType,
+    clustered_data: Any,
+    tiny_clustered_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    psgld_starts: list[Any] = []
+    other_starts: list[Any] = []
+    run_staged = clustered_compare.run_staged
+
+    def recording_run_staged(*args: Any, **kwargs: Any) -> Any:
+        is_psgld = type(args[3]).__name__ == "PreconditionedSGLD"
+        (psgld_starts if is_psgld else other_starts).append(args[2])
+        return run_staged(*args, **kwargs)
+
+    monkeypatch.setattr(clustered_compare, "run_staged", recording_run_staged)
+    (result,) = clustered_compare.compare(
+        clustered_data, tiny_clustered_config, seeds=1
+    )
+
+    assert len(psgld_starts) == tiny_clustered_config.psgld_chains == 2
+    assert psgld_starts[0].mean_model is not psgld_starts[1].mean_model
+    # The other staged methods share the first chain's stages.
+    assert all(start is psgld_starts[0] for start in other_starts)
+    staged_psgld = next(c for c in result.configurations if c.name == "staged pSGLD")
+    # 2 chains of 2 draws each pool into the 4 draws every method scores.
+    assert staged_psgld.draws.means.shape == (4, clustered_data.grid_inputs.shape[0])
+
+
+def test_joint_psgld_pools_one_chain_per_random_initialization(
+    clustered_compare: ModuleType,
+    clustered_data: Any,
+    tiny_clustered_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    psgld_networks: list[Any] = []
+    run_joint = clustered_compare.run_joint
+
+    def recording_run_joint(data: Any, config: Any, method: Any, **kwargs: Any) -> Any:
+        if type(method).__name__ == "PreconditionedSGLD":
+            psgld_networks.append(kwargs["network"])
+        return run_joint(data, config, method, **kwargs)
+
+    monkeypatch.setattr(clustered_compare, "run_joint", recording_run_joint)
+    (result,) = clustered_compare.compare(
+        clustered_data, tiny_clustered_config, seeds=1
+    )
+
+    assert len(psgld_networks) == tiny_clustered_config.psgld_chains == 2
+    first, second = (nnx.state(network, nnx.Param) for network in psgld_networks)
+    assert not all(
+        np.allclose(a, b)
+        for a, b in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True)
+    )
+    joint_psgld = next(c for c in result.configurations if c.name == "joint pSGLD")
+    assert joint_psgld.draws.means.shape == (4, clustered_data.grid_inputs.shape[0])
+
+
+def test_each_psgld_chain_trains_its_stages_from_its_own_initialization(
+    clustered_staged: ModuleType, clustered_data: Any, tiny_clustered_config: Any
+) -> None:
+    first = clustered_staged.train_supervised_stages(
+        clustered_data, tiny_clustered_config
+    )
+    second = clustered_staged.train_supervised_stages(
+        clustered_data, tiny_clustered_config, chain=1
+    )
+
+    inputs = clustered_data.grid_inputs
+    assert not np.allclose(first.mean_model(inputs), second.mean_model(inputs))
+
+
 def test_supervised_stages_run_their_full_epochs_without_stopping_early(
     clustered_staged: ModuleType, clustered_dataset: ModuleType
 ) -> None:
     # A learning rate this high makes the training loss oscillate, so an
     # early stopper would stop and restore an early best epoch.
     config = clustered_dataset.ClusteredDataConfig(
-        learning_rate=0.3, mean_epochs=20, variance_epochs=15, num_draws=4, seed=3
+        learning_rate=0.3,
+        mean_epochs=20,
+        variance_epochs=15,
+        num_draws=4,
+        psgld_chains=2,
+        seed=3,
     )
     data = clustered_dataset.make_clustered_data(config)
 

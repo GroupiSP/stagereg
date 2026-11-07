@@ -5,7 +5,9 @@ an inference method infers every weight, variance head included, under the
 network's own predicted variance. The example builds the library's
 [`PosteriorProblem`][stagereg.jax.PosteriorProblem] by hand and drives the
 method with its own loop: a single run from a random initialization, with
-no point-estimate warm start and no early stopping. Any
+no point-estimate warm start and no early stopping. Each run's `chain`
+index gives it its own initialization and update keys, so pSGLD's chains
+start apart. Any
 [`InferenceMethod`][stagereg.jax.InferenceMethod] runs in it unchanged.
 """
 
@@ -32,20 +34,29 @@ from stagereg.core.types import Batch, PyTree
 from stagereg.jax import InferenceMethod, IsotropicGaussianPrior, PosteriorProblem
 
 
+def _chain_key(config: ClusteredDataConfig, stream: int, chain: int) -> jax.Array:
+    """Return a stream's key for one chain; chain 0 keeps the stream's own key."""
+    key = seed_key(config, stream)
+    return jax.random.fold_in(key, chain) if chain else key
+
+
 def joint_network(
-    config: ClusteredDataConfig, *, dropout_rate: float = 0.0
+    config: ClusteredDataConfig, *, dropout_rate: float = 0.0, chain: int = 0
 ) -> JointNetwork:
     """Initialize the joint network at random from `config.seed`.
 
     Args:
         config: The comparison's settings; `seed` sets the initialization.
         dropout_rate: The trunk's dropout rate.
+        chain: Index of the pSGLD chain the network starts; each index has
+            its own initialization.
 
     Returns:
         A freshly initialized `JointNetwork`.
     """
     return JointNetwork(
-        dropout_rate=dropout_rate, rngs=nnx.Rngs(seed_key(config, JOINT_INIT_STREAM))
+        dropout_rate=dropout_rate,
+        rngs=nnx.Rngs(_chain_key(config, JOINT_INIT_STREAM, chain)),
     )
 
 
@@ -106,6 +117,7 @@ def run_joint(
     *,
     epochs: int,
     network: JointNetwork | None = None,
+    chain: int = 0,
 ) -> PredictiveDraws:
     """Infer the joint posterior from a random initialization and draw on the grid.
 
@@ -117,6 +129,8 @@ def run_joint(
             as the staged model's mean stage does.
         network: The joint network to infer over, or `None` for a fresh one
             without dropout.
+        chain: Index of the pSGLD chain the run is; each index has its own
+            update keys, and its own fresh network when `network` is `None`.
 
     Returns:
         `config.num_draws` draws (all retained samples for a finite
@@ -124,10 +138,10 @@ def run_joint(
         on the grid, in the targets' units.
     """
     if network is None:
-        network = joint_network(config)
+        network = joint_network(config, chain=chain)
     problem = joint_problem(network, data, config, epochs=epochs)
     inference_method.init(problem)
-    key = seed_key(config, JOINT_TRAIN_STREAM)
+    key = _chain_key(config, JOINT_TRAIN_STREAM, chain)
     for epoch in range(epochs):
         for batch in problem.train_loader(split="train", epoch=epoch):
             key, step_key = jax.random.split(key)

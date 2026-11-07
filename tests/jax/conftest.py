@@ -551,7 +551,12 @@ def clustered_dataset() -> ModuleType:
 def tiny_clustered_config(clustered_dataset: ModuleType) -> Any:
     """A clustered-data configuration whose every run trains in a few seconds."""
     return clustered_dataset.ClusteredDataConfig(
-        mean_epochs=3, variance_epochs=3, posterior_epochs=2, num_draws=4, seed=3
+        mean_epochs=3,
+        variance_epochs=3,
+        posterior_epochs=2,
+        num_draws=4,
+        psgld_chains=2,
+        seed=3,
     )
 
 

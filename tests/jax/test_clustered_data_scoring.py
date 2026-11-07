@@ -276,3 +276,28 @@ def test_draws_in_target_units_keep_the_pit_and_scale_the_sigma(
             std * standardized.regions[region].aleatoric_std,
             rtol=1e-4,
         )
+
+
+def test_pooled_draws_are_the_equal_weight_mixture_of_the_runs(
+    clustered_scoring: ModuleType,
+) -> None:
+    grid = jnp.linspace(-0.5, 1.5, 7)
+    first = clustered_scoring.PredictiveDraws(
+        means=jnp.stack([grid, 2 * grid]), variances=jnp.full((2, 7), 0.1)
+    )
+    second = clustered_scoring.PredictiveDraws(
+        means=-grid[None], variances=jnp.full((1, 7), 0.3)
+    )
+
+    pooled = clustered_scoring.pool_draws([first, second])
+
+    assert pooled.means.shape == pooled.variances.shape == (3, 7)
+    expected_cdf = (
+        2 * clustered_scoring.mixture_cdf(first, grid)
+        + clustered_scoring.mixture_cdf(second, grid)
+    ) / 3
+    np.testing.assert_allclose(
+        np.asarray(clustered_scoring.mixture_cdf(pooled, grid)),
+        np.asarray(expected_cdf),
+        rtol=1e-5,
+    )

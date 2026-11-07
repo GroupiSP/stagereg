@@ -52,6 +52,21 @@ class PredictiveDraws:
         )
 
 
+def pool_draws(draws: Sequence[PredictiveDraws]) -> PredictiveDraws:
+    """Pool several runs' draws into one equal-weight predictive.
+
+    Args:
+        draws: The runs' draws, all on the same grid.
+
+    Returns:
+        Every run's draws, stacked in order along the draw axis.
+    """
+    return PredictiveDraws(
+        means=jnp.concatenate([run.means for run in draws]),
+        variances=jnp.concatenate([run.variances for run in draws]),
+    )
+
+
 def mixture_cdf(draws: PredictiveDraws, targets: jax.Array) -> jax.Array:
     """Evaluate the equal-weight Gaussian mixture's CDF at the targets.
 

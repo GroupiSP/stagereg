@@ -5,6 +5,8 @@ All notable changes to `stagereg` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-08
+
 ### Breaking changes
 
 - `GammaHead` divides its rate by a new non-trainable `ResidualScale`, which
@@ -14,21 +16,29 @@ All notable changes to `stagereg` are recorded here. The format follows
   Without it, squared residuals of order 1e-3 forced rate logits of order 1e2
   and blew the variance up away from the data (the clustered-data example's
   staged extrapolation σ_ale fell from 331 to 0.13). `GammaHead` checkpoints
-  saved earlier do not restore into the new head (ADR 0016).
-- `GammaVarianceStage.prepare` raises when `"train"` is not among its `splits`,
-  or when the training squared residuals' mean is not positive and finite.
+  saved earlier do not restore into the new default head; pass
+  `residual_scaling=False` to keep the earlier head, its training and its
+  checkpoints (ADR 0016).
+- When its variance model holds a `ResidualScale`,
+  `GammaVarianceStage.prepare` raises if `"train"` is not among its `splits`,
+  or if the training squared residuals' mean is not positive and finite.
 
 ### Added
 
 - `ResidualScale`: the `nnx.Variable` a custom Gamma variance model holds and
   divides its rate by to get the same scaling (ADR 0016).
-
-### Changed
-
-- The clustered-data example trains every model on standardized targets and
-  its mean and variance stages under an L2 penalty from the posterior prior,
-  as VeBNN does; scores stay in the targets' units. Its staged extrapolation
-  σ_ale stays between 0.11 and 0.37 over seeds 0 to 9 (ADR 0017).
+- `GammaHead(..., residual_scaling=True)`: `False` builds a head without a
+  `ResidualScale`, which trains on the raw residuals as in 0.5.0 (ADR 0016).
+- The clustered-data example (`examples/jax/clustered_data/`): staged and
+  joint Bayes by Backprop, MC dropout and pSGLD on heteroscedastic
+  two-cluster data, compared by in-distribution R² and by per-region
+  epistemic share and 95% coverage in the in-distribution, gap and
+  extrapolation regions. Each pSGLD run pools 5 chains (`--psgld-chains`);
+  `--seeds` repeats the comparison and `--plot-path` saves the uncertainty
+  grid and extrapolation calibration figures. Every model trains on
+  standardized targets and its mean and variance stages under an L2 penalty
+  from the posterior prior, as VeBNN does; scores stay in the targets' units
+  (ADR 0017).
 
 ## [0.5.0] - 2026-10-23
 

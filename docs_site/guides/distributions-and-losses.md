@@ -33,7 +33,8 @@ variable that
 [`GammaVarianceStage`][stagereg.jax.GammaVarianceStage] sets to the mean
 training squared residual. The network therefore predicts at unit scale
 whatever the targets' units, and the distribution's mean stays in those
-units.
+units. `GammaHead(..., residual_scaling=False)` holds no residual scale and
+trains on the raw residuals, as in stagereg 0.5.0.
 
 To give a head something to work with, put it after a feature extractor in an
 ordinary Flax NNX module. The model's call then returns the distribution:

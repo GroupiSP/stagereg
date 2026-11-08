@@ -21,6 +21,7 @@ from stagereg.jax.distributions import (
     GaussianHead,
     MomentMatchedPredictive,
     PosteriorPredictive,
+    ResidualScale,
 )
 from stagereg.core import metrics as core_metrics
 from stagereg.core import Batch, ClosedFormCRPS, expected_gaussian_mixture_crps
@@ -185,6 +186,21 @@ def test_gamma_head_produces_positive_parameters_under_extreme_inputs() -> None:
     assert bool(jnp.all(prediction.rate > 0.0))
     assert bool(jnp.all(jnp.isfinite(prediction.concentration)))
     assert bool(jnp.all(jnp.isfinite(prediction.rate)))
+
+
+def test_gamma_head_holds_a_unit_residual_scale_by_default() -> None:
+    head = GammaHead(1, 1, rngs=nnx.Rngs(0))
+
+    scales = jax.tree.leaves(nnx.state(head, ResidualScale))
+
+    assert [float(scale) for scale in scales] == [1.0]
+
+
+def test_gamma_head_without_residual_scaling_holds_only_its_linear_layer() -> None:
+    # The state of a 0.5.0 `GammaHead`, so its checkpoints restore.
+    head = GammaHead(1, 1, rngs=nnx.Rngs(0), residual_scaling=False)
+
+    assert set(nnx.state(head)) == {"linear"}
 
 
 @pytest.mark.parametrize(

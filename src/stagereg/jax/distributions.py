@@ -731,21 +731,24 @@ class ResidualScale(nnx.Variable):
 class GammaHead(nnx.Module):
     """An NNX head producing a shape/rate [`Gamma`][stagereg.jax.Gamma] distribution.
 
-    The rate is ``(softplus(raw_rate) + eps) / residual_scale``, so the head's
-    linear layer predicts the rate at unit residual scale and the
+    By default the rate is ``(softplus(raw_rate) + eps) / residual_scale``, so
+    the head's linear layer predicts the rate at unit residual scale and the
     distribution's mean stays in the targets' units. The
     [`ResidualScale`][stagereg.jax.ResidualScale] starts at one;
     [`GammaVarianceStage`][stagereg.jax.GammaVarianceStage] sets it from the
     data. Without it, squared residuals of order ``1e-3`` would need rate
     logits of order ``1e2``, and a drift of such a logit through zero away
     from the data blows the predicted variance up onto the ``eps`` floor.
+    With ``residual_scaling=False`` the head holds no residual scale and its
+    rate is ``softplus(raw_rate) + eps``.
 
     Attributes:
         out_features: Number of predicted target dimensions.
         eps: Positive offset added to the rate and concentration after
             ``softplus``, before the rate is divided by the residual scale.
         linear: Projection from features to the raw concentration and rate.
-        residual_scale: The scalar residual scale the rate is divided by.
+        residual_scale: The scalar residual scale the rate is divided by, or
+            ``None`` without residual scaling.
     """
 
     def __init__(
@@ -755,6 +758,7 @@ class GammaHead(nnx.Module):
         *,
         rngs: nnx.Rngs,
         eps: float = 1e-6,
+        residual_scaling: bool = True,
     ) -> None:
         """Initialize the Gamma parameter projection.
 
@@ -763,6 +767,10 @@ class GammaHead(nnx.Module):
             out_features: Number of predicted target dimensions.
             rngs: NNX RNG collection used to initialize parameters.
             eps: Positive finite offset added after ``softplus``.
+            residual_scaling: Whether the head holds a
+                [`ResidualScale`][stagereg.jax.ResidualScale] and divides its
+                rate by it. Without one, the head trains on the raw residuals
+                and its state is that of a stagereg 0.5.0 ``GammaHead``.
 
         Raises:
             ValueError: If ``out_features`` or ``eps`` is invalid.
@@ -774,7 +782,7 @@ class GammaHead(nnx.Module):
         self.out_features = out_features
         self.eps = eps
         self.linear = nnx.Linear(in_features, 2 * out_features, rngs=rngs)
-        self.residual_scale = ResidualScale(jnp.ones(()))
+        self.residual_scale = ResidualScale(jnp.ones(())) if residual_scaling else None
 
     def __call__(self, features: jax.Array) -> Gamma:
         """Produce a Gamma prediction from model features.
@@ -792,5 +800,7 @@ class GammaHead(nnx.Module):
             axis=-1,
         )
         concentration = jax.nn.softplus(raw_concentration) + self.eps
-        rate = (jax.nn.softplus(raw_rate) + self.eps) / self.residual_scale.get_value()
+        rate = jax.nn.softplus(raw_rate) + self.eps
+        if self.residual_scale is not None:
+            rate = rate / self.residual_scale.get_value()
         return Gamma(concentration=concentration, rate=rate)

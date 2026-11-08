@@ -152,6 +152,18 @@ def _mean_squared_residual(residual_loader: LoaderFactory) -> float:
     return mean
 
 
+def _holds_residual_scale(model: nnx.Module) -> bool:
+    """Return whether ``model`` holds a [`ResidualScale`][stagereg.jax.ResidualScale].
+
+    Args:
+        model: The variance model.
+
+    Returns:
+        ``True`` if ``model`` holds at least one ``ResidualScale``.
+    """
+    return bool(jax.tree.leaves(nnx.state(model, ResidualScale)))
+
+
 def _set_residual_scale(model: nnx.Module, scale: float) -> None:
     """Set every [`ResidualScale`][stagereg.jax.ResidualScale] in ``model``.
 
@@ -421,9 +433,12 @@ class GammaVarianceStage:
     def prepare(self, state: TrainingState) -> None:
         """Validate Step 1 output and materialize fixed residual targets.
 
-        Also sets every [`ResidualScale`][stagereg.jax.ResidualScale] in the
-        variance model to the mean squared residual of the ``"train"`` split,
-        so a [`GammaHead`][stagereg.jax.GammaHead] trains at unit scale.
+        If the variance model holds a
+        [`ResidualScale`][stagereg.jax.ResidualScale], also sets every one to
+        the mean squared residual of the ``"train"`` split, so a
+        [`GammaHead`][stagereg.jax.GammaHead] trains at unit scale. A model
+        without one, such as ``GammaHead(..., residual_scaling=False)``, trains
+        on the raw residuals.
 
         Args:
             state: Shared state whose mean component is ready.
@@ -431,9 +446,9 @@ class GammaVarianceStage:
         Raises:
             TypeError: If the registered mean component is not an NNX module.
             ValueError: If lifecycle, ownership, or registrations are invalid,
-                if ``"train"`` is not among the materialized splits, or if
-                the training squared residuals' mean is not positive and
-                finite.
+                or, when the variance model holds a ``ResidualScale``, if
+                ``"train"`` is not among the materialized splits or the
+                training squared residuals' mean is not positive and finite.
         """
         if state.lifecycle_state is not StageState.MEAN_READY:
             raise ValueError("variance stage requires MEAN_READY lifecycle state.")
@@ -466,14 +481,19 @@ class GammaVarianceStage:
             splits=self.splits,
             source_epoch=self.source_epoch,
         )
-        residual_scale = _mean_squared_residual(residual_loader)
+        residual_scale = (
+            _mean_squared_residual(residual_loader)
+            if _holds_residual_scale(self.model)
+            else None
+        )
         validation = (
             self.validation_factory(residual_loader)
             if self.validation_factory is not None
             else self.options.validation
         )
 
-        _set_residual_scale(self.model, residual_scale)
+        if residual_scale is not None:
+            _set_residual_scale(self.model, residual_scale)
         state.register_component(self.model_name, self.model)
         state.register_optimizer(self.optimizer_name, self.optimizer)
         state.parameter_roles[self.model_name] = ParameterRole.VARIANCE

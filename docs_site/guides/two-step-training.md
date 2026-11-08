@@ -254,7 +254,9 @@ network predicts at unit scale and its mean stays in the targets' units.
 Scaling the targets by `k` scales the trained variance by `k**2`. A custom
 variance model gets the same behavior by holding a `ResidualScale` and
 dividing its rate by it; one without a `ResidualScale` trains on the raw
-residuals.
+residuals, and so does `GammaHead(..., residual_scaling=False)`, which holds
+none. Without a residual scale, `prepare` neither reads the training split
+nor checks its residuals.
 
 !!! warning "Residuals are held in memory"
 

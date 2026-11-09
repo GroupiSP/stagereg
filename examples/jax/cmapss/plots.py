@@ -327,10 +327,20 @@ def plot_validation_rul_curves(
             y_label = "RUL (cycles)"
             axes.set_ylabel(f"{labelled.label}\n{y_label}" if column == 0 else y_label)
 
-    # One legend for the whole figure: every panel draws the same three
-    # elements, so repeating a legend per panel would say nothing new.
-    handles, labels = grid[0, 0].get_legend_handles_labels()
-    figure.legend(handles, labels, loc="lower center", ncol=len(labels))
+    # One legend for the whole figure, listing the union of the elements
+    # drawn in first-drawn order: the panels of a row draw the same
+    # elements, so a legend per panel would say nothing new, while a
+    # posterior-predictive row adds its two bands to a Gaussian row's one.
+    legend_entries: dict[str, Any] = {}
+    for axes in grid.flat:
+        for handle, label in zip(*axes.get_legend_handles_labels(), strict=True):
+            legend_entries.setdefault(label, handle)
+    figure.legend(
+        list(legend_entries.values()),
+        list(legend_entries),
+        loc="lower center",
+        ncol=len(legend_entries),
+    )
     figure.suptitle("CMAPSS FD001 held-out validation RUL curves")
     figure.tight_layout(rect=(0.0, 0.08 / len(models), 1.0, 1.0))
 

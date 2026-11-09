@@ -601,3 +601,56 @@ def test_posterior_rows_evaluate_each_unit_once(
 
     # One evaluation per curve, so each draw is one function along it.
     assert model.calls == 3
+
+
+def test_mixed_figure_has_one_row_per_model_and_names_both_bands(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 30, 2: 12, 3: 20})
+    window_length = 4
+    models = [
+        cmapss_plots.LabelledModel("joint", _StubModel(offset=0.0)),
+        cmapss_plots.LabelledModel("joint+mcd", _StubPosteriorModel(offset=100.0)),
+        cmapss_plots.LabelledModel("staged", _StubModel(offset=200.0)),
+        cmapss_plots.LabelledModel("staged+mcd", _StubPosteriorModel(offset=300.0)),
+    ]
+    offsets = (0.0, 100.0, 200.0, 300.0)
+    gaussian_bands = {cmapss_plots._INTERVAL_LABEL}
+    posterior_bands = {
+        cmapss_plots._TOTAL_INTERVAL_LABEL,
+        cmapss_plots._EPISTEMIC_INTERVAL_LABEL,
+    }
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        models,
+        units=spanning_units(2, 3, 1),
+        window_length=window_length,
+    )
+
+    grid = np.asarray(figure.axes, dtype=object).reshape(len(models), 3)
+    for row, (labelled, offset) in enumerate(zip(models, offsets, strict=True)):
+        assert labelled.label in grid[row, 0].get_ylabel()
+        expected_bands = (
+            posterior_bands if labelled.label.endswith("+mcd") else gaussian_bands
+        )
+        for column, lifetime in enumerate((12, 20, 30)):
+            axes = grid[row, column]
+            assert set(_bands_by_label(axes)) == expected_bands
+            predicted = _lines_by_label(axes)[cmapss_plots._PREDICTED_MEAN_LABEL]
+            n_windows = lifetime - window_length + 1
+            np.testing.assert_allclose(
+                predicted.get_ydata(), offset + np.arange(n_windows), atol=1e-3
+            )
+    # The single legend lists the union of everything drawn, each once.
+    (legend,) = figure.legends
+    assert [text.get_text() for text in legend.get_texts()] == [
+        cmapss_plots._TRUE_RUL_LABEL,
+        cmapss_plots._PREDICTED_MEAN_LABEL,
+        cmapss_plots._INTERVAL_LABEL,
+        cmapss_plots._TOTAL_INTERVAL_LABEL,
+        cmapss_plots._EPISTEMIC_INTERVAL_LABEL,
+    ]

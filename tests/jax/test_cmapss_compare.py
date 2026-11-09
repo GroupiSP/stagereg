@@ -92,19 +92,20 @@ def test_compare_models_scores_lie_in_their_ranges(
 
 @pytest.fixture(scope="module")
 def mcd_config(tiny_cmapss_config: Any) -> Any:
-    """The tiny configuration with a two-epoch, eight-draw MC-Dropout budget."""
+    """The tiny configuration with two-epoch, eight-draw MC-Dropout budgets."""
     import dataclasses
 
     return dataclasses.replace(
         tiny_cmapss_config,
         dropout_rate=0.2,
         joint_mcd_epochs=2,
+        posterior_epochs=2,
         num_draws=8,
         early_stopping_patience=1,
     )
 
 
-def test_compare_models_with_a_posterior_stage_scores_joint_mcd_between_the_baselines(
+def test_compare_models_with_a_posterior_stage_scores_each_baseline_then_its_mcd(
     cmapss_compare: ModuleType,
     mcd_config: Any,
     synthetic_prepared_data: Callable[..., Any],
@@ -123,6 +124,7 @@ def test_compare_models_with_a_posterior_stage_scores_joint_mcd_between_the_base
             ("joint", "Joint model"),
             ("joint+mcd", "Joint MC-Dropout model"),
             ("staged", "Staged model"),
+            ("staged+mcd", "Staged MC-Dropout model"),
         ]
         for model in result.models:
             assert set(model.metrics) == _METRIC_NAMES
@@ -130,16 +132,54 @@ def test_compare_models_with_a_posterior_stage_scores_joint_mcd_between_the_base
             assert model.metrics["rmse"] >= 0.0
             assert model.metrics["closed_form_crps"] >= 0.0
             assert math.isfinite(model.metrics["nll"])
-        joint, joint_mcd, _ = result.models
+        joint, joint_mcd, staged, staged_mcd = result.models
         windows = prepared.test_windows
         assert isinstance(joint.model(windows), Gaussian)
-        predictive = joint_mcd.model(windows)
-        assert isinstance(predictive, PosteriorPredictive)
-        assert predictive.num_draws == mcd_config.num_draws
-        # Each draw keeps its own aleatoric variance.
-        assert predictive.aleatoric_variance.shape == predictive.draws.shape
-        # Dropout stays active at prediction: the mask sets give distinct draws.
-        assert len({float(draw.sum()) for draw in predictive.draws}) > 1
+        assert isinstance(staged.model(windows), Gaussian)
+        for mcd in (joint_mcd, staged_mcd):
+            predictive = mcd.model(windows)
+            assert isinstance(predictive, PosteriorPredictive)
+            assert predictive.num_draws == mcd_config.num_draws
+            # Dropout stays active at prediction: the mask sets give distinct draws.
+            assert len({float(draw.sum()) for draw in predictive.draws}) > 1
+        # The joint MC-Dropout model's draws each keep their own aleatoric
+        # variance; the staged one's share the Gamma stage's.
+        joint_predictive = joint_mcd.model(windows)
+        assert joint_predictive.aleatoric_variance.shape == (
+            joint_predictive.draws.shape
+        )
+
+
+def test_staged_mcd_starts_from_the_staged_models_networks(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    import dataclasses
+
+    import numpy as np
+
+    # Without dropout and with a negligible step, the posterior stage cannot
+    # move off its warm start: every draw is the staged model's mean network.
+    config = dataclasses.replace(mcd_config, dropout_rate=0.0, mcd_learning_rate=1e-12)
+    prepared = synthetic_prepared_data()
+
+    (result,) = cmapss_compare.compare_models(
+        prepared, config, seeds=1, posterior_stage=True
+    )
+
+    _, _, staged, staged_mcd = result.models
+    windows = prepared.test_windows
+    gaussian = staged.model(windows)
+    predictive = staged_mcd.model(windows)
+    for draw in predictive.draws:
+        np.testing.assert_allclose(draw, gaussian.loc, rtol=1e-5, atol=1e-5)
+    # The Gamma stage's aleatoric variance is held fixed and shared by every draw.
+    np.testing.assert_allclose(
+        np.broadcast_to(predictive.aleatoric_variance, gaussian.scale.shape),
+        gaussian.scale**2,
+        rtol=1e-5,
+    )
 
 
 def test_compare_models_posterior_stage_leaves_the_baselines_unchanged(
@@ -170,23 +210,26 @@ def test_compare_models_posterior_stage_trains_silently_and_reproduces_a_seed(
 
     prepared = synthetic_prepared_data()
 
-    def joint_mcd(seeds: int) -> list[Any]:
+    def mcd_models(seeds: int) -> list[tuple[Any, Any]]:
         results = cmapss_compare.compare_models(
             prepared, mcd_config, seeds=seeds, posterior_stage=True
         )
-        return [result.models[1] for result in results]
+        return [(result.models[1], result.models[3]) for result in results]
 
-    (first,) = joint_mcd(1)
-    (second,) = joint_mcd(1)
-    _, other_seed = joint_mcd(2)
+    (first,) = mcd_models(1)
+    (second,) = mcd_models(1)
+    _, other_seed = mcd_models(2)
 
     assert capsys.readouterr().out == ""
-    assert first.metrics == second.metrics
     windows = prepared.test_windows
-    np.testing.assert_array_equal(
-        first.model(windows).draws, second.model(windows).draws
-    )
-    assert first.metrics != other_seed.metrics
+    for first_model, second_model, other_model in zip(
+        first, second, other_seed, strict=True
+    ):
+        assert first_model.metrics == second_model.metrics
+        np.testing.assert_array_equal(
+            first_model.model(windows).draws, second_model.model(windows).draws
+        )
+        assert first_model.metrics != other_model.metrics
 
 
 def _fixed_posterior_model(low: float, high: float, scales: tuple[float, float]) -> Any:
@@ -405,7 +448,7 @@ def test_main_prints_one_line_per_run_and_a_mean_std_table_then_plots(
 
 
 @pytest.mark.usefixtures("offline_fd001")
-def test_main_with_a_posterior_stage_reports_tabulates_and_plots_joint_mcd(
+def test_main_with_a_posterior_stage_reports_tabulates_and_plots_four_models(
     cmapss_compare: ModuleType,
     mcd_config: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -438,18 +481,25 @@ def test_main_with_a_posterior_stage_reports_tabulates_and_plots_joint_mcd(
     cmapss_compare.main()
 
     lines = capsys.readouterr().out.splitlines()
-    names = ("joint", "joint+mcd", "staged")
+    names = ("joint", "joint+mcd", "staged", "staged+mcd")
     seeds = [f"seed={seed}]" for seed in (mcd_config.seed, mcd_config.seed + 1)]
     run_lines = [line for line in lines if line.startswith("[")]
     assert [tuple(line.split()[:2]) for line in run_lines] == [
         (f"[{name}", seed) for seed in seeds for name in names
     ]
     (header,) = [
-        line for line in lines if re.search(r"joint\s+joint\+mcd\s+staged", line)
+        line
+        for line in lines
+        if re.search(r"joint\s+joint\+mcd\s+staged\s+staged\+mcd\s*$", line)
     ]
     table = lines[lines.index(header) + 1 :]
     for row in ("RMSE", "95% coverage", "closed-form CRPS", "NLL"):
         (line,) = [line for line in table if line.startswith(row)]
-        assert re.fullmatch(rf"{re.escape(row)}\s+{_CELL}\s+{_CELL}\s+{_CELL}", line)
-    assert plotted_labels == ["Joint model", "Joint MC-Dropout model", "Staged model"]
+        assert re.fullmatch(rf"{re.escape(row)}(\s+{_CELL}){{4}}", line)
+    assert plotted_labels == [
+        "Joint model",
+        "Joint MC-Dropout model",
+        "Staged model",
+        "Staged MC-Dropout model",
+    ]
     assert plot_path.is_file()

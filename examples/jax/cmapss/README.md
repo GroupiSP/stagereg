@@ -138,8 +138,9 @@ staged model included. The mean and Gamma training functions take their
 event sinks as a parameter, so each entry point decides how verbose
 training is. Next to them sit the MC-Dropout helpers `compare.py` uses:
 `train_joint_mcd_model` and the predictive wrapper `McDropoutPredictive`
-(built by `build_mc_dropout_predictive`). The script itself does not use
-them.
+(built by `build_mc_dropout_predictive`), and the staged posterior-stage
+runner `train_staged_mcd_posterior`, which returns a
+`PosteriorStagePredictive`. The script itself does not use them.
 
 Run it with:
 
@@ -211,9 +212,12 @@ the parameter count.
 
 #### `--posterior-stage`: MC-Dropout posteriors
 
-Pass `--posterior-stage` to add the **joint MC-Dropout model** (`joint+mcd`).
-The models per seed are then `joint`, `joint+mcd` and `staged`, in that
-order; `joint` and `staged` are the same models as without the flag.
+Pass `--posterior-stage` to add the **joint MC-Dropout model** (`joint+mcd`)
+and the **staged MC-Dropout model** (`staged+mcd`). The models per seed are
+then `joint`, `joint+mcd`, `staged` and `staged+mcd`, in that order; `joint`
+and `staged` are the same models as without the flag. The comparison is of a
+single training (joint) against separate trainings (staged), each with and
+without an MC-Dropout posterior.
 
 ```shell
 uv run --group example-cmapss python examples/jax/cmapss/compare.py --posterior-stage
@@ -232,6 +236,19 @@ figure use the same draws. Its figure row shows a total band (the mixture's
 central 95% interval) and an epistemic band (the 2.5–97.5% quantiles of the
 draws' means).
 
+`staged+mcd` reuses the `staged` column's trained mean and Gamma variance
+networks from the same seed, without retraining, so the difference between
+`staged` and `staged+mcd` is the posterior stage alone. A `PosteriorStage`
+with the `MCDropout` inference method fine-tunes the whole mean network,
+rebuilt with dropout active at `dropout_rate`, at `mcd_learning_rate` under
+an isotropic Gaussian prior at `prior_precision`; the Gamma stage's
+aleatoric variance is held fixed. It runs at most `posterior_epochs` epochs,
+stops early on the validation mixture NLL after `early_stopping_patience`
+epochs without improvement, and keeps the best epoch. Its prediction is the
+stage's posterior predictive with `num_draws` draws under the same fixed,
+seed-derived key it was validated under, every draw sharing the one
+aleatoric variance. Its figure row shows the same two bands.
+
 The MC-Dropout settings live in `CmapssConfig` (`run.py`):
 
 | Field | Default |
@@ -239,5 +256,7 @@ The MC-Dropout settings live in `CmapssConfig` (`run.py`):
 | `dropout_rate` | 0.1 |
 | `joint_mcd_epochs` | 60 |
 | `mcd_learning_rate` | 1e-3 (provisional, not yet tuned) |
+| `posterior_epochs` | 20 (provisional, not yet tuned) |
+| `prior_precision` | 1.0 (provisional, not yet tuned) |
 | `num_draws` | 100 |
 | `early_stopping_patience` | 5 |

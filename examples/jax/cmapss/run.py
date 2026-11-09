@@ -82,9 +82,13 @@ from stagereg.jax import (
     GammaVarianceStage,
     GaussianPredictor,
     HeldOutValidation,
+    IsotropicGaussianPrior,
+    MCDropout,
     MeanStage,
     MetricSuite,
     PosteriorPredictive,
+    PosteriorStage,
+    PosteriorStageOptions,
     Predictor,
     SupervisedStageOptions,
     create_optimizer,
@@ -435,6 +439,13 @@ def train_gamma_model(
 MC_DROPOUT_DRAW_STREAM = 2
 """The stream folded into `config.seed`'s key for the MC-Dropout masks."""
 
+POSTERIOR_NETWORK_STREAM = 3
+"""The stream folded into `config.seed`'s key for the posterior network's init.
+
+The posterior stage overwrites the network's parameters with the trained mean network's,
+so only its dropout streams' initial keys come from here.
+"""
+
 JOINT_MCD_STAGE = "joint_mcd"
 """The stage segment the joint MC-Dropout model's training is reported under."""
 
@@ -638,6 +649,119 @@ def train_joint_mcd_model(
         optimizer=setup.optimizer,
     )
     return setup.model
+
+
+class PosteriorStagePredictive(nnx.Module, pytree=False):
+    """A trained posterior stage's posterior predictive under one fixed key.
+
+    Every call takes the same draws, so validation, test scoring and the figure all see
+    the same mask sets (ADR 0014).
+    """
+
+    def __init__(self, stage: PosteriorStage, *, key: jax.Array) -> None:
+        """Wrap a trained posterior stage.
+
+        Args:
+            stage: A trained posterior stage.
+            key: The key selecting the posterior's draws.
+        """
+        self.stage = stage
+        self.key = key
+
+    def __call__(self, inputs: jax.Array) -> PosteriorPredictive:
+        """Predict the posterior predictive for each windowed example.
+
+        Args:
+            inputs: Windowed sensor readings, shape ``(batch, window_length,
+                n_sensors)``.
+
+        Returns:
+            The stage's [`PosteriorPredictive`][stagereg.jax.PosteriorPredictive]:
+            the draws of the fine-tuned mean network, sharing the Gamma
+            stage's aleatoric variance.
+        """
+        return self.stage.predict(inputs, self.key)
+
+
+def train_staged_mcd_posterior(
+    state: TrainingState,
+    train_windows: np.ndarray,
+    train_targets: np.ndarray,
+    validation_windows: np.ndarray,
+    validation_targets: np.ndarray,
+    config: CmapssConfig,
+    *,
+    event_sinks: Sequence[EventSink],
+) -> PosteriorStagePredictive:
+    """Run an MC-Dropout posterior stage after the mean and Gamma stages.
+
+    The posterior network is the mean network rebuilt at
+    `config.dropout_rate`; the stage warm-starts it from the trained mean
+    network and fine-tunes all of it with `MCDropout` at
+    `config.mcd_learning_rate`, under an isotropic Gaussian prior at
+    `config.prior_precision`, holding the Gamma stage's aleatoric variance
+    fixed. After every epoch the posterior predictive is scored on the
+    validation windows under `mc_dropout_draw_key`, and the stage stops once
+    its mixture NLL has not improved for `config.early_stopping_patience`
+    epochs, after at most `config.posterior_epochs`, then finalizes the best
+    epoch.
+
+    Args:
+        state: The `VARIANCE_READY` staged training state produced by
+            `train_gamma_model`. It moves on to `POSTERIOR_READY`.
+        train_windows: Training sliding windows, shape `(n_train,
+            window_length, n_sensors)`.
+        train_targets: Training RUL targets, shape `(n_train,)`.
+        validation_windows: Held-out validation windows, same layout as
+            `train_windows`.
+        validation_targets: Held-out validation RUL targets.
+        config: Example configuration; `config.seed` sets the validation and
+            prediction draws.
+        event_sinks: Sinks notified of the stage's training events; pass
+            none to train silently.
+
+    Returns:
+        The trained stage's posterior predictive under
+        `mc_dropout_draw_key`.
+    """
+    network = Cnn1DMeanModel(
+        train_windows.shape[-1],
+        hidden_channels=config.hidden_channels,
+        kernel_size=config.kernel_size,
+        dropout_rate=config.dropout_rate,
+        rngs=nnx.Rngs(
+            jax.random.fold_in(jax.random.key(config.seed), POSTERIOR_NETWORK_STREAM)
+        ),
+    )
+    key = mc_dropout_draw_key(config)
+    stage = PosteriorStage(
+        inference_method=MCDropout(optimizer=optax.adam(config.mcd_learning_rate)),
+        train_loader=make_window_loader(
+            train_windows, train_targets, batch_size=config.batch_size
+        ),
+        dataset_size=train_windows.shape[0],
+        prior=IsotropicGaussianPrior(precision=config.prior_precision),
+        model=network,
+        options=PosteriorStageOptions(
+            epochs=config.posterior_epochs,
+            num_draws=config.num_draws,
+            validation_loader=_fixed_order_loader(
+                validation_windows, validation_targets, batch_size=config.batch_size
+            ),
+            early_stopper=EarlyStopper(
+                metric="nll",
+                mode=OptimizationMode.MIN,
+                patience=config.early_stopping_patience,
+                source=Split.VALIDATION,
+            ),
+            event_sinks=event_sinks,
+            checkpoint_store=InMemoryCheckpointStore(),
+            validation_key=key,
+        ),
+    )
+    stage.prepare(state)
+    stage.train(state)
+    return PosteriorStagePredictive(stage, key=key)
 
 
 def build_composite_model(

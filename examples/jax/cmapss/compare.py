@@ -21,8 +21,13 @@ With `--posterior-stage` it adds the **joint MC-Dropout model**
 (`joint+mcd`): a Gaussian-head CNN with dropout active, trained on the
 Gaussian NLL and early-stopped on its MC mixture's validation NLL, whose
 prediction is a posterior predictive over fixed dropout-mask sets with each
-draw's own aleatoric variance. The models are then `joint`, `joint+mcd` and
-`staged`, in that order, in the per-run lines, the table and the figure.
+draw's own aleatoric variance; and the **staged MC-Dropout model**
+(`staged+mcd`): a posterior stage with the `MCDropout` inference method that
+fine-tunes the `staged` model's trained mean network with dropout active,
+holding its Gamma stage's aleatoric variance fixed, and early-stops on the
+validation mixture NLL. The models are then `joint`, `joint+mcd`, `staged`
+and `staged+mcd`, in that order, in the per-run lines, the table and the
+figure.
 
 Run it with:
 
@@ -65,11 +70,13 @@ from run import (
     train_gamma_model,
     train_joint_mcd_model,
     train_mean_model,
+    train_staged_mcd_posterior,
 )
 
 from stagereg.core import NegativeLogLikelihood, NegativeLogLikelihoodLoss
 from stagereg.core.metric_registry import EpochMetric
 from stagereg.core.tracking import EventSink
+from stagereg.core.types import TrainingState
 from stagereg.jax import (
     GaussianPredictor,
     HeldOutValidation,
@@ -222,7 +229,7 @@ def _ignore_run(model: str, seed: int, metrics: dict[str, float]) -> None:
 
 def _train_staged_networks(
     prepared: PreparedCmapssData, config: CmapssConfig
-) -> tuple[Cnn1DMeanModel, Cnn1DGammaModel]:
+) -> tuple[Cnn1DMeanModel, Cnn1DGammaModel, TrainingState]:
     """Silently train the staged model's mean and Gamma variance networks.
 
     Args:
@@ -230,7 +237,8 @@ def _train_staged_networks(
         config: Example configuration; its `seed` initializes both networks.
 
     Returns:
-        The trained mean network and Gamma variance network.
+        The trained mean network, Gamma variance network, and the
+        `VARIANCE_READY` training state a posterior stage continues on.
     """
     mean_model, state = train_mean_model(
         prepared.train_windows,
@@ -247,7 +255,7 @@ def _train_staged_networks(
         config,
         event_sinks=(),
     )
-    return mean_model, variance_model
+    return mean_model, variance_model, state
 
 
 def _train_joint(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.Module:
@@ -280,8 +288,10 @@ def _train_and_score_seed(
     """Train and score every model of the comparison from `config.seed`.
 
     Without a posterior stage the models are the staged and then the joint
-    model; with one, the joint, the joint MC-Dropout and the staged model.
-    Each model is trained and scored in that order.
+    model; with one, the joint, the joint MC-Dropout, the staged and the
+    staged MC-Dropout model. Each model is trained and scored in that order;
+    the staged MC-Dropout model's posterior stage continues on the staged
+    model's trained networks.
 
     Args:
         prepared: The prepared FD001 windows to train, validate and score on.
@@ -299,24 +309,38 @@ def _train_and_score_seed(
         on_run(name, config.seed, metrics)
         return ModelResult(name=name, label=label, model=model, metrics=metrics)
 
-    def staged() -> ModelResult:
-        mean_model, variance_model = _train_staged_networks(prepared, config)
-        return score(
-            "staged", "Staged model", build_composite_model(mean_model, variance_model)
-        )
+    def staged() -> tuple[ModelResult, TrainingState]:
+        mean_model, variance_model, state = _train_staged_networks(prepared, config)
+        composite = build_composite_model(mean_model, variance_model)
+        return score("staged", "Staged model", composite), state
 
     def joint() -> ModelResult:
         return score("joint", "Joint model", _train_joint(prepared, config))
 
     if not posterior_stage:
-        return SeedComparison(seed=config.seed, models=(staged(), joint()))
+        staged_result, _ = staged()
+        return SeedComparison(seed=config.seed, models=(staged_result, joint()))
 
     def joint_mcd() -> ModelResult:
         return score(
             "joint+mcd", "Joint MC-Dropout model", _train_joint_mcd(prepared, config)
         )
 
-    models = (joint(), joint_mcd(), staged())
+    def staged_mcd(state: TrainingState) -> ModelResult:
+        predictive = train_staged_mcd_posterior(
+            state,
+            prepared.train_windows,
+            prepared.train_targets,
+            prepared.validation_windows,
+            prepared.validation_targets,
+            config,
+            event_sinks=(),
+        )
+        return score("staged+mcd", "Staged MC-Dropout model", predictive)
+
+    joint_result, joint_mcd_result = joint(), joint_mcd()
+    staged_result, state = staged()
+    models = (joint_result, joint_mcd_result, staged_result, staged_mcd(state))
     return SeedComparison(seed=config.seed, models=models)
 
 
@@ -332,7 +356,7 @@ def compare_models(
 
     Every seed trains on the same `prepared` data, so only initialization
     varies: seed index `i` initializes every model, and the MC-Dropout
-    model's masks, from `config.seed + i`. Training is silent. Each
+    models' masks, from `config.seed + i`. Training is silent. Each
     `SeedComparison` keeps its trained models, so a caller can plot, say,
     the first seed's models without retraining.
 
@@ -342,8 +366,10 @@ def compare_models(
         seeds: Number of seeds to train the models from.
         posterior_stage: Off, the default, compares the staged and the joint
             model, in that order. On, it compares the joint, the joint
-            MC-Dropout (`"joint+mcd"`) and the staged model, in that order;
-            the joint and staged models are the same as with it off.
+            MC-Dropout (`"joint+mcd"`), the staged and the staged MC-Dropout
+            (`"staged+mcd"`) model, in that order; the joint and staged
+            models are the same as with it off, and the staged MC-Dropout
+            model starts from exactly the staged model's networks.
         on_run: Called with the model's name, the seed and the test metrics
             as soon as each run is scored. Does nothing by default.
 
@@ -435,7 +461,7 @@ def main() -> None:
 
     Pass `--seeds` to set the number of seeds (default 5), `--plot-path` to save the
     first seed's RUL-curves figure to that path instead of displaying it, and
-    `--posterior-stage` to add the joint MC-Dropout model.
+    `--posterior-stage` to add the joint and the staged MC-Dropout models.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -457,8 +483,9 @@ def main() -> None:
         "--posterior-stage",
         action="store_true",
         help=(
-            "Add the joint MC-Dropout model (joint+mcd); the models are then "
-            "joint, joint+mcd and staged."
+            "Add the joint and staged MC-Dropout models (joint+mcd, "
+            "staged+mcd); the models are then joint, joint+mcd, staged and "
+            "staged+mcd."
         ),
     )
     args = parser.parse_args()

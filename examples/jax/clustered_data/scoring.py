@@ -53,8 +53,20 @@ def pool_chains(chains: Sequence[PosteriorPredictive]) -> PosteriorPredictive:
 
     Returns:
         Every chain's draws, concatenated in order along the draw axis, each
-        with its own chain's aleatoric variance.
+        with its own chain's aleatoric variance. If any chain has a draw
+        mask, the masks are concatenated too, a chain without one including
+        every draw; otherwise the pooled predictive has none.
     """
+    draw_mask = None
+    if any(chain.draw_mask is not None for chain in chains):
+        draw_mask = jnp.concatenate(
+            [
+                jnp.ones(chain.num_draws, dtype=bool)
+                if chain.draw_mask is None
+                else chain.draw_mask
+                for chain in chains
+            ]
+        )
     return PosteriorPredictive(
         draws=jnp.concatenate([chain.draws for chain in chains]),
         aleatoric_variance=jnp.concatenate(
@@ -63,6 +75,7 @@ def pool_chains(chains: Sequence[PosteriorPredictive]) -> PosteriorPredictive:
                 for chain in chains
             ]
         ),
+        draw_mask=draw_mask,
     )
 
 

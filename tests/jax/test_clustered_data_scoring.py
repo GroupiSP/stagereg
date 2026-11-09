@@ -305,3 +305,32 @@ def test_pooled_chains_are_the_equal_weight_mixture_keeping_each_chains_variance
     np.testing.assert_allclose(
         np.asarray(pooled.cdf(grid)), np.asarray(expected_cdf), rtol=1e-5
     )
+
+
+def test_pooled_chains_keep_each_chains_excluded_slots_out_of_the_mixture(
+    clustered_scoring: ModuleType,
+) -> None:
+    grid = jnp.linspace(-0.5, 1.5, 7)
+    # A padded chain whose second slot is excluded and holds junk, beside an
+    # unmasked chain whose every draw counts.
+    padded = PosteriorPredictive(
+        draws=jnp.stack([grid, jnp.full(7, jnp.nan)]),
+        aleatoric_variance=jnp.full(7, 0.1),
+        draw_mask=jnp.array([True, False]),
+    )
+    full = PosteriorPredictive(draws=-grid[None], aleatoric_variance=jnp.full(7, 0.3))
+
+    pooled = clustered_scoring.pool_chains([padded, full])
+
+    np.testing.assert_array_equal(np.asarray(pooled.draw_mask), [True, False, True])
+    expected_cdf = (padded.cdf(grid) + full.cdf(grid)) / 2
+    np.testing.assert_allclose(
+        np.asarray(pooled.cdf(grid)), np.asarray(expected_cdf), rtol=1e-5
+    )
+
+
+def test_pooled_unmasked_chains_stay_unmasked(clustered_scoring: ModuleType) -> None:
+    grid = jnp.linspace(-0.5, 1.5, 7)
+    chain = PosteriorPredictive(draws=grid[None], aleatoric_variance=jnp.full(7, 0.1))
+
+    assert clustered_scoring.pool_chains([chain, chain]).draw_mask is None

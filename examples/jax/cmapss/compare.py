@@ -203,9 +203,9 @@ class SeedComparison:
     Attributes:
         seed: The seed every model was initialized from.
         models: One result per model, in the table's column order and the
-            figure's row order: the staged model's, then the joint model's;
-            with a posterior stage, the joint, the joint MC-Dropout and the
-            staged model's.
+            figure's row order. Without `--posterior-stage`: `staged`, then
+            `joint`. With it: `joint`, `joint+mcd`, `staged`, then
+            `staged+mcd`.
     """
 
     seed: int
@@ -259,14 +259,32 @@ def _train_staged_networks(
 
 
 def _train_joint(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.Module:
-    """Silently train the joint model and return an eval-mode clone of it."""
+    """Silently train the joint model and return an eval-mode clone of it.
+
+    Args:
+        prepared: The prepared FD001 windows to train and validate on.
+        config: Example configuration; its `seed` initializes the model.
+
+    Returns:
+        An eval-mode clone of the trained `Cnn1DGaussianModel`.
+    """
     joint_model = nnx.clone(train_joint_model(prepared, config, event_sinks=()))
     joint_model.eval()
     return joint_model
 
 
 def _train_joint_mcd(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.Module:
-    """Silently train the joint MC-Dropout model and return its predictive."""
+    """Silently train the joint MC-Dropout model and return its predictive.
+
+    Args:
+        prepared: The prepared FD001 windows to train and validate on.
+        config: Example configuration; its `seed` initializes the network,
+            its training masks and the predictive's draws.
+
+    Returns:
+        The trained network's eval-mode `McDropoutPredictive`, from
+        `build_mc_dropout_predictive`.
+    """
     network = train_joint_mcd_model(
         prepared.train_windows,
         prepared.train_targets,
@@ -309,24 +327,26 @@ def _train_and_score_seed(
         on_run(name, config.seed, metrics)
         return ModelResult(name=name, label=label, model=model, metrics=metrics)
 
-    def staged() -> tuple[ModelResult, TrainingState]:
+    def train_and_score_staged() -> tuple[ModelResult, TrainingState]:
         mean_model, variance_model, state = _train_staged_networks(prepared, config)
         composite = build_composite_model(mean_model, variance_model)
         return score("staged", "Staged model", composite), state
 
-    def joint() -> ModelResult:
+    def train_and_score_joint() -> ModelResult:
         return score("joint", "Joint model", _train_joint(prepared, config))
 
     if not posterior_stage:
-        staged_result, _ = staged()
-        return SeedComparison(seed=config.seed, models=(staged_result, joint()))
+        staged_result, _ = train_and_score_staged()
+        return SeedComparison(
+            seed=config.seed, models=(staged_result, train_and_score_joint())
+        )
 
-    def joint_mcd() -> ModelResult:
+    def train_and_score_joint_mcd() -> ModelResult:
         return score(
             "joint+mcd", "Joint MC-Dropout model", _train_joint_mcd(prepared, config)
         )
 
-    def staged_mcd(state: TrainingState) -> ModelResult:
+    def train_and_score_staged_mcd(state: TrainingState) -> ModelResult:
         predictive = train_staged_mcd_posterior(
             state,
             prepared.train_windows,
@@ -338,9 +358,15 @@ def _train_and_score_seed(
         )
         return score("staged+mcd", "Staged MC-Dropout model", predictive)
 
-    joint_result, joint_mcd_result = joint(), joint_mcd()
-    staged_result, state = staged()
-    models = (joint_result, joint_mcd_result, staged_result, staged_mcd(state))
+    joint_result = train_and_score_joint()
+    joint_mcd_result = train_and_score_joint_mcd()
+    staged_result, state = train_and_score_staged()
+    models = (
+        joint_result,
+        joint_mcd_result,
+        staged_result,
+        train_and_score_staged_mcd(state),
+    )
     return SeedComparison(seed=config.seed, models=models)
 
 
@@ -457,7 +483,10 @@ def print_run(model: str, seed: int, metrics: dict[str, float]) -> None:
 
 
 def main() -> None:
-    """Compare the staged and the joint model over seeds, print and plot the results.
+    """Compare the CMAPSS models over seeds, print and plot the results.
+
+    Compares `staged` and `joint`; with `--posterior-stage`, `joint`,
+    `joint+mcd`, `staged` and `staged+mcd`, in that order.
 
     Pass `--seeds` to set the number of seeds (default 5), `--plot-path` to save the
     first seed's RUL-curves figure to that path instead of displaying it, and
@@ -475,8 +504,8 @@ def main() -> None:
         type=Path,
         default=None,
         help=(
-            "Save the staged-vs-joint validation RUL-curves figure to this path "
-            "instead of displaying it."
+            "Save the first seed's validation RUL-curves figure, one row per "
+            "model, to this path instead of displaying it."
         ),
     )
     parser.add_argument(

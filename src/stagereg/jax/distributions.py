@@ -294,7 +294,8 @@ class MomentMatchedPredictive:
 
     Attributes:
         loc: The predictive mean, the average of the draws' means.
-        aleatoric_variance: The aleatoric variance shared by every draw.
+        aleatoric_variance: The average of the draws' aleatoric variances;
+            for a staged posterior, the variance every draw shares.
         epistemic_variance: The variance of the draws' means around ``loc``.
     """
 
@@ -383,10 +384,17 @@ class MomentMatchedPredictive:
 class PosteriorPredictive:
     """The posterior predictive: an equally weighted mixture of Gaussians over draws.
 
-    Each component is a Gaussian centred on one draw's mean with the aleatoric
-    variance, so the mixture is exact for the draws taken and may be skewed or
-    multimodal. Its single-Gaussian summary is
-    [`moment_matched`][stagereg.jax.PosteriorPredictive.moment_matched].
+    Each component is a Gaussian centred on one draw's mean with that draw's
+    aleatoric variance, so the mixture is exact for the draws taken and may be
+    skewed or multimodal. A staged posterior's draws share one aleatoric
+    variance, the variance stage's; a joint posterior's draws, which each
+    predict a mean and a variance, carry one each. Its single-Gaussian summary
+    is [`moment_matched`][stagereg.jax.PosteriorPredictive.moment_matched].
+
+    The aleatoric variance is read per draw when it has as many dimensions as
+    ``draws`` and a leading axis of size ``S``; otherwise it is shared by every
+    draw. A variance that could be read either way is therefore read per draw,
+    and a shared one is given without the leading draw axis.
 
     A ``draw_mask`` excludes draw slots from the mixture, which is then the
     equally weighted mixture over the included draws alone. It lets a posterior
@@ -396,12 +404,14 @@ class PosteriorPredictive:
     Attributes:
         draws: The mean of each draw at the predicted inputs, shaped
             ``[S, *batch]`` with ``S >= 1`` draw slots on the leading axis.
-        aleatoric_variance: The positive aleatoric variance, broadcastable
-            against ``draws[0]`` and shared by every draw.
+        aleatoric_variance: The positive aleatoric variance, either shared by
+            every draw and broadcastable against ``draws[0]``, or one per draw
+            and broadcastable against ``draws``, shaped ``[S, *batch]``.
         draw_mask: Which of the ``S`` draw slots the mixture includes, a
             boolean array shaped ``[S]`` with at least one ``True``; the means
-            in excluded slots are ignored. Defaults to ``None``, which
-            includes every slot.
+            and per-draw variances in excluded slots are ignored and may be
+            anything, even non-finite. Defaults to ``None``, which includes
+            every slot.
     """
 
     draws: jax.Array
@@ -409,17 +419,27 @@ class PosteriorPredictive:
     draw_mask: jax.Array | None = None
 
     def __post_init__(self) -> None:
-        """Validate the leading draw axis and the draw mask.
+        """Validate the leading draw axis, the variance's shape and the draw mask.
 
         A traced mask's values are unknown, so only its shape is checked.
 
         Raises:
             ValueError: If ``draws`` has no leading draw axis or no draws, if
-                ``draw_mask`` is not shaped ``[S]``, or if a concrete
-                ``draw_mask`` includes no draw.
+                ``aleatoric_variance`` broadcasts neither against ``draws[0]``
+                nor against ``draws``, if ``draw_mask`` is not shaped ``[S]``,
+                or if a concrete ``draw_mask`` includes no draw.
         """
         if jnp.ndim(self.draws) == 0 or jnp.shape(self.draws)[0] == 0:
             raise ValueError("draws must have a non-empty leading draw axis.")
+        try:
+            self.batch_shape  # noqa: B018 - computing it validates the shapes.
+        except ValueError as error:
+            raise ValueError(
+                "aleatoric_variance must broadcast against draws[0], shared by "
+                "every draw, or against draws, one variance per draw; got "
+                f"{jnp.shape(self.aleatoric_variance)} for draws "
+                f"{jnp.shape(self.draws)}."
+            ) from error
         if self.draw_mask is None:
             return
         if jnp.shape(self.draw_mask) != (self.num_draws,):
@@ -434,6 +454,11 @@ class PosteriorPredictive:
         """The number of draw slots ``S``, including any the mask excludes."""
         return self.draws.shape[0]
 
+    def _has_per_draw_variance(self) -> bool:
+        """Return whether the aleatoric variance carries the leading draw axis."""
+        shape = jnp.shape(self.aleatoric_variance)
+        return len(shape) == jnp.ndim(self.draws) and shape[0] == self.num_draws
+
     def _included_count(self) -> int | jax.Array:
         """Return the number of draws the mixture averages over."""
         if self.draw_mask is None:
@@ -447,33 +472,47 @@ class PosteriorPredictive:
         mask = jnp.reshape(self.draw_mask, (-1,) + (1,) * (jnp.ndim(values) - 1))
         return jnp.where(mask, values, fill)
 
-    def _draw_mean(self) -> jax.Array:
-        """Return the average of the included draws' means, shaped like ``draws[0]``."""
+    def _included_average(self, values: jax.Array) -> jax.Array:
+        """Return the average of per-draw ``values`` over the included draws."""
         if self.draw_mask is None:
-            return jnp.mean(self.draws, axis=0)
-        return jnp.sum(self._included(self.draws, 0.0), axis=0) / self._included_count()
+            return jnp.mean(values, axis=0)
+        return jnp.sum(self._included(values, 0.0), axis=0) / self._included_count()
 
     @property
     def batch_shape(self) -> tuple[int, ...]:
-        """The broadcast shape of the draws' means and the aleatoric variance."""
-        return jnp.broadcast_shapes(self.draws.shape[1:], self.aleatoric_variance.shape)
+        """The broadcast shape of one draw's mean and its aleatoric variance."""
+        variance_shape = jnp.shape(self.aleatoric_variance)
+        if self._has_per_draw_variance():
+            variance_shape = variance_shape[1:]
+        return jnp.broadcast_shapes(self.draws.shape[1:], variance_shape)
 
     @property
     def event_shape(self) -> tuple[int, ...]:
         """The shape of a single predictive sample, always scalar."""
         return ()
 
-    def _components(self) -> tuple[jax.Array, jax.Array]:
-        """Return the draws' means and the shared scale, aligned on ``batch_shape``.
+    def _component_variance(self) -> jax.Array:
+        """Return each draw's aleatoric variance, shaped ``(S,) + batch_shape``.
 
-        The means are shaped ``(S,) + batch_shape`` and the scale ``batch_shape``, so
-        broadcasting against them never crosses the leading draw axis.
+        Excluded slots hold one, so that no operation reads an invalid variance.
+        """
+        variance = jnp.broadcast_to(
+            self.aleatoric_variance, (self.num_draws, *self.batch_shape)
+        )
+        if not self._has_per_draw_variance():
+            return variance
+        return self._included(variance, 1.0)
+
+    def _components(self) -> tuple[jax.Array, jax.Array]:
+        """Return the draws' means and scales, aligned on ``batch_shape``.
+
+        Both are shaped ``(S,) + batch_shape``, so broadcasting against them never
+        crosses the leading draw axis.
         """
         missing = len(self.batch_shape) - (self.draws.ndim - 1)
         draws = jnp.expand_dims(self.draws, tuple(range(1, 1 + missing)))
         loc = jnp.broadcast_to(draws, (self.num_draws, *self.batch_shape))
-        scale = jnp.broadcast_to(jnp.sqrt(self.aleatoric_variance), self.batch_shape)
-        return loc, scale
+        return loc, jnp.sqrt(self._component_variance())
 
     def log_prob(self, targets: jax.Array) -> jax.Array:
         """Compute the exact elementwise mixture log-density of ``targets``.
@@ -495,7 +534,8 @@ class PosteriorPredictive:
         """Draw predictive samples, each from a uniformly chosen included draw's
         Gaussian.
 
-        The Gaussian noise uses ``key`` exactly as
+        Each sample uses the chosen draw's mean and aleatoric variance. The
+        Gaussian noise uses ``key`` exactly as
         [`Gaussian.sample`][stagereg.jax.Gaussian.sample] does, so with one draw
         the samples equal that Gaussian's.
 
@@ -515,15 +555,19 @@ class PosteriorPredictive:
         if self.draw_mask is not None:
             # The k-th included slot is the first whose running count reaches k + 1.
             component = jnp.searchsorted(jnp.cumsum(self.draw_mask), component + 1)
-        means = jnp.broadcast_to(
-            jnp.moveaxis(self.draws, 0, -1), shape + (self.num_draws,)
-        )
-        loc = jnp.take_along_axis(means, component[..., None], axis=-1)[..., 0]
-        return loc + jnp.sqrt(self.aleatoric_variance) * noise
+
+        def chosen(values: jax.Array) -> jax.Array:
+            stacked = jnp.broadcast_to(
+                jnp.moveaxis(values, 0, -1), shape + (self.num_draws,)
+            )
+            return jnp.take_along_axis(stacked, component[..., None], axis=-1)[..., 0]
+
+        loc, scale = self._components()
+        return chosen(loc) + chosen(scale) * noise
 
     def mean(self) -> jax.Array:
         """Return the mixture mean, the average of the included draws' means."""
-        return jnp.broadcast_to(self._draw_mean(), self.batch_shape)
+        return jnp.broadcast_to(self._included_average(self.draws), self.batch_shape)
 
     def variance(self) -> jax.Array:
         """Return the mixture variance, aleatoric plus epistemic."""
@@ -537,7 +581,7 @@ class PosteriorPredictive:
 
         Returns:
             The average over the included draws of the component Gaussian
-            CDFs.
+            CDFs, each under its draw's own aleatoric variance.
         """
         loc, scale = self._components()
         component = self._included(jstats.norm.cdf(targets, loc=loc, scale=scale), 0.0)
@@ -569,7 +613,8 @@ class PosteriorPredictive:
         Implements [`ClosedFormCRPS`][stagereg.core.ClosedFormCRPS] with the
         Gaussian-mixture formula of Grimit et al. (2006), as
         [`expected_gaussian_mixture_crps`][stagereg.core.expected_gaussian_mixture_crps]
-        does.
+        does. With a per-draw aleatoric variance, each pairwise term uses the
+        sum of the two draws' variances.
 
         Args:
             targets: One target per scoring unit, shaped ``[*batch]``, or
@@ -593,28 +638,31 @@ class PosteriorPredictive:
             mask = jnp.reshape(self.draw_mask, (-1,) + (1,) * len(batch_shape))
             loc = jnp.where(mask, loc, self.mean())
             weights = self.draw_mask / self._included_count()
+        if self._has_per_draw_variance():
+            variance = self._component_variance()
+        else:
+            variance = jnp.broadcast_to(self.aleatoric_variance, batch_shape)
         return _gaussian_mixture_crps(
-            loc,
-            jnp.broadcast_to(self.aleatoric_variance, batch_shape),
-            _reference_axis(targets, batch_shape),
-            weights,
+            loc, variance, _reference_axis(targets, batch_shape), weights
         )
 
     def moment_matched(self) -> MomentMatchedPredictive:
         """Summarize the mixture by the Gaussian with its mean and variance.
 
-        By the law of total variance, the mixture variance is the aleatoric
-        variance plus the epistemic variance of the included draws' means.
+        By the law of total variance, the mixture variance is the average of
+        the included draws' aleatoric variances plus the epistemic variance of
+        their means. A shared aleatoric variance is its own average.
 
         Returns:
             The [`MomentMatchedPredictive`][stagereg.jax.MomentMatchedPredictive],
             with both variance parts broadcast to ``batch_shape``.
         """
+        aleatoric_variance = self.aleatoric_variance
+        if self._has_per_draw_variance():
+            aleatoric_variance = self._included_average(self._component_variance())
         return MomentMatchedPredictive(
             loc=self.mean(),
-            aleatoric_variance=jnp.broadcast_to(
-                self.aleatoric_variance, self.batch_shape
-            ),
+            aleatoric_variance=jnp.broadcast_to(aleatoric_variance, self.batch_shape),
             epistemic_variance=jnp.broadcast_to(
                 self._epistemic_variance(), self.batch_shape
             ),
@@ -661,7 +709,8 @@ class PosteriorPredictive:
         """Return the variance of the included draws' means."""
         if self.draw_mask is None:
             return jnp.var(self.draws, axis=0)
-        deviation = self._included(self.draws - self._draw_mean(), 0.0)
+        mean = self._included_average(self.draws)
+        deviation = self._included(self.draws - mean, 0.0)
         return jnp.sum(jnp.square(deviation), axis=0) / self._included_count()
 
 

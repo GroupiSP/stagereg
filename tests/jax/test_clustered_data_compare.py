@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
+jnp = pytest.importorskip("jax.numpy")
 nnx = pytest.importorskip("flax.nnx")
 pytest.importorskip("optax")
 
@@ -70,9 +71,11 @@ def test_compare_groups_joint_and_staged_results_per_seed(
         assert names == _CONFIGURATION_NAMES
         for configuration in result.configurations:
             # pSGLD retains exactly num_draws samples, like the others draw.
-            means = configuration.draws.means
-            assert means.shape == (4, clustered_data.grid_inputs.shape[0])
-            assert configuration.draws.variances.shape == means.shape
+            predictive = configuration.predictive
+            assert predictive.draws.shape == (4, clustered_data.grid_inputs.shape[0])
+            assert predictive.moment_matched().aleatoric_variance.shape == (
+                clustered_data.grid_inputs.shape[0],
+            )
             assert set(configuration.scores.regions) == set(clustered_regions.REGIONS)
             for region in configuration.scores.regions.values():
                 assert 0.0 <= region.coverage <= 1.0
@@ -252,7 +255,16 @@ def test_staged_psgld_pools_one_chain_per_map_of_its_own_stages(
     assert all(start is psgld_starts[0] for start in other_starts)
     staged_psgld = next(c for c in result.configurations if c.name == "staged pSGLD")
     # 2 chains of 2 draws each pool into the 4 draws every method scores.
-    assert staged_psgld.draws.means.shape == (4, clustered_data.grid_inputs.shape[0])
+    assert staged_psgld.predictive.draws.shape == (
+        4,
+        clustered_data.grid_inputs.shape[0],
+    )
+    # Each chain keeps its own variance stage's variance on its own draws.
+    variances = staged_psgld.predictive.aleatoric_variance
+    assert variances.shape == (4, clustered_data.grid_inputs.shape[0])
+    assert jnp.array_equal(variances[0], variances[1])
+    assert jnp.array_equal(variances[2], variances[3])
+    assert not jnp.array_equal(variances[0], variances[2])
 
 
 def test_joint_psgld_pools_one_chain_per_random_initialization(
@@ -281,7 +293,10 @@ def test_joint_psgld_pools_one_chain_per_random_initialization(
         for a, b in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True)
     )
     joint_psgld = next(c for c in result.configurations if c.name == "joint pSGLD")
-    assert joint_psgld.draws.means.shape == (4, clustered_data.grid_inputs.shape[0])
+    assert joint_psgld.predictive.draws.shape == (
+        4,
+        clustered_data.grid_inputs.shape[0],
+    )
 
 
 def test_each_psgld_chain_trains_its_stages_from_its_own_initialization(

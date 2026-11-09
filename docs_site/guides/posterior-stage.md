@@ -28,7 +28,7 @@ The stage and its inference methods share a small vocabulary, defined in the
 | Inferred subnetwork | The part of the network's parameters the stage infers, selected with `inferred_subnetwork`; by default the whole network. |
 | Frozen remainder | Every other parameter, held at its trained-mean value. |
 | Draw | One mean function taken from the posterior, the same function at every input: a parameter sample, or for MC-Dropout one dropout mask set. A finite posterior, such as pSGLD's retained samples, always uses all its draws. |
-| Posterior predictive | The [`PosteriorPredictive`][stagereg.jax.PosteriorPredictive]: the equally weighted mixture, over the draws, of Gaussians centred on each draw's mean with the aleatoric variance. |
+| Posterior predictive | The [`PosteriorPredictive`][stagereg.jax.PosteriorPredictive]: the equally weighted mixture, over the draws, of Gaussians centred on each draw's mean with its aleatoric variance, shared by every draw for a staged posterior. |
 | Moment-matched predictive | The [`MomentMatchedPredictive`][stagereg.jax.MomentMatchedPredictive]: the single Gaussian with the posterior predictive's mean and variance, the aleatoric plus the epistemic variance. A summary, not a substitute. |
 
 A draw is a mean function, not a target value; a value drawn from a predictive
@@ -191,6 +191,41 @@ by_hand = PosteriorPredictive(
     draws=draws, aleatoric_variance=variance_model(inputs).mean()
 )
 assert bool(jnp.allclose(by_hand.mean(), predictive.mean(), atol=1e-5))
+```
+
+### Draws with their own aleatoric variance
+
+A joint posterior, such as MC-Dropout over a network with both a mean and a
+variance head, has every draw predict its own variance. Give
+`PosteriorPredictive` a variance shaped `[S, *batch]`, with the leading draw
+axis, and each component uses its draw's variance. The variance is read per
+draw when it has as many dimensions as `draws` and a leading axis of size `S`;
+otherwise it is shared by every draw. The moment-matched predictive's
+aleatoric variance is then the average of the draws' variances, and its
+epistemic variance the variance of their means. Mixtures from several chains
+pool by concatenating along the draw axis, each keeping its own variances:
+
+```{.python continuation}
+joint_mixture = PosteriorPredictive(
+    draws=jnp.array([[0.0, 1.0], [2.0, 1.0]]),
+    aleatoric_variance=jnp.array([[1.0, 0.5], [3.0, 0.5]]),
+)
+# A chain whose draws share one variance, expanded to one per draw to pool.
+chain_mixture = PosteriorPredictive(
+    draws=jnp.array([[1.0, 1.0]]), aleatoric_variance=jnp.array([2.0, 0.5])
+)
+pooled_mixture = PosteriorPredictive(
+    draws=jnp.concatenate([joint_mixture.draws, chain_mixture.draws]),
+    aleatoric_variance=jnp.concatenate(
+        [
+            joint_mixture.aleatoric_variance,
+            jnp.broadcast_to(chain_mixture.aleatoric_variance, chain_mixture.draws.shape),
+        ]
+    ),
+)
+pooled_summary = pooled_mixture.moment_matched()
+assert bool(jnp.allclose(pooled_summary.aleatoric_variance, jnp.array([2.0, 0.5])))
+assert bool(jnp.allclose(pooled_summary.epistemic_variance, jnp.array([2.0 / 3.0, 0.0])))
 ```
 
 ## Inferring a subnetwork

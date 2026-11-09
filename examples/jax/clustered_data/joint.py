@@ -28,10 +28,15 @@ from flax import nnx
 from jax.scipy.stats import norm
 from methods import draw_on_grid
 from networks import JointNetwork
-from scoring import PredictiveDraws
+from scoring import in_target_units
 
 from stagereg.core.types import Batch, PyTree
-from stagereg.jax import InferenceMethod, IsotropicGaussianPrior, PosteriorProblem
+from stagereg.jax import (
+    InferenceMethod,
+    IsotropicGaussianPrior,
+    PosteriorPredictive,
+    PosteriorProblem,
+)
 
 
 def _chain_key(config: ClusteredDataConfig, stream: int, chain: int) -> jax.Array:
@@ -118,7 +123,7 @@ def run_joint(
     epochs: int,
     network: JointNetwork | None = None,
     chain: int = 0,
-) -> PredictiveDraws:
+) -> PosteriorPredictive:
     """Infer the joint posterior from a random initialization and draw on the grid.
 
     Args:
@@ -133,9 +138,9 @@ def run_joint(
             update keys, and its own fresh network when `network` is `None`.
 
     Returns:
+        The posterior predictive on the grid, in the targets' units:
         `config.num_draws` draws (all retained samples for a finite
-        posterior), each with its own predictive mean and aleatoric variance
-        on the grid, in the targets' units.
+        posterior), each with its own mean and its own aleatoric variance.
     """
     if network is None:
         network = joint_network(config, chain=chain)
@@ -148,5 +153,7 @@ def run_joint(
             inference_method.update(batch, step_key)
 
     outputs = draw_on_grid(inference_method, data, config, stream=JOINT_DRAW_STREAM)
-    draws = PredictiveDraws(means=outputs[..., 0], variances=outputs[..., 1])
-    return draws.in_target_units(data.target_mean, data.target_std)
+    predictive = PosteriorPredictive(
+        draws=outputs[..., 0], aleatoric_variance=outputs[..., 1]
+    )
+    return in_target_units(predictive, data.target_mean, data.target_std)

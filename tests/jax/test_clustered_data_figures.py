@@ -1,6 +1,6 @@
 """Tests for the clustered-data example's uncertainty grid and calibration figures.
 
-None of these trains a model: they draw hand-built per-draw predictions whose
+None of these trains a model: they draw hand-built posterior predictives whose
 bands and calibration curves are known by construction.
 """
 
@@ -16,6 +16,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 jnp = pytest.importorskip("jax.numpy")
+stagereg_jax = pytest.importorskip("stagereg.jax")
 plt = pytest.importorskip("matplotlib.pyplot")
 
 _MEAN = 0.5
@@ -25,11 +26,11 @@ _VARIANCE = 0.04
 
 @dataclass(frozen=True)
 class _Configuration:
-    """A hand-built configuration: a training, a method and its draws."""
+    """A hand-built configuration: a training, a method and its predictive."""
 
     training: str
     method: str
-    draws: Any
+    predictive: Any
 
 
 def _spread_draws(
@@ -42,9 +43,9 @@ def _spread_draws(
 ) -> Any:
     """Draws at `mean ± spread` everywhere, with aleatoric variance `variance`."""
     signs = jnp.asarray([1.0, -1.0, 1.0, -1.0])[:, None]
-    return scoring.PredictiveDraws(
-        means=jnp.full((4, num_points), mean) + spread * signs,
-        variances=jnp.full((4, num_points), variance),
+    return stagereg_jax.PosteriorPredictive(
+        draws=jnp.full((4, num_points), mean) + spread * signs,
+        aleatoric_variance=jnp.full((4, num_points), variance),
     )
 
 
@@ -182,9 +183,9 @@ def test_calibration_curves_score_the_extrapolation_region_only(
         clustered_regions.EXTRAPOLATION
     ]
     means = jnp.where(extrapolation, targets, targets + 100.0)
-    draws = clustered_scoring.PredictiveDraws(
-        means=jnp.broadcast_to(means, (4, means.size)),
-        variances=jnp.full((4, means.size), 0.01),
+    draws = stagereg_jax.PosteriorPredictive(
+        draws=jnp.broadcast_to(means, (4, means.size)),
+        aleatoric_variance=jnp.full((4, means.size), 0.01),
     )
 
     figure = clustered_figures.plot_extrapolation_calibration(

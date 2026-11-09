@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Callable
 from typing import Any
 
 import jax
@@ -314,6 +315,8 @@ def test_posterior_predictive_sample_moments_match_its_mean_and_variance(
 
 
 def _mixture_cdf(y: np.ndarray, means: np.ndarray, variance: np.ndarray) -> np.ndarray:
+    """The mixture CDF at ``y``, in float64, of ``[S, *batch]`` means and a variance
+    shared as ``[*batch]`` or one per draw as ``[S, *batch]``."""
     standard = NormalDist()
     z = (y - means.astype(np.float64)) / np.sqrt(variance.astype(np.float64))
     return np.vectorize(standard.cdf)(z).mean(axis=0)
@@ -760,6 +763,26 @@ def test_extreme_means_in_excluded_slots_leave_the_crps_finite(extreme: float) -
     )
 
 
+@pytest.mark.parametrize("variance_shape", [(1,), (2, 1)], ids=["shared", "per-draw"])
+def test_an_integer_variance_crps_matches_the_float_variance_crps(
+    variance_shape: tuple[int, ...],
+) -> None:
+    # Two variances of 2**30 sum past the int32 range, so the pairwise
+    # variance must be formed in floating point.
+    variance = jnp.full(variance_shape, 2**30, dtype=jnp.int32)
+    draws = jnp.zeros((2, 1))
+
+    np.testing.assert_allclose(
+        PosteriorPredictive(draws=draws, aleatoric_variance=variance).crps(
+            jnp.zeros(1)
+        ),
+        PosteriorPredictive(
+            draws=draws, aleatoric_variance=variance.astype(jnp.float32)
+        ).crps(jnp.zeros(1)),
+        rtol=1e-6,
+    )
+
+
 @settings(deadline=None, max_examples=25)
 @given(posterior_predictives_and_references(), st.booleans())
 def test_moment_matched_crps_matches_the_core_function(
@@ -832,3 +855,283 @@ def test_the_posterior_predictive_and_its_summary_offer_the_closed_form_crps() -
 
     assert isinstance(mixture, ClosedFormCRPS)
     assert isinstance(mixture.moment_matched(), ClosedFormCRPS)
+
+
+@st.composite
+def per_draw_posterior_predictives(
+    draw: st.DrawFn, *, num_draws: st.SearchStrategy[int] | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Draw component means ``[S, B]`` and per-draw aleatoric variances ``[S, B]``."""
+    count = draw(num_draws if num_draws is not None else st.integers(1, 6))
+    batch = draw(st.integers(1, 4))
+    means = draw(arrays(np.float32, (count, batch), elements=_FINITE))
+    variances = draw(arrays(np.float32, (count, batch), elements=_POSITIVE))
+    return means, variances
+
+
+def _assert_same_predictive(
+    actual: PosteriorPredictive,
+    expected: Any,
+    targets: jax.Array,
+    key: jax.Array,
+    *,
+    tolerance: float = 1e-5,
+) -> None:
+    """Assert two distributions agree on every method the posterior offers."""
+    assert actual.batch_shape == expected.batch_shape
+    close = {"rtol": tolerance, "atol": tolerance}
+    for name in ("mean", "variance"):
+        np.testing.assert_allclose(
+            getattr(actual, name)(), getattr(expected, name)(), **close
+        )
+    for name in ("log_prob", "crps"):
+        np.testing.assert_allclose(
+            getattr(actual, name)(targets), getattr(expected, name)(targets), **close
+        )
+    np.testing.assert_allclose(
+        actual.sample(key, (4,)), expected.sample(key, (4,)), **close
+    )
+    if isinstance(expected, PosteriorPredictive):
+        np.testing.assert_allclose(actual.cdf(targets), expected.cdf(targets), **close)
+        np.testing.assert_allclose(
+            actual.quantile(0.3), expected.quantile(0.3), rtol=1e-4, atol=1e-4
+        )
+        actual_summary = actual.moment_matched()
+        expected_summary = expected.moment_matched()
+        for name in ("aleatoric_variance", "epistemic_variance"):
+            np.testing.assert_allclose(
+                getattr(actual_summary, name), getattr(expected_summary, name), **close
+            )
+
+
+@settings(deadline=None, max_examples=25)
+@given(
+    components=posterior_predictives(),
+    targets=_FINITE,
+    seed=st.integers(0, 2**31 - 1),
+)
+def test_a_per_draw_variance_equal_across_draws_is_the_shared_variance(
+    components: tuple[np.ndarray, np.ndarray], targets: float, seed: int
+) -> None:
+    means, variance = components
+    shared = PosteriorPredictive(
+        draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variance)
+    )
+    per_draw = PosteriorPredictive(
+        draws=jnp.asarray(means),
+        aleatoric_variance=jnp.asarray(np.broadcast_to(variance, means.shape)),
+    )
+
+    _assert_same_predictive(
+        per_draw,
+        shared,
+        jnp.full(shared.batch_shape, targets, jnp.float32),
+        jax.random.key(seed),
+    )
+
+
+@settings(deadline=None, max_examples=25)
+@given(
+    components=per_draw_posterior_predictives(num_draws=st.just(1)),
+    targets=_FINITE,
+    seed=st.integers(0, 2**31 - 1),
+)
+def test_one_draw_with_its_own_variance_is_the_gaussian(
+    components: tuple[np.ndarray, np.ndarray], targets: float, seed: int
+) -> None:
+    means, variances = components
+    mixture = PosteriorPredictive(
+        draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variances)
+    )
+    gaussian = Gaussian(loc=jnp.asarray(means[0]), scale=jnp.sqrt(variances[0]))
+
+    _assert_same_predictive(
+        mixture,
+        gaussian,
+        jnp.full(gaussian.batch_shape, targets, jnp.float32),
+        jax.random.key(seed),
+    )
+
+
+@pytest.mark.parametrize(
+    ("draws_shape", "variance_shape"),
+    [((3, 2), (4,)), ((3, 2), (3, 3)), ((3, 2), (2, 2, 3)), ((3, 1, 2), (3, 4))],
+)
+def test_a_variance_neither_shared_nor_per_draw_is_rejected(
+    draws_shape: tuple[int, ...], variance_shape: tuple[int, ...]
+) -> None:
+    with pytest.raises(ValueError, match="aleatoric_variance"):
+        PosteriorPredictive(
+            draws=jnp.zeros(draws_shape), aleatoric_variance=jnp.ones(variance_shape)
+        )
+
+
+def test_a_variance_with_the_draw_axis_is_read_per_draw() -> None:
+    # Both readings broadcast here; the leading axis of size S makes it per draw.
+    mixture = PosteriorPredictive(
+        draws=jnp.zeros((2, 2)), aleatoric_variance=jnp.array([[1.0, 1.0], [3.0, 3.0]])
+    )
+
+    assert mixture.batch_shape == (2,)
+    np.testing.assert_allclose(mixture.moment_matched().aleatoric_variance, [2.0, 2.0])
+
+
+def test_a_variance_with_a_leading_axis_of_one_is_shared_by_several_draws() -> None:
+    # With S > 1 a leading axis of size 1 is not the draw axis: the variance is
+    # shared, broadcast against one draw's mean like any other.
+    shared = PosteriorPredictive(
+        draws=jnp.array([[0.0, 1.0], [2.0, 3.0]]),
+        aleatoric_variance=jnp.array([[1.0, 4.0]]),
+    )
+
+    assert shared.batch_shape == (1, 2)
+    np.testing.assert_allclose(shared.moment_matched().aleatoric_variance, [[1.0, 4.0]])
+
+
+_GARBAGE_VARIANCE = st.sampled_from([0.0, -1.0, float("inf"), float("nan")])
+_GARBAGE_MEAN = st.sampled_from([3e38, -3e38, float("inf"), float("nan"), 0.0])
+
+
+@st.composite
+def padded_per_draw_posterior_predictives(
+    draw: st.DrawFn,
+) -> tuple[PosteriorPredictive, PosteriorPredictive]:
+    """Draw a per-draw-variance mixture and the same one padded with garbage slots."""
+    means, variances = draw(per_draw_posterior_predictives())
+    padding_shape = (draw(st.integers(1, 3)), means.shape[1])
+    padded_means = np.concatenate(
+        [means, draw(arrays(np.float32, padding_shape, elements=_GARBAGE_MEAN))]
+    )
+    padded_variances = np.concatenate(
+        [variances, draw(arrays(np.float32, padding_shape, elements=_GARBAGE_VARIANCE))]
+    )
+    order = np.asarray(draw(st.permutations(range(len(padded_means)))))
+    mask = order < len(means)
+    exact = PosteriorPredictive(
+        draws=jnp.asarray(padded_means[order][mask]),
+        aleatoric_variance=jnp.asarray(padded_variances[order][mask]),
+    )
+    masked = PosteriorPredictive(
+        draws=jnp.asarray(padded_means[order]),
+        aleatoric_variance=jnp.asarray(padded_variances[order]),
+        draw_mask=jnp.asarray(mask),
+    )
+    return masked, exact
+
+
+@settings(deadline=None, max_examples=25)
+@given(
+    mixtures=padded_per_draw_posterior_predictives(),
+    targets=_FINITE,
+    seed=st.integers(0, 2**31 - 1),
+)
+def test_excluded_slots_with_invalid_variances_change_nothing(
+    mixtures: tuple[PosteriorPredictive, PosteriorPredictive], targets: float, seed: int
+) -> None:
+    masked, exact = mixtures
+
+    _assert_same_predictive(
+        masked,
+        exact,
+        jnp.full(exact.batch_shape, targets, jnp.float32),
+        jax.random.key(seed),
+        tolerance=1e-4,
+    )
+
+
+@settings(deadline=None, max_examples=25)
+@given(
+    components=per_draw_posterior_predictives(),
+    probability=st.floats(min_value=0.01, max_value=0.99),
+)
+def test_a_per_draw_variance_quantile_inverts_its_cdf(
+    components: tuple[np.ndarray, np.ndarray], probability: float
+) -> None:
+    means, variances = components
+    mixture = PosteriorPredictive(
+        draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variances)
+    )
+
+    quantile = mixture.quantile(probability)
+
+    np.testing.assert_allclose(mixture.cdf(quantile), probability, atol=1e-4)
+    np.testing.assert_allclose(
+        _mixture_cdf(np.asarray(quantile, np.float64), means, variances),
+        probability,
+        atol=1e-4,
+    )
+
+
+@settings(deadline=None, max_examples=15)
+@given(components=per_draw_posterior_predictives(), targets=_FINITE)
+def test_a_per_draw_variance_crps_matches_numerical_integration(
+    components: tuple[np.ndarray, np.ndarray],
+    targets: float,
+    mixture_crps_oracle: Callable[[np.ndarray, np.ndarray, float], np.ndarray],
+) -> None:
+    means, variances = components
+    mixture = PosteriorPredictive(
+        draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variances)
+    )
+
+    expected = mixture_crps_oracle(means, variances, targets)
+
+    np.testing.assert_allclose(
+        mixture.crps(jnp.full(means.shape[1:], targets, jnp.float32)),
+        expected,
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@settings(deadline=None, max_examples=15)
+@given(components=per_draw_posterior_predictives(), seed=st.integers(0, 2**31 - 1))
+def test_the_moment_matched_split_matches_monte_carlo_moments_of_the_samples(
+    components: tuple[np.ndarray, np.ndarray], seed: int
+) -> None:
+    means, variances = components
+    mixture = PosteriorPredictive(
+        draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variances)
+    )
+    summary = mixture.moment_matched()
+    count = 20_000
+
+    samples = np.asarray(mixture.sample(jax.random.key(seed), (count,)), np.float64)
+
+    np.testing.assert_allclose(
+        summary.aleatoric_variance, variances.astype(np.float64).mean(axis=0), rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        summary.epistemic_variance, means.astype(np.float64).var(axis=0), atol=1e-3
+    )
+    np.testing.assert_allclose(mixture.variance(), summary.variance(), rtol=1e-6)
+    var = np.asarray(summary.variance(), np.float64)
+    centred = samples - samples.mean(axis=0)
+    fourth = (centred**4).mean(axis=0)
+    assert np.all(
+        np.abs(samples.mean(axis=0) - np.asarray(summary.mean()))
+        <= 6.0 * np.sqrt(var / count)
+    )
+    assert np.all(
+        np.abs(samples.var(axis=0) - var) <= 6.0 * np.sqrt(fourth / count) + 1e-3
+    )
+
+
+def test_a_per_draw_variance_mixture_passes_through_jit_as_a_pytree() -> None:
+    mixture = PosteriorPredictive(
+        draws=jnp.arange(6.0).reshape(3, 2),
+        aleatoric_variance=jnp.array([[1.0, 2.0], [jnp.nan, 0.0], [3.0, 4.0]]),
+        draw_mask=jnp.array([True, False, True]),
+    )
+    targets = jnp.array([0.5, 2.0])
+
+    passed = jax.jit(lambda distribution: distribution)(mixture)
+
+    assert_same_distribution(passed, mixture)
+    for method in (PosteriorPredictive.log_prob, PosteriorPredictive.crps):
+        np.testing.assert_allclose(
+            jax.jit(method)(mixture, targets), method(mixture, targets), rtol=1e-6
+        )
+    np.testing.assert_allclose(
+        jax.jit(PosteriorPredictive.variance)(mixture), mixture.variance(), rtol=1e-6
+    )

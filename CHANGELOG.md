@@ -3,7 +3,35 @@
 All notable changes to `stagereg` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.7.0] - 2026-11-09
+
+### Added
+
+- `PosteriorPredictive` accepts a per-draw aleatoric variance, shaped
+  `[S, *batch]` with the leading draw axis, as well as one shared by every
+  draw, so a joint posterior (e.g. joint MC-Dropout, whose draws each predict
+  a mean and a variance) is a `PosteriorPredictive` and is scored by
+  `PosteriorPredictivePredictor` like a staged one. The variance is read per
+  draw when it has as many dimensions as `draws` and a leading axis of size
+  `S`; a shape that broadcasts neither way now raises `ValueError` at
+  construction. `log_prob`, `cdf`, `quantile`, `sample` and the closed-form
+  `crps` use each draw's own variance; `moment_matched` reports the average
+  of the included draws' variances as the aleatoric variance. Excluded draw
+  slots may hold any variance, even non-positive or non-finite. A shared
+  variance gives the same results as before.
+- `expected_gaussian_mixture_crps` accepts a `(units, M)` variance, one per
+  mixture component, as well as the `(units,)` variance shared by every
+  component. The pairwise term then uses the sum of the two components'
+  variances (Grimit et al. 2006); a shared variance gives the same values as
+  before.
+
+### Changed
+
+- The clustered-data example builds a library `PosteriorPredictive` for every
+  configuration (per-draw variances for a joint run, one variance per chain
+  for a staged one) and scores it through the library's `cdf` and
+  `moment_matched`, in place of its own per-draw mixture code. Its tables and
+  figures are unchanged.
 
 ## [0.6.0] - 2026-11-08
 

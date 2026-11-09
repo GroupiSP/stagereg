@@ -16,7 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import jax
-import jax.numpy as jnp
 import optax
 from clustered import (
     STAGED_DRAW_STREAM,
@@ -30,7 +29,7 @@ from clustered import (
 from flax import nnx
 from methods import draw_on_grid
 from networks import GammaNetwork, MeanNetwork
-from scoring import PredictiveDraws
+from scoring import in_target_units
 
 from stagereg.core.types import TrainingState
 from stagereg.jax import (
@@ -38,6 +37,7 @@ from stagereg.jax import (
     InferenceMethod,
     IsotropicGaussianPrior,
     MeanStage,
+    PosteriorPredictive,
     PosteriorStage,
     PosteriorStageOptions,
     SupervisedStageOptions,
@@ -177,7 +177,7 @@ def run_staged(
     inference_method: InferenceMethod,
     *,
     network: nnx.Module | None = None,
-) -> PredictiveDraws:
+) -> PosteriorPredictive:
     """Run the posterior stage on the trained stages and draw on the grid.
 
     Args:
@@ -190,9 +190,9 @@ def run_staged(
             tree, or `None` to infer over a copy of the mean network.
 
     Returns:
-        `config.num_draws` draws of the predictive mean on the grid (all
-        retained samples for a finite posterior), each paired with the
-        variance stage's aleatoric variance, in the targets' units.
+        The posterior predictive on the grid, in the targets' units:
+        `config.num_draws` draws of the mean (all retained samples for a
+        finite posterior), sharing the variance stage's aleatoric variance.
     """
     state = _fork(supervised.state)
     stage = PosteriorStage(
@@ -212,7 +212,5 @@ def run_staged(
         ..., 0
     ]
     aleatoric = supervised.variance_model(data.grid_inputs).mean()[..., 0]
-    draws = PredictiveDraws(
-        means=means, variances=jnp.broadcast_to(aleatoric, means.shape)
-    )
-    return draws.in_target_units(data.target_mean, data.target_std)
+    predictive = PosteriorPredictive(draws=means, aleatoric_variance=aleatoric)
+    return in_target_units(predictive, data.target_mean, data.target_std)

@@ -97,7 +97,7 @@ def test_joint_draws_carry_their_own_positive_variances(
     clustered_data: Any,
     tiny_clustered_config: Any,
 ) -> None:
-    draws = clustered_joint.run_joint(
+    predictive = clustered_joint.run_joint(
         clustered_data,
         tiny_clustered_config,
         clustered_methods.bayes_by_backprop(tiny_clustered_config),
@@ -105,10 +105,11 @@ def test_joint_draws_carry_their_own_positive_variances(
     )
 
     grid_size = clustered_data.grid_inputs.shape[0]
-    assert draws.means.shape == (4, grid_size)
-    assert draws.variances.shape == (4, grid_size)
-    assert bool(jnp.all(draws.variances >= 1e-6))
-    assert not bool(jnp.all(draws.variances == draws.variances[:1]))
+    variances = predictive.aleatoric_variance
+    assert predictive.draws.shape == (4, grid_size)
+    assert variances.shape == (4, grid_size)
+    assert bool(jnp.all(variances >= 1e-6))
+    assert not bool(jnp.all(variances == variances[:1]))
 
 
 def test_joint_run_is_reproducible(
@@ -127,8 +128,8 @@ def test_joint_run_is_reproducible(
         for _ in range(2)
     )
 
-    assert jnp.array_equal(first.means, second.means)
-    assert jnp.array_equal(first.variances, second.variances)
+    assert jnp.array_equal(first.draws, second.draws)
+    assert jnp.array_equal(first.aleatoric_variance, second.aleatoric_variance)
 
 
 def test_log_likelihood_is_the_scaled_gaussian_under_the_variance_head(
@@ -214,11 +215,11 @@ def test_joint_psgld_retains_num_draws_over_the_final_half_of_its_run(
         clustered_methods.PSGLD, tiny_clustered_config
     )
 
-    draws = clustered_joint.run_joint(
+    predictive = clustered_joint.run_joint(
         clustered_data, tiny_clustered_config, method, epochs=3
     )
 
-    assert draws.means.shape == (4, clustered_data.grid_inputs.shape[0])
+    assert predictive.draws.shape == (4, clustered_data.grid_inputs.shape[0])
     # 3 epochs of 4 steps: every draw falls after step 4 and the last at 12.
     assert method.burn_in + method.thinning > 4
     assert method.burn_in + 4 * method.thinning == 12
@@ -234,7 +235,7 @@ def test_joint_mc_dropout_draws_one_dropout_mask_per_draw(
         tiny_clustered_config, dropout_rate=tiny_clustered_config.mc_dropout_rate
     )
 
-    draws = clustered_joint.run_joint(
+    predictive = clustered_joint.run_joint(
         clustered_data,
         tiny_clustered_config,
         clustered_methods.mc_dropout(tiny_clustered_config),
@@ -242,7 +243,8 @@ def test_joint_mc_dropout_draws_one_dropout_mask_per_draw(
         network=network,
     )
 
-    assert draws.means.shape == (4, clustered_data.grid_inputs.shape[0])
+    variances = predictive.aleatoric_variance
+    assert predictive.draws.shape == (4, clustered_data.grid_inputs.shape[0])
     # Each draw is one function of the input: its own mask over every point.
-    assert not bool(jnp.all(draws.means == draws.means[:1]))
-    assert not bool(jnp.all(draws.variances == draws.variances[:1]))
+    assert not bool(jnp.all(predictive.draws == predictive.draws[:1]))
+    assert not bool(jnp.all(variances == variances[:1]))

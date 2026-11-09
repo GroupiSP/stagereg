@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
+from statistics import NormalDist
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import pytest
 
 from stagereg.core.early_stopping import EarlyStopper
@@ -86,6 +88,60 @@ def documented_module(documented_package: str) -> ModuleType:
     for dependency in DOCUMENTED_PACKAGES[documented_package]:
         pytest.importorskip(dependency)
     return importlib.import_module(documented_package)
+
+
+def _standard_normal_cdf() -> Callable[[np.ndarray], np.ndarray]:
+    """Return a vectorized standard normal CDF, SciPy's when it is installed."""
+    try:
+        from scipy.special import ndtr
+    except ImportError:
+        return np.vectorize(NormalDist().cdf, otypes=[np.float64])
+    return ndtr
+
+
+def integrated_mixture_crps(
+    means: np.ndarray, variances: np.ndarray, target: float
+) -> np.ndarray:
+    """Integrate the CRPS of an equally weighted Gaussian mixture numerically.
+
+    The independent oracle for the closed-form mixture CRPS: the trapezoid rule
+    on ``(F(z) - 1{z >= target})**2``, in float64, either side of the target,
+    where the step jumps, out to 10 of the widest component's standard
+    deviations, where ``F`` is 0 or 1 to float64 precision.
+
+    Args:
+        means: Component means, shaped ``[S, *batch]``.
+        variances: Component variances broadcastable against ``means``: one
+            shared by every component, shaped ``[*batch]``, or one each, shaped
+            ``[S, *batch]``.
+        target: The observed value, the same for every scoring unit.
+
+    Returns:
+        The CRPS of each scoring unit, shaped ``[*batch]``.
+    """
+    means = np.asarray(means, np.float64)
+    scales = np.broadcast_to(np.sqrt(np.asarray(variances, np.float64)), means.shape)
+    standard_cdf = _standard_normal_cdf()
+    reach = 10.0 * scales.max()
+
+    def squared_error(grid: np.ndarray, step: float) -> np.ndarray:
+        # Each side of the target is smooth, so the trapezoid rule converges fast.
+        points = grid.reshape((-1,) + (1,) * means.ndim)
+        mixture_cdf = standard_cdf((points - means) / scales).mean(axis=1)
+        return np.trapezoid((mixture_cdf - step) ** 2, grid, axis=0)
+
+    below = np.linspace(min(means.min(), target) - reach, target, 20_001)
+    above = np.linspace(target, max(means.max(), target) + reach, 20_001)
+    return squared_error(below, 0.0) + squared_error(above, 1.0)
+
+
+@pytest.fixture(scope="session")
+def mixture_crps_oracle() -> Callable[[np.ndarray, np.ndarray, float], np.ndarray]:
+    """The numerically integrated CRPS of an equally weighted Gaussian mixture.
+
+    See `integrated_mixture_crps` for its arguments.
+    """
+    return integrated_mixture_crps
 
 
 @pytest.fixture(scope="session")

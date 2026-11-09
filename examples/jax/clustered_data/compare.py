@@ -68,9 +68,11 @@ from methods import (
     psgld_chain_config,
 )
 from regions import EXTRAPOLATION, GAP, IN_DISTRIBUTION, REGIONS, region_masks
-from scoring import PredictiveDraws, Scores, pool_draws, score
+from scoring import Scores, pool_chains, score
 from joint import joint_network, run_joint
 from staged import posterior_network, run_staged, train_supervised_stages
+
+from stagereg.jax import PosteriorPredictive
 
 REGION_LABELS: dict[str, str] = {
     IN_DISTRIBUTION: "ID",
@@ -82,18 +84,19 @@ REGION_LABELS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class ConfigurationResult:
-    """One configuration's draws on the grid, and their scores.
+    """One configuration's posterior predictive on the grid, and its scores.
 
     Attributes:
         training: How the posterior was inferred, `"joint"` or `"staged"`.
         method: The inference method's name, e.g. `"BBB"`.
-        draws: The per-draw predictive means and variances on the grid.
-        scores: The draws' scores against the grid's noisy targets.
+        predictive: The posterior predictive on the grid, in the targets'
+            units.
+        scores: The predictive's scores against the grid's noisy targets.
     """
 
     training: str
     method: str
-    draws: PredictiveDraws
+    predictive: PosteriorPredictive
     scores: Scores
 
     @property
@@ -154,7 +157,7 @@ def compare_seed(
 
     def run_chain(
         training: str, method: str, run_config: ClusteredDataConfig, chain: int
-    ) -> PredictiveDraws:
+    ) -> PosteriorPredictive:
         rate = dropout_rate(method, config)
         if training == JOINT:
             return run_joint(
@@ -173,11 +176,11 @@ def compare_seed(
             network=posterior_network(config, rate),
         )
 
-    def run(training: str, method: str) -> PredictiveDraws:
+    def run(training: str, method: str) -> PosteriorPredictive:
         if method != PSGLD:
             return run_chain(training, method, config, 0)
         chain_config = psgld_chain_config(config)
-        return pool_draws(
+        return pool_chains(
             [
                 run_chain(training, method, chain_config, chain)
                 for chain in range(config.psgld_chains)
@@ -187,12 +190,12 @@ def compare_seed(
     configurations = []
     for training in TRAININGS:
         for method in METHODS:
-            draws = run(training, method)
+            predictive = run(training, method)
             result = ConfigurationResult(
                 training=training,
                 method=method,
-                draws=draws,
-                scores=score(draws, data.grid_targets, masks),
+                predictive=predictive,
+                scores=score(predictive, data.grid_targets, masks),
             )
             on_run(config.seed, result)
             configurations.append(result)

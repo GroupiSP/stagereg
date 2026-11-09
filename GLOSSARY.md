@@ -130,7 +130,7 @@ One value of the target drawn from a predictive distribution, as used to estimat
 _Avoid_: Draw, predictive draw
 
 **Posterior predictive**:
-The predictive distribution of a posterior stage: the equally weighted mixture, over the draws, of Gaussians centred on each draw's mean with the aleatoric variance. Exact for the draws taken, so it may be skewed or multimodal.
+The predictive distribution of a posterior stage: the equally weighted mixture, over the draws, of Gaussians centred on each draw's mean with each draw's aleatoric variance, shared by every draw for a staged posterior. A joint posterior, whose draws each predict a mean and a variance, gives each draw its own. Exact for the draws taken, so it may be skewed or multimodal.
 _Avoid_: BMA Gaussian, predictive Gaussian
 
 **Closed-form CRPS**:
@@ -142,7 +142,7 @@ The CRPS of the empirical distribution of a set of predictive samples, an estima
 _Avoid_: Exact CRPS, closed-form CRPS
 
 **Moment-matched predictive**:
-The single Gaussian with the posterior predictive's mean and variance (the aleatoric plus the epistemic variance). A summary of the posterior predictive, not a substitute for it.
+The single Gaussian with the posterior predictive's mean and variance: the average of the draws' aleatoric variances plus the epistemic variance (law of total variance). A summary of the posterior predictive, not a substitute for it.
 _Avoid_: Posterior predictive (that is the mixture)
 
 ## CMAPSS example

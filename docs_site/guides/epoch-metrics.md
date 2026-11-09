@@ -328,7 +328,8 @@ with pytest.raises(ValueError, match="reference_samples_extractor"):
 Outside a training run,
 [`expected_gaussian_mixture_crps`][stagereg.core.expected_gaussian_mixture_crps]
 computes the same score with NumPy alone. It takes `(units, M)` draw means, a
-`(units,)` variance shared by every draw of a unit and `(units, R)` reference
+`(units,)` variance shared by every draw of a unit (or a `(units, M)` variance,
+one per draw, when the draws differ in variance) and `(units, R)` reference
 samples, and returns each unit's expected CRPS of the equally weighted mixture
 (Grimit et al. 2006). One draw is a Gaussian, and one reference sample is an
 observed target:

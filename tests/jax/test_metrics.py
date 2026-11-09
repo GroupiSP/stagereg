@@ -29,6 +29,7 @@ from stagereg.core.metric_registry import (
 from stagereg.core.metrics import expected_gaussian_mixture_crps
 from stagereg.core.types import Batch
 from stagereg.jax.distributions import Gaussian, GaussianHead, PosteriorPredictive
+from stagereg.jax.evaluation import evaluate_loader
 from stagereg.jax.metrics import (
     GaussianPredictor,
     MetricSuite,
@@ -548,6 +549,55 @@ def test_posterior_predictive_predictor_is_deterministic_for_metric_key() -> Non
     assert np.array_equal(first.predictive_samples, second.predictive_samples)
     assert np.array_equal(first.log_likelihood, second.log_likelihood)
     assert np.array_equal(first.interval(0.9).lower, second.interval(0.9).lower)
+
+
+class PerDrawVarianceMixtureModel(nnx.Module):
+    """A joint posterior: each draw shifts the inputs and has its own variance."""
+
+    def __init__(self, offsets: list[float], variances: list[float]) -> None:
+        self.offsets = jnp.asarray(offsets)
+        self.variances = jnp.asarray(variances)
+
+    def __call__(self, inputs: jax.Array) -> PosteriorPredictive:
+        per_draw = (-1,) + (1,) * inputs.ndim
+        draws = inputs[None] + self.offsets.reshape(per_draw)
+        variance = self.variances.reshape(per_draw) * (1.0 + jnp.abs(inputs[None]))
+        return PosteriorPredictive(draws=draws, aleatoric_variance=variance)
+
+
+def test_evaluate_loader_scores_a_per_draw_variance_mixture_as_the_distribution() -> (
+    None
+):
+    model = PerDrawVarianceMixtureModel([-1.5, 0.0, 2.5], [0.1, 0.5, 2.0])
+    batches = [
+        Batch(inputs=_MIXTURE_BATCH.inputs[:3], targets=_MIXTURE_BATCH.targets[:3]),
+        Batch(inputs=_MIXTURE_BATCH.inputs[3:], targets=_MIXTURE_BATCH.targets[3:]),
+    ]
+    level = 0.9
+    suite = MetricSuite(
+        epoch=(
+            NegativeLogLikelihood(),
+            ClosedFormContinuousRankedProbabilityScore(),
+            IntervalCoverage(level=level),
+        ),
+        predictor=PosteriorPredictivePredictor(),
+    )
+
+    scores, _ = evaluate_loader(model, batches, key=jax.random.key(0), metrics=suite)
+
+    mixture = model(_MIXTURE_BATCH.inputs)
+    targets = _MIXTURE_BATCH.targets
+    lower = mixture.quantile((1.0 - level) / 2.0)
+    upper = mixture.quantile((1.0 + level) / 2.0)
+    assert mixture.aleatoric_variance.shape == (3, *mixture.batch_shape)
+    assert scores == pytest.approx(
+        {
+            "nll": -float(jnp.mean(mixture.log_prob(targets))),
+            "closed_form_crps": float(jnp.mean(mixture.crps(targets))),
+            "coverage": float(jnp.mean((lower <= targets) & (targets <= upper))),
+        },
+        rel=1e-5,
+    )
 
 
 def test_posterior_predictive_predictor_rejects_other_predictions() -> None:

@@ -410,7 +410,7 @@ def train_gamma_model(
         The trained `Cnn1DGammaModel`.
     """
     n_sensors = train_windows.shape[-1]
-    model_key = jax.random.fold_in(jax.random.key(config.seed), 1)
+    model_key = seed_stream_key(config, GAMMA_NETWORK_STREAM)
     model = Cnn1DGammaModel(
         n_sensors,
         hidden_channels=config.hidden_channels,
@@ -437,6 +437,9 @@ def train_gamma_model(
     return model
 
 
+GAMMA_NETWORK_STREAM = 1
+"""The stream folded into `config.seed`'s key for the Gamma network's init."""
+
 MC_DROPOUT_DRAW_STREAM = 2
 """The stream folded into `config.seed`'s key for the MC-Dropout masks."""
 
@@ -449,6 +452,20 @@ so only its dropout streams' initial keys come from here.
 
 JOINT_MCD_STAGE = "joint_mcd"
 """The stage segment the joint MC-Dropout model's training is reported under."""
+
+
+def seed_stream_key(config: CmapssConfig, stream: int) -> jax.Array:
+    """Return the key of one named random stream under `config.seed`.
+
+    Args:
+        config: Example configuration; its `seed` is read.
+        stream: The stream folded into the seed's key, e.g.
+            `MC_DROPOUT_DRAW_STREAM`.
+
+    Returns:
+        A JAX PRNG key, independent of every other stream's.
+    """
+    return jax.random.fold_in(jax.random.key(config.seed), stream)
 
 
 def mc_dropout_draw_key(config: CmapssConfig) -> jax.Array:
@@ -464,7 +481,7 @@ def mc_dropout_draw_key(config: CmapssConfig) -> jax.Array:
     Returns:
         A JAX PRNG key.
     """
-    return jax.random.fold_in(jax.random.key(config.seed), MC_DROPOUT_DRAW_STREAM)
+    return seed_stream_key(config, MC_DROPOUT_DRAW_STREAM)
 
 
 class McDropoutPredictive(nnx.Module):
@@ -489,9 +506,9 @@ class McDropoutPredictive(nnx.Module):
             num_draws: Number of dropout-mask sets to draw.
             key: The key the mask sets are drawn from.
         """
-        self.network = network
-        self.num_draws = num_draws
-        self.key = nnx.data(key)
+        self.network: Cnn1DGaussianModel = network
+        self.num_draws: int = num_draws
+        self.key: jax.Array = nnx.data(key)
 
     def __call__(self, inputs: jax.Array) -> PosteriorPredictive:
         """Predict the posterior predictive for each windowed example.
@@ -521,6 +538,25 @@ class McDropoutPredictive(nnx.Module):
         )
 
 
+def _mc_dropout_predictive_over(
+    network: Cnn1DGaussianModel, config: CmapssConfig
+) -> McDropoutPredictive:
+    """Wrap `network` itself, not a clone, as its MC-Dropout posterior predictive.
+
+    Args:
+        network: The Gaussian-head network with dropout; later changes to
+            its parameters are seen.
+        config: Example configuration; `num_draws` and `seed` are read.
+
+    Returns:
+        An `McDropoutPredictive` over `network` drawing its masks from
+        `mc_dropout_draw_key`.
+    """
+    return McDropoutPredictive(
+        network, num_draws=config.num_draws, key=mc_dropout_draw_key(config)
+    )
+
+
 def build_mc_dropout_predictive(
     network: Cnn1DGaussianModel, config: CmapssConfig
 ) -> McDropoutPredictive:
@@ -535,19 +571,48 @@ def build_mc_dropout_predictive(
         independent of later training, drawing its masks from
         `mc_dropout_draw_key`.
     """
-    predictive = McDropoutPredictive(
-        nnx.clone(network),
-        num_draws=config.num_draws,
-        key=mc_dropout_draw_key(config),
-    )
+    predictive = _mc_dropout_predictive_over(nnx.clone(network), config)
     predictive.eval()
     return predictive
+
+
+def _validation_nll_early_stopper(config: CmapssConfig, *, metric: str) -> EarlyStopper:
+    """Build the early stopper an MC-Dropout model trains under.
+
+    Args:
+        config: Example configuration; `early_stopping_patience` is read.
+        metric: The name the validation NLL is reported under, `"loss"`
+            for `run_supervised` or `"nll"` for a posterior stage.
+
+    Returns:
+        An `EarlyStopper` minimizing `metric` on the validation split.
+    """
+    return EarlyStopper(
+        metric=metric,
+        mode=OptimizationMode.MIN,
+        patience=config.early_stopping_patience,
+        source=Split.VALIDATION,
+    )
 
 
 def _fixed_order_loader(
     windows: np.ndarray, targets: np.ndarray, *, batch_size: int
 ) -> LoaderFactory:
-    """Build a `LoaderFactory` yielding the same unshuffled batches every epoch."""
+    """Build a `LoaderFactory` yielding the same unshuffled batches every epoch.
+
+    The batches are built once, so every epoch sees the same windows in the
+    same batches; an MC-Dropout model's validation NLL is then comparable
+    epoch to epoch.
+
+    Args:
+        windows: Sliding-window inputs, shape `(n_windows, window_length,
+            n_sensors)`.
+        targets: Aligned RUL targets, shape `(n_windows,)`.
+        batch_size: Number of windows per mini-batch.
+
+    Returns:
+        A callable `loader(split, epoch)` returning the fixed batches.
+    """
     inputs = jnp.asarray(windows, dtype=jnp.float32)
     targets_array = jnp.asarray(targets, dtype=jnp.float32).reshape(-1, 1)
     batches = [
@@ -614,6 +679,9 @@ def train_joint_mcd_model(
     state = initialize_training_state(
         setup.model, setup.optimizer, rng_key=setup.rng_key
     )
+    validation_loader = _fixed_order_loader(
+        validation_windows, validation_targets, batch_size=config.batch_size
+    )
     store = InMemoryCheckpointStore()
     run_supervised(
         model=setup.model,
@@ -623,22 +691,11 @@ def train_joint_mcd_model(
         state=state,
         epochs=config.joint_mcd_epochs,
         validation=HeldOutValidation(
-            model=McDropoutPredictive(
-                setup.model,
-                num_draws=config.num_draws,
-                key=mc_dropout_draw_key(config),
-            ),
-            loader=_fixed_order_loader(
-                validation_windows, validation_targets, batch_size=config.batch_size
-            ),
+            model=_mc_dropout_predictive_over(setup.model, config),
+            loader=validation_loader,
             loss=loss,
         ),
-        early_stopper=EarlyStopper(
-            metric="loss",
-            mode=OptimizationMode.MIN,
-            patience=config.early_stopping_patience,
-            source=Split.VALIDATION,
-        ),
+        early_stopper=_validation_nll_early_stopper(config, metric="loss"),
         event_sinks=event_sinks,
         checkpoint_store=store,
         stage=JOINT_MCD_STAGE,
@@ -666,8 +723,8 @@ class PosteriorStagePredictive(nnx.Module, pytree=False):
             stage: A trained posterior stage.
             key: The key selecting the posterior's draws.
         """
-        self.stage = stage
-        self.key = key
+        self.stage: PosteriorStage = stage
+        self.key: jax.Array = key
 
     def __call__(self, inputs: jax.Array) -> PosteriorPredictive:
         """Predict the posterior predictive for each windowed example.
@@ -730,11 +787,12 @@ def train_staged_mcd_posterior(
         hidden_channels=config.hidden_channels,
         kernel_size=config.kernel_size,
         dropout_rate=config.dropout_rate,
-        rngs=nnx.Rngs(
-            jax.random.fold_in(jax.random.key(config.seed), POSTERIOR_NETWORK_STREAM)
-        ),
+        rngs=nnx.Rngs(seed_stream_key(config, POSTERIOR_NETWORK_STREAM)),
     )
     key = mc_dropout_draw_key(config)
+    validation_loader = _fixed_order_loader(
+        validation_windows, validation_targets, batch_size=config.batch_size
+    )
     stage = PosteriorStage(
         inference_method=MCDropout(optimizer=optax.adam(config.mcd_learning_rate)),
         train_loader=make_window_loader(
@@ -746,15 +804,8 @@ def train_staged_mcd_posterior(
         options=PosteriorStageOptions(
             epochs=config.posterior_epochs,
             num_draws=config.num_draws,
-            validation_loader=_fixed_order_loader(
-                validation_windows, validation_targets, batch_size=config.batch_size
-            ),
-            early_stopper=EarlyStopper(
-                metric="nll",
-                mode=OptimizationMode.MIN,
-                patience=config.early_stopping_patience,
-                source=Split.VALIDATION,
-            ),
+            validation_loader=validation_loader,
+            early_stopper=_validation_nll_early_stopper(config, metric="nll"),
             event_sinks=event_sinks,
             checkpoint_store=InMemoryCheckpointStore(),
             validation_key=key,
@@ -800,13 +851,18 @@ def evaluate_test_metrics(
     """Score a model against the FD001 test split.
 
     By default works for any model whose output is a `Gaussian`, such as the
-    staged model from `build_composite_model`. Scoring goes through
+    staged model from `build_composite_model`; with a
+    `PosteriorPredictivePredictor()` it scores a model returning a
+    `PosteriorPredictive` on the exact mixture. Scoring goes through
     `stagereg`'s `MetricSuite`, the predictor, and `evaluate_loader`; the
     closed-form CRPS needs neither predictive samples nor an evaluation grid,
     so the scores carry no Monte Carlo noise. No loss is computed.
 
     Args:
-        model: An eval-mode model mapping windows to a `Gaussian`.
+        model: An eval-mode model mapping windows to a `Gaussian` (the
+            default predictor) or to a `PosteriorPredictive`, such as the
+            MC-Dropout models' predictives (with a
+            `PosteriorPredictivePredictor()` as `predictor`).
         test_windows: One trailing window per test unit, shape `(n_units,
             window_length, n_sensors)`.
         test_rul: Ground-truth RUL per test unit, shape `(n_units,)`.

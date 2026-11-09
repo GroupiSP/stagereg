@@ -248,7 +248,7 @@ def test_extrapolation_calibration_curves_match_the_pinned_reference(
 
     for configuration in result.configurations:
         curve = clustered_scoring.calibration_curve(
-            configuration.draws,
+            configuration.predictive,
             reference_data.grid_targets,
             clustered_scoring.CALIBRATION_LEVELS,
             where=extrapolation,

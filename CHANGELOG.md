@@ -25,6 +25,14 @@ All notable changes to `stagereg` are recorded here. The format follows
   variances (Grimit et al. 2006); a shared variance gives the same values as
   before.
 
+### Changed
+
+- The clustered-data example builds a library `PosteriorPredictive` for every
+  configuration (per-draw variances for a joint run, one variance per chain
+  for a staged one) and scores it through the library's `cdf` and
+  `moment_matched`, in place of its own per-draw mixture code. Its tables and
+  figures are unchanged.
+
 ## [0.6.0] - 2026-11-08
 
 ### Breaking changes

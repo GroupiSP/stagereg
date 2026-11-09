@@ -519,7 +519,7 @@ def clustered_regions() -> ModuleType:
 
 @pytest.fixture(scope="session")
 def clustered_scoring() -> ModuleType:
-    """The clustered-data example's shared scoring of per-draw predictions."""
+    """The clustered-data example's shared scoring of posterior predictives."""
     pytest.importorskip("jax")
     return _import_clustered_data_module("scoring")
 

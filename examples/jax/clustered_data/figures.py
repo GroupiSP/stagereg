@@ -21,7 +21,6 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
 
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 from clustered import GRID_BOUNDS, ClusteredData
@@ -29,7 +28,9 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from methods import METHODS, TRAININGS
 from regions import CLUSTERS, EXTRAPOLATION, region_masks
-from scoring import CALIBRATION_LEVELS, PredictiveDraws, calibration_curve
+from scoring import CALIBRATION_LEVELS, calibration_curve
+
+from stagereg.jax import PosteriorPredictive
 
 METHOD_COLUMNS: tuple[str, ...] = tuple(METHODS)
 """The inference methods, one per column of the uncertainty grid, in table order.
@@ -68,7 +69,7 @@ class Configuration(Protocol):
     Attributes:
         training: The training's name, one of `TRAININGS`.
         method: The inference method's name, one of `METHOD_COLUMNS`.
-        draws: The per-draw predictive means and variances on the grid.
+        predictive: The posterior predictive on the grid.
     """
 
     @property
@@ -78,7 +79,7 @@ class Configuration(Protocol):
     def method(self) -> str: ...
 
     @property
-    def draws(self) -> PredictiveDraws: ...
+    def predictive(self) -> PosteriorPredictive: ...
 
 
 def _by_cell(
@@ -114,11 +115,11 @@ def _shade_regions(axes: Axes) -> None:
 
 def _draw_panel(axes: Axes, configuration: Configuration, data: ClusteredData) -> None:
     """Draw one configuration's predictive on the grid, with the data and truth."""
-    draws = configuration.draws
+    summary = configuration.predictive.moment_matched()
     inputs = np.asarray(data.grid_inputs)[:, 0]
-    mean = np.asarray(jnp.mean(draws.means, axis=0))
-    epistemic = np.asarray(jnp.var(draws.means, axis=0))
-    aleatoric = np.asarray(jnp.mean(draws.variances, axis=0))
+    mean = np.asarray(summary.loc)
+    epistemic = np.asarray(summary.epistemic_variance)
+    aleatoric = np.asarray(summary.aleatoric_variance)
     epistemic_half = Z_95 * np.sqrt(epistemic)
     total_half = Z_95 * np.sqrt(aleatoric + epistemic)
 
@@ -233,7 +234,7 @@ def plot_extrapolation_calibration(
             axes.plot([0.0, 1.0], [0.0, 1.0], color="0.5", linestyle="--", linewidth=1)
         for method in methods:
             coverage = calibration_curve(
-                cells[training, method].draws,
+                cells[training, method].predictive,
                 data.grid_targets,
                 CALIBRATION_LEVELS,
                 where=extrapolation,

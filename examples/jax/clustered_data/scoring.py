@@ -1,10 +1,10 @@
-"""The clustered-data example's shared scoring of per-draw predictions.
+"""The clustered-data example's shared scoring of posterior predictives.
 
-Every configuration, joint or staged, is reduced to the same
-`PredictiveDraws`: one predictive mean and one aleatoric variance per
-posterior draw and grid point. Its predictive distribution is the
-equal-weight mixture of those Gaussians, and one scoring path serves every
-configuration.
+Every configuration, joint or staged, is reduced to the library's
+[`PosteriorPredictive`][stagereg.jax.PosteriorPredictive] on the evaluation
+grid: the equal-weight mixture of one Gaussian per posterior draw. A joint
+draw carries its own aleatoric variance; a staged chain's draws share its
+variance stage's. One scoring path serves every configuration.
 
 A target `y` lies inside the mixture's central `p`-interval iff its
 probability integral transform `F(y)` satisfies `|F(y) - 1/2| <= p/2`.
@@ -18,71 +18,56 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-from jax.scipy.stats import norm
 from regions import IN_DISTRIBUTION, REGIONS, RegionMasks
 
-
-@dataclass(frozen=True)
-class PredictiveDraws:
-    """A posterior predictive reduced to per-draw Gaussians on the grid.
-
-    Attributes:
-        means: Each draw's predictive mean, shape `[S, N]`.
-        variances: Each draw's aleatoric variance, shape `[S, N]`. A staged
-            model broadcasts its single aleatoric variance across draws.
-    """
-
-    means: jax.Array
-    variances: jax.Array
-
-    def in_target_units(self, mean: float, std: float) -> PredictiveDraws:
-        """Map draws predicted on standardized targets back to the targets' units.
-
-        Args:
-            mean: The targets' mean, which standardization subtracted.
-            std: The targets' standard deviation, which standardization
-                divided by.
-
-        Returns:
-            The draws with means `mean + std * means` and variances
-            `std**2 * variances`.
-        """
-        return PredictiveDraws(
-            means=mean + std * self.means, variances=std**2 * self.variances
-        )
+from stagereg.jax import PosteriorPredictive
 
 
-def pool_draws(draws: Sequence[PredictiveDraws]) -> PredictiveDraws:
-    """Pool several runs' draws into one equal-weight predictive.
+def in_target_units(
+    predictive: PosteriorPredictive, mean: float, std: float
+) -> PosteriorPredictive:
+    """Map a predictive on standardized targets back to the targets' units.
 
     Args:
-        draws: The runs' draws, all on the same grid.
+        predictive: The predictive on standardized targets.
+        mean: The targets' mean, which standardization subtracted.
+        std: The targets' standard deviation, which standardization
+            divided by.
 
     Returns:
-        Every run's draws, stacked in order along the draw axis.
+        The predictive with draws `mean + std * draws` and aleatoric
+        variance `std**2 * aleatoric_variance`, shared or per draw as given.
     """
-    return PredictiveDraws(
-        means=jnp.concatenate([run.means for run in draws]),
-        variances=jnp.concatenate([run.variances for run in draws]),
+    return PosteriorPredictive(
+        draws=mean + std * predictive.draws,
+        aleatoric_variance=std**2 * predictive.aleatoric_variance,
+        draw_mask=predictive.draw_mask,
     )
 
 
-def mixture_cdf(draws: PredictiveDraws, targets: jax.Array) -> jax.Array:
-    """Evaluate the equal-weight Gaussian mixture's CDF at the targets.
+def pool_chains(chains: Sequence[PosteriorPredictive]) -> PosteriorPredictive:
+    """Pool several chains' predictives into one equal-weight predictive.
 
     Args:
-        draws: The per-draw predictive means and variances, shape `[S, N]`.
-        targets: One target per grid point, shape `[N]`.
+        chains: The chains' predictives, all on the same grid.
 
     Returns:
-        `F(y_n) = mean_s Phi((y_n - mu_sn) / sigma_sn)`, shape `[N]`.
+        Every chain's draws, concatenated in order along the draw axis, each
+        with its own chain's aleatoric variance.
     """
-    scale = jnp.sqrt(draws.variances)
-    return jnp.mean(norm.cdf(targets, loc=draws.means, scale=scale), axis=0)
+    return PosteriorPredictive(
+        draws=jnp.concatenate([chain.draws for chain in chains]),
+        aleatoric_variance=jnp.concatenate(
+            [
+                jnp.broadcast_to(chain.aleatoric_variance, chain.draws.shape)
+                for chain in chains
+            ]
+        ),
+    )
 
 
 def central_coverage(
-    draws: PredictiveDraws,
+    predictive: PosteriorPredictive,
     targets: jax.Array,
     level: float,
     *,
@@ -91,7 +76,7 @@ def central_coverage(
     """Return the fraction of targets inside the central `level`-interval.
 
     Args:
-        draws: The per-draw predictive means and variances, shape `[S, N]`.
+        predictive: The predictive on the grid, batch shape `[N]`.
         targets: One target per grid point, shape `[N]`.
         level: The interval's nominal level, in `(0, 1)`.
         where: Optional boolean mask of shape `[N]` restricting the points
@@ -100,7 +85,7 @@ def central_coverage(
     Returns:
         The observed coverage, in `[0, 1]`.
     """
-    inside = jnp.abs(mixture_cdf(draws, targets) - 0.5) <= level / 2
+    inside = jnp.abs(predictive.cdf(targets) - 0.5) <= level / 2
     return float(jnp.mean(inside, where=where))
 
 
@@ -113,10 +98,11 @@ class RegionScores:
     """One region's uncertainty and coverage.
 
     Attributes:
-        aleatoric_std: `sqrt` of the region average of the draw-averaged
-            aleatoric variance, in target units.
-        epistemic_std: `sqrt` of the region average of the variance over
-            draws of the predictive mean, in target units.
+        aleatoric_std: `sqrt` of the region average of the moment-matched
+            aleatoric variance, the draws' average, in target units.
+        epistemic_std: `sqrt` of the region average of the moment-matched
+            epistemic variance, the variance of the draws' means, in target
+            units.
         coverage: Fraction of the region's targets inside the mixture's
             central `COVERAGE_LEVEL`-interval.
     """
@@ -146,32 +132,35 @@ class Scores:
     regions: dict[str, RegionScores]
 
 
-def score(draws: PredictiveDraws, targets: jax.Array, masks: RegionMasks) -> Scores:
-    """Score per-draw predictions on the grid, region by region.
+def score(
+    predictive: PosteriorPredictive, targets: jax.Array, masks: RegionMasks
+) -> Scores:
+    """Score a predictive on the grid, region by region.
 
     Args:
-        draws: The per-draw predictive means and variances, shape `[S, N]`.
+        predictive: The predictive on the grid, batch shape `[N]`.
         targets: One noisy target per grid point, shape `[N]`.
         masks: The grid's region masks, as `region_masks` returns them.
 
     Returns:
         The in-distribution R² and every region's `RegionScores`.
     """
-    aleatoric = jnp.mean(draws.variances, axis=0)
-    epistemic = jnp.var(draws.means, axis=0)
+    summary = predictive.moment_matched()
     in_distribution = masks[IN_DISTRIBUTION]
-    residual = jnp.sum(
-        (jnp.mean(draws.means, axis=0) - targets) ** 2, where=in_distribution
-    )
+    residual = jnp.sum((summary.loc - targets) ** 2, where=in_distribution)
     spread = jnp.sum(
         (targets - jnp.mean(targets, where=in_distribution)) ** 2, where=in_distribution
     )
 
     def region_scores(mask: jax.Array) -> RegionScores:
         return RegionScores(
-            aleatoric_std=float(jnp.sqrt(jnp.mean(aleatoric, where=mask))),
-            epistemic_std=float(jnp.sqrt(jnp.mean(epistemic, where=mask))),
-            coverage=central_coverage(draws, targets, COVERAGE_LEVEL, where=mask),
+            aleatoric_std=float(
+                jnp.sqrt(jnp.mean(summary.aleatoric_variance, where=mask))
+            ),
+            epistemic_std=float(
+                jnp.sqrt(jnp.mean(summary.epistemic_variance, where=mask))
+            ),
+            coverage=central_coverage(predictive, targets, COVERAGE_LEVEL, where=mask),
         )
 
     return Scores(
@@ -185,7 +174,7 @@ CALIBRATION_LEVELS: tuple[float, ...] = tuple(step / 20 for step in range(1, 20)
 
 
 def calibration_curve(
-    draws: PredictiveDraws,
+    predictive: PosteriorPredictive,
     targets: jax.Array,
     levels: Sequence[float] = CALIBRATION_LEVELS,
     *,
@@ -197,7 +186,7 @@ def calibration_curve(
     curve and the table's coverage share one scoring path.
 
     Args:
-        draws: The per-draw predictive means and variances, shape `[S, N]`.
+        predictive: The predictive on the grid, batch shape `[N]`.
         targets: One target per grid point, shape `[N]`.
         levels: The nominal levels, each in `(0, 1)`.
         where: Optional boolean mask of shape `[N]` restricting the points
@@ -207,5 +196,5 @@ def calibration_curve(
         One observed coverage in `[0, 1]` per level, in the levels' order.
     """
     return tuple(
-        central_coverage(draws, targets, level, where=where) for level in levels
+        central_coverage(predictive, targets, level, where=where) for level in levels
     )

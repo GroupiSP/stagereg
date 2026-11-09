@@ -13,7 +13,7 @@ Standardization does not replace ADR 0016's residual scale; the example keeps bo
 
 ## Consequences
 
-- Every configuration trains in standardized units. A new configuration must map its predictions back with `PredictiveDraws.in_target_units` before scoring, or its scores are in the wrong units.
+- Every configuration trains in standardized units. A new configuration must map its posterior predictive back with the example's `scoring.in_target_units` before scoring, or its scores are in the wrong units.
 - The `prior_precision` flag now sets the supervised stages' L2 as well as the posterior prior, so changing it changes the trained mean and variance networks too.
 - The networks now predict standardized targets, so the same `prior_precision` is a different prior over the function than before, for the joint baseline as well as the staged model.
 - VeBNN's outer iterations, and the early stopping and best-iteration selection across them, are not reproduced: the staged model runs one outer pass.

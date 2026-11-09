@@ -1,6 +1,6 @@
 """Tests for the clustered-data example's region masks and shared scoring.
 
-None of these trains a model: they score hand-built per-draw predictions
+None of these trains a model: they score hand-built posterior predictives
 whose answers are known by construction.
 """
 
@@ -15,6 +15,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 jnp = pytest.importorskip("jax.numpy")
+stagereg_jax = pytest.importorskip("stagereg.jax")
+PosteriorPredictive = stagereg_jax.PosteriorPredictive
 
 _GRID_INPUTS = st.lists(
     st.floats(min_value=-0.5, max_value=1.5, width=32), min_size=1, max_size=50
@@ -85,8 +87,8 @@ def test_coverage_matches_the_level_when_targets_come_from_the_predictive(
     means = rng.normal(size=(5, 20_000))
     variances = rng.uniform(0.1, 2.0, size=(5, 20_000))
     targets = _mixture_samples(rng, means, variances)
-    draws = clustered_scoring.PredictiveDraws(
-        means=jnp.asarray(means), variances=jnp.asarray(variances)
+    draws = PosteriorPredictive(
+        draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variances)
     )
 
     coverage = clustered_scoring.central_coverage(draws, jnp.asarray(targets), level)
@@ -99,8 +101,8 @@ def test_coverage_falls_far_below_the_level_for_a_far_too_narrow_predictive(
 ) -> None:
     rng = np.random.default_rng(0)
     targets = rng.normal(size=10_000)
-    draws = clustered_scoring.PredictiveDraws(
-        means=jnp.zeros((4, 10_000)), variances=jnp.full((4, 10_000), 0.01**2)
+    draws = PosteriorPredictive(
+        draws=jnp.zeros((4, 10_000)), aleatoric_variance=jnp.full((4, 10_000), 0.01**2)
     )
 
     coverage = clustered_scoring.central_coverage(draws, jnp.asarray(targets), 0.95)
@@ -131,9 +133,9 @@ def test_score_splits_constant_means_and_equal_variances(
     offset: float,
 ) -> None:
     curve = jnp.sin(3.0 * _GRID[:, 0]) + offset
-    draws = clustered_scoring.PredictiveDraws(
-        means=jnp.broadcast_to(curve, (_NUM_DRAWS, curve.size)),
-        variances=jnp.full((_NUM_DRAWS, curve.size), std**2),
+    draws = PosteriorPredictive(
+        draws=jnp.broadcast_to(curve, (_NUM_DRAWS, curve.size)),
+        aleatoric_variance=jnp.full((_NUM_DRAWS, curve.size), std**2),
     )
 
     scores = clustered_scoring.score(draws, curve, grid_masks)
@@ -153,9 +155,9 @@ def test_score_recovers_a_known_spread_of_means_as_epistemic_std(
 ) -> None:
     signs = jnp.asarray([1.0, -1.0] * (_NUM_DRAWS // 2))[:, None]
     curve = jnp.cos(2.0 * _GRID[:, 0])
-    draws = clustered_scoring.PredictiveDraws(
-        means=curve + spread * signs,
-        variances=jnp.ones((_NUM_DRAWS, curve.size)),
+    draws = PosteriorPredictive(
+        draws=curve + spread * signs,
+        aleatoric_variance=jnp.ones((_NUM_DRAWS, curve.size)),
     )
 
     scores = clustered_scoring.score(draws, curve, grid_masks)
@@ -178,11 +180,11 @@ def test_score_reports_r2_on_the_in_distribution_region_only(
     # Predicting the in-distribution targets' own mean there explains none of
     # their variance, whatever is predicted outside.
     level = jnp.mean(targets, where=in_distribution)
-    draws = clustered_scoring.PredictiveDraws(
-        means=jnp.broadcast_to(
+    draws = PosteriorPredictive(
+        draws=jnp.broadcast_to(
             jnp.where(in_distribution, level, 0.0), (_NUM_DRAWS, targets.size)
         ),
-        variances=jnp.ones((_NUM_DRAWS, targets.size)),
+        aleatoric_variance=jnp.ones((_NUM_DRAWS, targets.size)),
     )
 
     scores = clustered_scoring.score(draws, targets, grid_masks)
@@ -199,8 +201,8 @@ def test_calibration_curve_follows_the_diagonal_when_targets_come_from_the_predi
     means = rng.normal(size=(5, 20_000))
     variances = rng.uniform(0.1, 2.0, size=(5, 20_000))
     targets = _mixture_samples(rng, means, variances)
-    draws = clustered_scoring.PredictiveDraws(
-        means=jnp.asarray(means), variances=jnp.asarray(variances)
+    draws = PosteriorPredictive(
+        draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variances)
     )
     levels = clustered_scoring.CALIBRATION_LEVELS
 
@@ -223,8 +225,9 @@ def test_calibration_curve_counts_only_the_masked_points(
     # The masked half sits at the predictive's mean, so every interval covers
     # it; the other half lies far outside every interval.
     targets = jnp.concatenate([jnp.zeros(50), jnp.full(50, 100.0)])
-    draws = clustered_scoring.PredictiveDraws(
-        means=jnp.zeros((_NUM_DRAWS, 100)), variances=jnp.ones((_NUM_DRAWS, 100))
+    draws = PosteriorPredictive(
+        draws=jnp.zeros((_NUM_DRAWS, 100)),
+        aleatoric_variance=jnp.ones((_NUM_DRAWS, 100)),
     )
     where = jnp.arange(100) < 50
 
@@ -253,21 +256,23 @@ def test_draws_in_target_units_keep_the_pit_and_scale_the_sigma(
     grid = jnp.linspace(-0.5, 1.5, 40)[:, None]
     masks = clustered_regions.region_masks(grid)
     targets = jnp.sin(3.0 * grid[:, 0])
-    draws = clustered_scoring.PredictiveDraws(
-        means=jnp.stack([0.9 * targets, 1.1 * targets]),
-        variances=jnp.full((2, 40), 0.05),
+    draws = PosteriorPredictive(
+        draws=jnp.stack([0.9 * targets, 1.1 * targets]),
+        aleatoric_variance=jnp.full((2, 40), 0.05),
     )
 
-    rescaled = draws.in_target_units(mean, std)
+    rescaled = clustered_scoring.in_target_units(draws, mean, std)
     standardized = clustered_scoring.score(draws, targets, masks)
     original = clustered_scoring.score(rescaled, mean + std * targets, masks)
 
     np.testing.assert_allclose(
-        np.asarray(rescaled.variances), std**2 * np.asarray(draws.variances), rtol=1e-5
+        np.asarray(rescaled.aleatoric_variance),
+        std**2 * np.asarray(draws.aleatoric_variance),
+        rtol=1e-5,
     )
     np.testing.assert_allclose(
-        np.asarray(clustered_scoring.mixture_cdf(rescaled, mean + std * targets)),
-        np.asarray(clustered_scoring.mixture_cdf(draws, targets)),
+        np.asarray(rescaled.cdf(mean + std * targets)),
+        np.asarray(draws.cdf(targets)),
         atol=1e-4,
     )
     for region in standardized.regions:
@@ -278,26 +283,25 @@ def test_draws_in_target_units_keep_the_pit_and_scale_the_sigma(
         )
 
 
-def test_pooled_draws_are_the_equal_weight_mixture_of_the_runs(
+def test_pooled_chains_are_the_equal_weight_mixture_keeping_each_chains_variance(
     clustered_scoring: ModuleType,
 ) -> None:
     grid = jnp.linspace(-0.5, 1.5, 7)
-    first = clustered_scoring.PredictiveDraws(
-        means=jnp.stack([grid, 2 * grid]), variances=jnp.full((2, 7), 0.1)
+    # A joint chain with a variance per draw, and a staged chain whose draws
+    # share its variance stage's variance.
+    joint = PosteriorPredictive(
+        draws=jnp.stack([grid, 2 * grid]),
+        aleatoric_variance=jnp.stack([jnp.full(7, 0.1), jnp.full(7, 0.2)]),
     )
-    second = clustered_scoring.PredictiveDraws(
-        means=-grid[None], variances=jnp.full((1, 7), 0.3)
-    )
+    staged = PosteriorPredictive(draws=-grid[None], aleatoric_variance=jnp.full(7, 0.3))
 
-    pooled = clustered_scoring.pool_draws([first, second])
+    pooled = clustered_scoring.pool_chains([joint, staged])
 
-    assert pooled.means.shape == pooled.variances.shape == (3, 7)
-    expected_cdf = (
-        2 * clustered_scoring.mixture_cdf(first, grid)
-        + clustered_scoring.mixture_cdf(second, grid)
-    ) / 3
+    assert pooled.draws.shape == pooled.aleatoric_variance.shape == (3, 7)
     np.testing.assert_allclose(
-        np.asarray(clustered_scoring.mixture_cdf(pooled, grid)),
-        np.asarray(expected_cdf),
-        rtol=1e-5,
+        np.asarray(pooled.aleatoric_variance), [[0.1] * 7, [0.2] * 7, [0.3] * 7]
+    )
+    expected_cdf = (2 * joint.cdf(grid) + staged.cdf(grid)) / 3
+    np.testing.assert_allclose(
+        np.asarray(pooled.cdf(grid)), np.asarray(expected_cdf), rtol=1e-5
     )

@@ -73,7 +73,8 @@ followed by a Gaussian head predicting mean and scale together.
 
 Builds the example's RUL curves. `plot_validation_rul_curves` takes the
 standardized validation trajectories, the feature columns, a sequence of
-`LabelledModel`s (a label and a trained Gaussian model each), the three
+`LabelledModel`s (a label and a trained model each, predicting a Gaussian
+or a posterior predictive), the three
 units to draw, and the window length, and draws an N×3 grid: one row per
 model, labelled with its name, and one column per unit. `run.py` passes
 its one staged model, so its figure is a single row, and its first panel's
@@ -88,7 +89,12 @@ times as long.
 
 Each column shows one unit's true linear RUL across its whole trajectory,
 the model's predicted mean, and the 95% predictive interval
-`loc ± 1.96 * scale` taken analytically from the model's Gaussian. The
+`loc ± 1.96 * scale` taken analytically from the model's Gaussian. A
+posterior-predictive row instead draws the mixture mean, a total band
+(the mixture's central 95% interval, from its quantiles) and a narrower
+epistemic band (the 2.5% and 97.5% quantiles of the draws' means at each
+window); each curve comes from one evaluation over the unit's windows, so
+every draw is the same function along it. The
 columns have independent x limits, so the band stays readable in the
 short-lived unit instead of being squashed by the long-lived one's axis
 range, while each column shares its x-axis across rows so that every
@@ -96,7 +102,7 @@ model's curve for a unit sits on the same time axis; y limits are
 independent per panel. Each column is titled with its unit ID, the role it
 plays, and that unit's lifetime in cycles, and one shared figure-level
 legend names the
-three elements. The predicted mean and its band start at each unit's
+union of the elements drawn across rows. The predicted mean and its band start at each unit's
 first full window, since no prediction exists before `window_length`
 cycles of history have accumulated; the band is left unclipped at zero,
 so a band dipping below zero stays visible as evidence of the Gaussian

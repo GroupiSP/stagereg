@@ -1,11 +1,14 @@
 """RUL curves with 95% predictive intervals for the CMAPSS example.
 
-Turns one or more trained Gaussian models and the standardized trajectories
+Turns one or more trained models, each predicting a Gaussian or a posterior
+predictive, and the standardized trajectories
 they were trained under into the example's headline figure: one row per
 model, and in each row three held-out validation units side by side — the
 shortest-, median-, and longest-lifetime one — each showing its true
 linear RUL across the whole trajectory, the model's predicted mean, and
-the 95% predictive interval around that mean. Spanning the lifetime range that way shows whether the
+the 95% predictive interval around that mean — for a posterior predictive,
+a total band and a narrower epistemic band. Spanning the lifetime range
+that way shows whether the
 model's accuracy and its stated uncertainty behave consistently across
 units that fail early and units that survive several times as long.
 
@@ -105,7 +108,9 @@ class PredictiveModel(Protocol):
                 window_length, n_features)`.
 
         Returns:
-            The predictive distribution over those windows.
+            The predictive distribution over those windows: a Gaussian, or a
+            posterior predictive each of whose draws is one function applied
+            to the whole batch.
         """
         ...
 
@@ -264,10 +269,16 @@ def plot_validation_rul_curves(
     curves are evidence of generalization rather than of memorized fit,
     and a unit's lifetime is only observable at all for the
     run-to-failure train-split trajectories the validation subset is
-    carved out of. Each band is `loc ± 1.96 * scale`, taken analytically
-    from the model's Gaussian and left unclipped at zero, so that a band
-    dipping below zero stays visible as evidence of the Gaussian
-    assumption breaking down near end of life.
+    carved out of. A Gaussian row's band is `loc ± 1.96 * scale`, taken
+    analytically from the model's Gaussian. A posterior-predictive row
+    draws the mixture mean, a total band (the mixture's central 95%
+    interval, from its quantiles) and a narrower epistemic band (the 2.5%
+    and 97.5% quantiles of the draws' means at each window). Each curve
+    comes from one evaluation over the unit's windows, so every draw is
+    the same function along it. No band is clipped at zero, so that a band
+    dipping below zero stays visible as evidence of the distributional
+    assumption breaking down near end of life. The one figure legend lists
+    the union of the elements drawn across rows.
 
     Args:
         trajectories: The standardized trajectories holding `units`,

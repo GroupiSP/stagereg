@@ -1,11 +1,14 @@
 """RUL curves with 95% predictive intervals for the CMAPSS example.
 
-Turns one or more trained Gaussian models and the standardized trajectories
+Turns one or more trained models, each predicting a Gaussian or a posterior
+predictive, and the standardized trajectories
 they were trained under into the example's headline figure: one row per
 model, and in each row three held-out validation units side by side — the
 shortest-, median-, and longest-lifetime one — each showing its true
 linear RUL across the whole trajectory, the model's predicted mean, and
-the 95% predictive interval around that mean. Spanning the lifetime range that way shows whether the
+the 95% predictive interval around that mean — for a posterior predictive,
+a total band and a narrower epistemic band. Spanning the lifetime range
+that way shows whether the
 model's accuracy and its stated uncertainty behave consistently across
 units that fail early and units that survive several times as long.
 
@@ -25,7 +28,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -43,6 +46,11 @@ _INTERVAL_Z_SCORE = 1.96
 _TRUE_RUL_LABEL = "True linear RUL"
 _PREDICTED_MEAN_LABEL = "Predicted mean"
 _INTERVAL_LABEL = "95% predictive interval"
+_TOTAL_INTERVAL_LABEL = "95% total interval"
+_EPISTEMIC_INTERVAL_LABEL = "95% epistemic interval"
+# Central 95% interval of a posterior predictive and of its draws' means.
+_LOWER_PROBABILITY = 0.025
+_UPPER_PROBABILITY = 0.975
 # The role each column plays in the figure, in column order.
 _ROLE_LABELS: tuple[str, ...] = (
     "shortest lifetime",
@@ -65,10 +73,34 @@ class PredictiveDistribution(Protocol):
         ...
 
 
+@runtime_checkable
+class PosteriorPredictiveDistribution(Protocol):
+    """A posterior predictive over a batch of windows: a mixture over draws.
+
+    The library's `PosteriorPredictive` is one. Its draws are told apart
+    from a location-scale Gaussian by having `draws` at all.
+    """
+
+    @property
+    def draws(self) -> Any:
+        """Each draw's mean, shape `(n_draws, n_windows, 1)`."""
+        ...
+
+    def mean(self) -> Any:
+        """Return the mixture mean, shape `(n_windows, 1)`."""
+        ...
+
+    def quantile(self, probability: float) -> Any:
+        """Return the mixture quantile at `probability`, shape `(n_windows, 1)`."""
+        ...
+
+
 class PredictiveModel(Protocol):
     """A model mapping windowed sensor readings to a predictive distribution."""
 
-    def __call__(self, inputs: Any) -> PredictiveDistribution:
+    def __call__(
+        self, inputs: Any
+    ) -> PredictiveDistribution | PosteriorPredictiveDistribution:
         """Predict one distribution per windowed example.
 
         Args:
@@ -76,7 +108,9 @@ class PredictiveModel(Protocol):
                 window_length, n_features)`.
 
         Returns:
-            The predictive distribution over those windows.
+            The predictive distribution over those windows: a Gaussian, or a
+            posterior predictive each of whose draws is one function applied
+            to the whole batch.
         """
         ...
 
@@ -88,11 +122,77 @@ class LabelledModel:
     Attributes:
         label: The name of the model, shown as its row's label, e.g.
             `"Staged model"` or `"Joint model"`.
-        model: The trained model whose Gaussian output the row draws.
+        model: The trained model whose Gaussian or posterior-predictive
+            output the row draws.
     """
 
     label: str
     model: PredictiveModel
+
+
+def _flat(values: Any) -> np.ndarray:
+    """Return per-window values as a flat float array."""
+    return np.asarray(values, dtype=float).reshape(-1)
+
+
+def _draw_gaussian_band(
+    axes: Axes, window_cycles: Any, prediction: PredictiveDistribution
+) -> None:
+    """Draw a Gaussian's mean and its `loc ± 1.96·scale` band."""
+    loc = _flat(prediction.loc)
+    half_width = _INTERVAL_Z_SCORE * _flat(prediction.scale)
+    axes.plot(window_cycles, loc, label=_PREDICTED_MEAN_LABEL, color="tab:blue")
+    axes.fill_between(
+        window_cycles,
+        loc - half_width,
+        loc + half_width,
+        alpha=0.25,
+        color="tab:blue",
+        label=_INTERVAL_LABEL,
+    )
+
+
+def _draw_posterior_bands(
+    axes: Axes, window_cycles: Any, prediction: PosteriorPredictiveDistribution
+) -> None:
+    """Draw a posterior predictive's mean, total band and epistemic band.
+
+    The total band is the mixture's central 95% interval, from its
+    quantiles; the epistemic band is the 2.5% and 97.5% quantiles of the
+    draws' means at each window, ignoring the aleatoric variance. Draw
+    slots a `draw_mask` excludes are left out of the epistemic band, as the
+    mixture leaves them out of its quantiles.
+    """
+    draws = np.asarray(prediction.draws, dtype=float)
+    draw_mask = getattr(prediction, "draw_mask", None)
+    if draw_mask is not None:
+        draws = draws[np.asarray(draw_mask, dtype=bool)]
+    draws = draws.reshape(draws.shape[0], -1)
+    epistemic_lower, epistemic_upper = np.quantile(
+        draws, (_LOWER_PROBABILITY, _UPPER_PROBABILITY), axis=0
+    )
+    axes.plot(
+        window_cycles,
+        _flat(prediction.mean()),
+        label=_PREDICTED_MEAN_LABEL,
+        color="tab:blue",
+    )
+    axes.fill_between(
+        window_cycles,
+        _flat(prediction.quantile(_LOWER_PROBABILITY)),
+        _flat(prediction.quantile(_UPPER_PROBABILITY)),
+        alpha=0.2,
+        color="tab:blue",
+        label=_TOTAL_INTERVAL_LABEL,
+    )
+    axes.fill_between(
+        window_cycles,
+        epistemic_lower,
+        epistemic_upper,
+        alpha=0.4,
+        color="tab:orange",
+        label=_EPISTEMIC_INTERVAL_LABEL,
+    )
 
 
 def _draw_unit_rul_curve(
@@ -128,11 +228,9 @@ def _draw_unit_rul_curve(
         unit_id=unit_id,
         window_length=window_length,
     )
+    # One evaluation over all of the unit's windows, so that each draw of a
+    # posterior predictive is the same function along the whole curve.
     prediction = model(np.asarray(curve.windows, dtype=np.float32))
-    loc = np.asarray(prediction.loc, dtype=float).reshape(-1)
-    half_width = _INTERVAL_Z_SCORE * np.asarray(prediction.scale, dtype=float).reshape(
-        -1
-    )
 
     axes.plot(
         curve.trajectory_cycles,
@@ -140,15 +238,10 @@ def _draw_unit_rul_curve(
         label=_TRUE_RUL_LABEL,
         color="black",
     )
-    axes.plot(curve.window_cycles, loc, label=_PREDICTED_MEAN_LABEL, color="tab:blue")
-    axes.fill_between(
-        curve.window_cycles,
-        loc - half_width,
-        loc + half_width,
-        alpha=0.25,
-        color="tab:blue",
-        label=_INTERVAL_LABEL,
-    )
+    if isinstance(prediction, PosteriorPredictiveDistribution):
+        _draw_posterior_bands(axes, curve.window_cycles, prediction)
+    else:
+        _draw_gaussian_band(axes, curve.window_cycles, prediction)
     return curve.lifetime
 
 
@@ -176,10 +269,16 @@ def plot_validation_rul_curves(
     curves are evidence of generalization rather than of memorized fit,
     and a unit's lifetime is only observable at all for the
     run-to-failure train-split trajectories the validation subset is
-    carved out of. Each band is `loc ± 1.96 * scale`, taken analytically
-    from the model's Gaussian and left unclipped at zero, so that a band
-    dipping below zero stays visible as evidence of the Gaussian
-    assumption breaking down near end of life.
+    carved out of. A Gaussian row's band is `loc ± 1.96 * scale`, taken
+    analytically from the model's Gaussian. A posterior-predictive row
+    draws the mixture mean, a total band (the mixture's central 95%
+    interval, from its quantiles) and a narrower epistemic band (the 2.5%
+    and 97.5% quantiles of the draws' means at each window). Each curve
+    comes from one evaluation over the unit's windows, so every draw is
+    the same function along it. No band is clipped at zero, so that a band
+    dipping below zero stays visible as evidence of the distributional
+    assumption breaking down near end of life. The one figure legend lists
+    the union of the elements drawn across rows.
 
     Args:
         trajectories: The standardized trajectories holding `units`,
@@ -239,10 +338,20 @@ def plot_validation_rul_curves(
             y_label = "RUL (cycles)"
             axes.set_ylabel(f"{labelled.label}\n{y_label}" if column == 0 else y_label)
 
-    # One legend for the whole figure: every panel draws the same three
-    # elements, so repeating a legend per panel would say nothing new.
-    handles, labels = grid[0, 0].get_legend_handles_labels()
-    figure.legend(handles, labels, loc="lower center", ncol=len(labels))
+    # One legend for the whole figure, listing the union of the elements
+    # drawn in first-drawn order: the panels of a row draw the same
+    # elements, so a legend per panel would say nothing new, while a
+    # posterior-predictive row adds its two bands to a Gaussian row's one.
+    legend_entries: dict[str, Any] = {}
+    for axes in grid.flat:
+        for handle, label in zip(*axes.get_legend_handles_labels(), strict=True):
+            legend_entries.setdefault(label, handle)
+    figure.legend(
+        list(legend_entries.values()),
+        list(legend_entries),
+        loc="lower center",
+        ncol=len(legend_entries),
+    )
     figure.suptitle("CMAPSS FD001 held-out validation RUL curves")
     figure.tight_layout(rect=(0.0, 0.08 / len(models), 1.0, 1.0))
 

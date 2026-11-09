@@ -130,14 +130,15 @@ class CmapssConfig:
             `[0, 1)`.
         joint_mcd_epochs: Maximum number of training epochs of the joint
             MC-Dropout model, which stops early on its validation NLL.
-        mcd_learning_rate: Adam learning rate of the MC-Dropout training.
-            Provisional until tuned.
+        mcd_learning_rate: Adam learning rate of the MC-Dropout training,
+            shared by both MC-Dropout models; tuned on FD001 (see the
+            example's README).
         posterior_epochs: Maximum number of epochs of the staged MC-Dropout
             model's posterior stage, which stops early on its validation
-            mixture NLL. Provisional until tuned.
+            mixture NLL; tuned on FD001.
         prior_precision: Precision of the isotropic Gaussian prior over the
             mean network's parameters in the staged MC-Dropout model's
-            posterior stage. Provisional until tuned.
+            posterior stage; tuned on FD001.
         num_draws: Number of dropout-mask sets an MC-Dropout model's posterior
             predictive mixes.
         early_stopping_patience: Number of epochs without a better validation

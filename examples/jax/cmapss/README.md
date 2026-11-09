@@ -213,15 +213,37 @@ the parameter count.
 #### `--posterior-stage`: MC-Dropout posteriors
 
 Pass `--posterior-stage` to add the **joint MC-Dropout model** (`joint+mcd`)
-and the **staged MC-Dropout model** (`staged+mcd`). The models per seed are
-then `joint`, `joint+mcd`, `staged` and `staged+mcd`, in that order; `joint`
-and `staged` are the same models as without the flag. The comparison is of a
-single training (joint) against separate trainings (staged), each with and
-without an MC-Dropout posterior.
+and the **staged MC-Dropout model** (`staged+mcd`). The comparison is then of
+a single training (joint) against separate trainings (staged), each with and
+without an MC-Dropout posterior. The four models per seed, in column and
+figure-row order:
+
+| Column | Model | How it is trained | Predictive distribution |
+| --- | --- | --- | --- |
+| `joint` | joint model | as without the flag, no dropout | Gaussian |
+| `joint+mcd` | joint MC-Dropout | Gaussian-head CNN with dropout active, from a random initialization, on the Gaussian NLL; early-stopped on its MC mixture's validation NLL | posterior predictive, each draw with its own aleatoric variance |
+| `staged` | staged model | as without the flag | Gaussian |
+| `staged+mcd` | staged MC-Dropout | posterior stage (`MCDropout`) fine-tuning the `staged` mean network with dropout active; early-stopped on the validation mixture NLL | posterior predictive, all draws sharing the Gamma stage's aleatoric variance |
+
+`joint` and `staged` are the same models, with the same scores, as without
+the flag. All four are scored on RMSE, 95% coverage, closed-form CRPS and
+NLL on the FD001 test split; the two MC-Dropout models through
+`PosteriorPredictivePredictor`, on their exact mixture (mixture
+log-density, coverage from mixture quantiles, the mixture's closed-form
+CRPS).
+
+Run the comparison without the flag (two models, `staged` and `joint`) or
+with it (four models):
 
 ```shell
-uv run --group example-cmapss python examples/jax/cmapss/compare.py --posterior-stage
+uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5
+uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5 --posterior-stage
 ```
+
+`--seeds` and `--plot-path` work the same either way. With the flag a seed
+takes about a minute on a laptop CPU, against about 20 seconds without.
+
+##### How the MC-Dropout models are trained
 
 `joint+mcd` is a Gaussian-head CNN at `dropout_rate`, trained from a random
 initialization on the Gaussian NLL with dropout active and no prior term. It
@@ -232,9 +254,7 @@ prediction evaluates the network under `num_draws` dropout-mask sets, each
 one applied to the whole batch, and keeps each draw's own mean and aleatoric
 variance: a posterior predictive scored on its exact mixture. The masks come
 from a fixed key derived from the seed, so validation, test scoring and the
-figure use the same draws. Its figure row shows a total band (the mixture's
-central 95% interval) and an epistemic band (the 2.5–97.5% quantiles of the
-draws' means).
+figure use the same draws.
 
 `staged+mcd` reuses the `staged` column's trained mean and Gamma variance
 networks from the same seed, without retraining, so the difference between
@@ -247,16 +267,115 @@ stops early on the validation mixture NLL after `early_stopping_patience`
 epochs without improvement, and keeps the best epoch. Its prediction is the
 stage's posterior predictive with `num_draws` draws under the same fixed,
 seed-derived key it was validated under, every draw sharing the one
-aleatoric variance. Its figure row shows the same two bands.
+aleatoric variance.
+
+##### Reading the total and epistemic bands
+
+In the figure the Gaussian rows (`joint`, `staged`) keep their single
+`loc ± 1.96 * scale` band. Each MC-Dropout row draws the mixture mean and
+two bands around it:
+
+- the **total band**, the posterior predictive's central 95% interval
+  (from the mixture's quantiles): where the next observed RUL should fall,
+  counting both the aleatoric noise and the spread of the draws;
+- the narrower **epistemic band**, the 2.5% and 97.5% quantiles of the
+  draws' means at each window: how much the dropout draws disagree about
+  the mean, i.e. the model's uncertainty about the function itself.
+
+The gap between the two is the aleatoric part. An epistemic band that is
+narrow next to the total band says that most of the uncertainty is noise
+in the data rather than lack of knowledge. Each curve comes from one
+evaluation over the unit's windows, so every draw is the same function
+along the whole curve.
+
+##### Defaults and how they were chosen
 
 The MC-Dropout settings live in `CmapssConfig` (`run.py`):
 
-| Field | Default |
-| --- | --- |
-| `dropout_rate` | 0.1 |
-| `joint_mcd_epochs` | 60 |
-| `mcd_learning_rate` | 1e-3 (provisional, not yet tuned) |
-| `posterior_epochs` | 20 (provisional, not yet tuned) |
-| `prior_precision` | 1.0 (provisional, not yet tuned) |
-| `num_draws` | 100 |
-| `early_stopping_patience` | 5 |
+| Field | Default | Source |
+| --- | --- | --- |
+| `dropout_rate` | 0.1 | fixed by the spec (#173) |
+| `joint_mcd_epochs` | 60 | fixed by the spec: about the staged path's total epoch budget |
+| `mcd_learning_rate` | 1e-3 | tuned, below; shared by both MC-Dropout models |
+| `posterior_epochs` | 20 | tuned, below |
+| `prior_precision` | 1.0 | tuned, below |
+| `num_draws` | 100 | fixed by the spec |
+| `early_stopping_patience` | 5 | fixed by the spec |
+
+The three tuned values come from a grid on real FD001, seeds 0 and 1, with
+every other setting at its default:
+
+- `joint+mcd`: `mcd_learning_rate` in {1e-4, 3e-4, 1e-3, 3e-3}.
+- `staged+mcd`: `mcd_learning_rate` in {1e-4, 3e-4, 1e-3, 3e-3} ×
+  `prior_precision` in {1, 100, 10⁴}, with `posterior_epochs` raised to 40
+  so the cap never cut a run short. Each grid point fine-tunes the same
+  seed's `staged` networks.
+
+Values were selected on the **validation mixture NLL** at the best epoch,
+never on the test split. Means over the two seeds; "stop (best)" is the
+epoch count run and the best epoch (0-based) per seed:
+
+| Model | `mcd_learning_rate` | `prior_precision` | stop (best) | val NLL | test RMSE | test coverage | test CRPS | test NLL |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `joint+mcd` | 1e-4 | | 60 (56), 60 (59) | 5.061 | 32.39 | 0.990 | 17.91 | 4.824 |
+| `joint+mcd` | 3e-4 | | 60 (56), 60 (57) | 4.947 | 30.43 | 0.980 | 16.70 | 4.747 |
+| `joint+mcd` | **1e-3** | | 60 (56), 60 (56) | **4.834** | 29.50 | 0.965 | 15.54 | 4.604 |
+| `joint+mcd` | 3e-3 | | 50 (43), 46 (39) | 4.864 | 27.13 | 0.970 | 14.32 | 4.529 |
+| `staged+mcd` | 1e-4 | 1 | 10 (3), 7 (0) | 5.326 | 23.91 | 0.950 | 13.29 | 4.546 |
+| `staged+mcd` | 1e-4 | 100 | 7 (0), 7 (0) | 5.339 | 23.83 | 0.950 | 13.29 | 4.549 |
+| `staged+mcd` | 1e-4 | 10⁴ | 7 (0), 7 (0) | 5.522 | 20.79 | 0.970 | 11.92 | 4.476 |
+| `staged+mcd` | 3e-4 | 1 | 10 (3), 9 (2) | 5.348 | 23.57 | 0.955 | 13.11 | 4.533 |
+| `staged+mcd` | 3e-4 | 100 | 7 (0), 7 (0) | 5.399 | 22.95 | 0.955 | 12.98 | 4.536 |
+| `staged+mcd` | 3e-4 | 10⁴ | 7 (0), 7 (0) | 5.863 | 20.83 | 0.945 | 12.01 | 4.498 |
+| `staged+mcd` | **1e-3** | **1** | 7 (0), 7 (0) | **5.413** | 23.49 | 0.950 | 13.31 | 4.559 |
+| `staged+mcd` | 1e-3 | 100 | 7 (0), 7 (0) | 5.469 | 22.90 | 0.935 | 13.01 | 4.544 |
+| `staged+mcd` | 1e-3 | 10⁴ | 7 (0), 7 (0) | 7.033 | 29.12 | 0.860 | 16.62 | 4.937 |
+| `staged+mcd` | 3e-3 | 1 | 7 (0), 8 (1) | 5.445 | 25.39 | 0.920 | 14.11 | 4.618 |
+| `staged+mcd` | 3e-3 | 100 | 7 (0), 8 (1) | 5.604 | 24.06 | 0.900 | 13.53 | 4.620 |
+| `staged+mcd` | 3e-3 | 10⁴ | 7 (0), 7 (0) | 10.009 | 50.94 | 0.610 | 30.81 | 6.638 |
+
+For reference, the `staged` model without a posterior stage scores a
+validation NLL of 5.58 (5.52, 5.63) and a test NLL of 4.668.
+
+How the values were chosen:
+
+- **`mcd_learning_rate = 1e-3`.** It is shared by both models, which pull
+  opposite ways: `joint+mcd` reaches its best validation NLL at 1e-3,
+  while `staged+mcd` does slightly better lower (5.33 at 1e-4). 1e-3
+  minimizes the two models' summed validation NLL (10.25, against 10.29 at
+  3e-4, 10.31 at 3e-3 and 10.39 at 1e-4).
+- **`prior_precision = 1.0`.** The best validation NLL at every learning
+  rate. The likelihood is scaled to the full training set, so a precision
+  of 1 or 100 barely regularizes; 10⁴ pulls the network towards zero and
+  degrades validation NLL at every learning rate, and destroys the model at
+  3e-3. It does improve the test scores at the lowest learning rates, but
+  the test split was not used for selection.
+- **`posterior_epochs = 20`.** Under every setting the posterior stage
+  reached its best validation NLL within its first four epochs and stopped
+  after at most ten, so 20 is a cap that early stopping always reaches
+  first.
+- **Spec-fixed values.** None is broken, so none was changed. Note that at
+  `mcd_learning_rate = 1e-3` `joint+mcd` uses its whole 60-epoch budget
+  (best epoch 56 of 60): its early stopping does not fire, and more epochs
+  would likely improve it a little. The budget is kept at about the staged
+  path's total on purpose, so that the comparison holds the training budget
+  fixed.
+
+Reproduce the grid by calling `train_joint_mcd_model` and
+`train_staged_mcd_posterior` (`run.py`) with `dataclasses.replace`-d
+configurations and an event sink that records the `validation_end`
+events. The chosen defaults then give, with `--seeds 2 --posterior-stage`:
+
+```text
+FD001 test metrics over 2 seeds (mean ± std):
+                             joint         joint+mcd            staged        staged+mcd
+RMSE              44.9407 ± 8.1235  29.4997 ± 0.6067  25.1384 ± 2.1268  23.4862 ± 2.8211
+95% coverage       0.9900 ± 0.0000   0.9650 ± 0.0071   0.8900 ± 0.0000   0.9500 ± 0.0283
+closed-form CRPS  25.3361 ± 4.2376  15.5427 ± 0.6044  14.2690 ± 0.7339  13.3144 ± 1.3830
+NLL                5.2000 ± 0.1457   4.6037 ± 0.0607   4.6679 ± 0.0405   4.5593 ± 0.0982
+```
+
+On this run the posterior stage improves every metric of `staged`, bringing
+its coverage from 0.89 to the nominal 0.95. `joint+mcd` is far better than
+`joint`, whose unscaled-target training is unstable across seeds, but stays
+behind both staged models on RMSE and CRPS.

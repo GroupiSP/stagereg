@@ -128,6 +128,12 @@ class CmapssConfig:
             MC-Dropout model, which stops early on its validation NLL.
         mcd_learning_rate: Adam learning rate of the MC-Dropout training.
             Provisional until tuned.
+        posterior_epochs: Maximum number of epochs of the staged MC-Dropout
+            model's posterior stage, which stops early on its validation
+            mixture NLL. Provisional until tuned.
+        prior_precision: Precision of the isotropic Gaussian prior over the
+            mean network's parameters in the staged MC-Dropout model's
+            posterior stage. Provisional until tuned.
         num_draws: Number of dropout-mask sets an MC-Dropout model's posterior
             predictive mixes.
         early_stopping_patience: Number of epochs without a better validation
@@ -147,6 +153,8 @@ class CmapssConfig:
     dropout_rate: float = 0.1
     joint_mcd_epochs: int = 60
     mcd_learning_rate: float = 1e-3
+    posterior_epochs: int = 20
+    prior_precision: float = 1.0
     num_draws: int = 100
     early_stopping_patience: int = 5
     seed: int = 0
@@ -155,8 +163,8 @@ class CmapssConfig:
         """Validate size, fraction, epoch, and MC-Dropout configuration.
 
         Raises:
-            ValueError: If sizes, epochs, draws, patience or the MC-Dropout
-                learning rate are not positive, the validation fraction is
+            ValueError: If sizes, epochs, draws, patience, the MC-Dropout
+                learning rate or the prior precision are not positive, the validation fraction is
                 not in (0, 1), or the dropout rate is not in [0, 1).
         """
         if self.window_length <= 0 or self.batch_size <= 0:
@@ -171,11 +179,17 @@ class CmapssConfig:
             raise ValueError("validation_fraction must be within (0, 1).")
         if not 0.0 <= self.dropout_rate < 1.0:
             raise ValueError("dropout_rate must be within [0, 1).")
-        for name in ("joint_mcd_epochs", "num_draws", "early_stopping_patience"):
+        for name in (
+            "joint_mcd_epochs",
+            "posterior_epochs",
+            "num_draws",
+            "early_stopping_patience",
+        ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive.")
-        if not self.mcd_learning_rate > 0.0:
-            raise ValueError("mcd_learning_rate must be positive.")
+        for name in ("mcd_learning_rate", "prior_precision"):
+            if not getattr(self, name) > 0.0:
+                raise ValueError(f"{name} must be positive.")
 
 
 def make_window_loader(

@@ -259,6 +259,31 @@ def test_cmapss_config_rejects_a_non_positive_mc_dropout_learning_rate(
         cmapss_run.CmapssConfig(mcd_learning_rate=learning_rate)
 
 
+def test_cmapss_config_accepts_the_posterior_stage_defaults(
+    cmapss_run: ModuleType,
+) -> None:
+    config = cmapss_run.CmapssConfig()
+
+    assert config.posterior_epochs > 0
+    assert config.prior_precision > 0.0
+
+
+@given(epochs=st.integers(max_value=0))
+def test_cmapss_config_rejects_non_positive_posterior_epochs(
+    cmapss_run: ModuleType, epochs: int
+) -> None:
+    with pytest.raises(ValueError, match="posterior_epochs"):
+        cmapss_run.CmapssConfig(posterior_epochs=epochs)
+
+
+@given(precision=st.floats(max_value=0.0, allow_nan=False))
+def test_cmapss_config_rejects_a_non_positive_prior_precision(
+    cmapss_run: ModuleType, precision: float
+) -> None:
+    with pytest.raises(ValueError, match="prior_precision"):
+        cmapss_run.CmapssConfig(prior_precision=precision)
+
+
 def test_cmapss_config_has_no_predictive_sample_count(cmapss_run: ModuleType) -> None:
     # The closed-form CRPS draws no predictive samples, so the run has no
     # sample count to configure.

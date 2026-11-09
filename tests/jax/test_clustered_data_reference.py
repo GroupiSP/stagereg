@@ -1,15 +1,15 @@
-"""Reference values of the clustered-data comparison, pinned before a refactor.
+"""Reference values of the clustered-data comparison, pinned across a refactor.
 
-The example's scoring is about to move from its own per-draw mixture code
-onto the library's posterior predictive (#172). These tests run the
-comparison and the scoring entry points on one small, fixed configuration
-and check the region scores, the extrapolation calibration curves and the
-printed table against values recorded from the example's own mixture code,
-so that the migration is provably a refactor.
+The example's scoring moved from its own per-draw mixture code onto the
+library's posterior predictive (#172). These tests run the comparison and the
+scoring entry points on one small, fixed configuration and check the region
+scores, the extrapolation calibration curves and the printed table against
+values recorded from the example's former mixture code, so that the migration
+is a proven refactor and any later change of the scores is caught.
 
 They touch only `compare.compare`, `compare.format_table`,
 `scoring.calibration_curve` and the results they return, never the
-example's mixture helpers.
+example's helpers that compute them.
 
 The tolerance is tight enough to catch any change of formula (a variance
 averaged differently, a different quantile) and loose enough to survive a

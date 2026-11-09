@@ -86,6 +86,16 @@ class PosteriorPredictiveDistribution(Protocol):
         """Each draw's mean, shape `(n_draws, n_windows, 1)`."""
         ...
 
+    @property
+    def draw_mask(self) -> Any | None:
+        """Which draw slots the mixture includes, shape `(n_draws,)`.
+
+        `None` includes every slot. Declared so the runtime `isinstance`
+        check still matches the library's `PosteriorPredictive`, which always
+        carries the field.
+        """
+        ...
+
     def mean(self) -> Any:
         """Return the mixture mean, shape `(n_windows, 1)`."""
         ...
@@ -130,8 +140,15 @@ class LabelledModel:
     model: PredictiveModel
 
 
-def _flat(values: Any) -> np.ndarray:
-    """Return per-window values as a flat float array."""
+def _per_window_array(values: Any) -> np.ndarray:
+    """Return per-window values as a flat float array.
+
+    Args:
+        values: One value per window, in any array-like shape.
+
+    Returns:
+        The values as a 1-D float array, one entry per window.
+    """
     return np.asarray(values, dtype=float).reshape(-1)
 
 
@@ -139,8 +156,8 @@ def _draw_gaussian_band(
     axes: Axes, window_cycles: Any, prediction: PredictiveDistribution
 ) -> None:
     """Draw a Gaussian's mean and its `loc ± 1.96·scale` band."""
-    loc = _flat(prediction.loc)
-    half_width = _INTERVAL_Z_SCORE * _flat(prediction.scale)
+    loc = _per_window_array(prediction.loc)
+    half_width = _INTERVAL_Z_SCORE * _per_window_array(prediction.scale)
     axes.plot(window_cycles, loc, label=_PREDICTED_MEAN_LABEL, color="tab:blue")
     axes.fill_between(
         window_cycles,
@@ -164,23 +181,22 @@ def _draw_posterior_bands(
     mixture leaves them out of its quantiles.
     """
     draws = np.asarray(prediction.draws, dtype=float)
-    draw_mask = getattr(prediction, "draw_mask", None)
-    if draw_mask is not None:
-        draws = draws[np.asarray(draw_mask, dtype=bool)]
+    if prediction.draw_mask is not None:
+        draws = draws[np.asarray(prediction.draw_mask, dtype=bool)]
     draws = draws.reshape(draws.shape[0], -1)
     epistemic_lower, epistemic_upper = np.quantile(
         draws, (_LOWER_PROBABILITY, _UPPER_PROBABILITY), axis=0
     )
     axes.plot(
         window_cycles,
-        _flat(prediction.mean()),
+        _per_window_array(prediction.mean()),
         label=_PREDICTED_MEAN_LABEL,
         color="tab:blue",
     )
     axes.fill_between(
         window_cycles,
-        _flat(prediction.quantile(_LOWER_PROBABILITY)),
-        _flat(prediction.quantile(_UPPER_PROBABILITY)),
+        _per_window_array(prediction.quantile(_LOWER_PROBABILITY)),
+        _per_window_array(prediction.quantile(_UPPER_PROBABILITY)),
         alpha=0.2,
         color="tab:blue",
         label=_TOTAL_INTERVAL_LABEL,

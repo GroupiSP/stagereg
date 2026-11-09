@@ -460,16 +460,25 @@ _EPISTEMIC_HALF_WIDTH = 19.0
 class _StubPosteriorModel:
     """A model predicting a library posterior predictive with known draws."""
 
-    def __init__(self, *, aleatoric_std: float = 3.0, offset: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        aleatoric_std: float = 3.0,
+        offset: float = 0.0,
+        masked_outlier: float | None = None,
+    ) -> None:
         """Fix each draw's aleatoric standard deviation and a mean offset.
 
         Args:
             aleatoric_std: Every draw's aleatoric standard deviation.
             offset: Added to every draw's mean, to tell models apart.
+            masked_outlier: If given, one more draw slot, offset by this much,
+                which the prediction's `draw_mask` excludes.
         """
-        self.aleatoric_std = aleatoric_std
-        self.offset = offset
-        self.calls = 0
+        self.aleatoric_std: float = aleatoric_std
+        self.offset: float = offset
+        self.masked_outlier: float | None = masked_outlier
+        self.calls: int = 0
 
     def __call__(self, inputs: Any) -> Any:
         """Predict draws centred on a mean counting up over the batch.
@@ -486,12 +495,18 @@ class _StubPosteriorModel:
         self.calls += 1
         n_windows = np.asarray(inputs).shape[0]
         loc = self.offset + np.arange(n_windows, dtype=float)
-        draws = loc[None, :, None] + _DRAW_OFFSETS[:, None, None]
+        offsets = _DRAW_OFFSETS
+        draw_mask = None
+        if self.masked_outlier is not None:
+            offsets = np.append(offsets, self.masked_outlier)
+            draw_mask = np.arange(offsets.size) < _DRAW_OFFSETS.size
+        draws = loc[None, :, None] + offsets[:, None, None]
         return stagereg_jax.PosteriorPredictive(
             draws=np.asarray(draws, dtype=np.float32),
             aleatoric_variance=np.full(
                 (n_windows, 1), self.aleatoric_std**2, dtype=np.float32
             ),
+            draw_mask=draw_mask,
         )
 
 
@@ -581,6 +596,36 @@ def test_posterior_row_draws_the_draw_mean_epistemic_band_inside_the_total(
     )
     assert np.all(total_lower < epistemic_lower)
     assert np.all(epistemic_upper < total_upper)
+
+
+def test_posterior_row_epistemic_band_leaves_out_masked_draw_slots(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 12})
+    window_length = 3
+    n_windows = 12 - window_length + 1
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        [
+            cmapss_plots.LabelledModel(
+                "Staged MC-Dropout", _StubPosteriorModel(masked_outlier=1000.0)
+            )
+        ],
+        units=spanning_units(1, 1, 1),
+        window_length=window_length,
+    )
+
+    bands = _bands_by_label(figure.axes[0])
+    loc = np.arange(n_windows, dtype=float)
+    epistemic_lower, epistemic_upper = _band_edges(
+        bands[cmapss_plots._EPISTEMIC_INTERVAL_LABEL], n_windows
+    )
+    np.testing.assert_allclose(epistemic_lower, loc - _EPISTEMIC_HALF_WIDTH, atol=1e-4)
+    np.testing.assert_allclose(epistemic_upper, loc + _EPISTEMIC_HALF_WIDTH, atol=1e-4)
 
 
 def test_posterior_rows_evaluate_each_unit_once(

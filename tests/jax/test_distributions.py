@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Callable
 from typing import Any
 
 import jax
@@ -13,7 +14,6 @@ from flax import nnx
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 from hypothesis.extra.numpy import arrays
-from scipy.special import ndtr
 
 from stagereg.jax.distributions import (
     Gamma,
@@ -315,6 +315,8 @@ def test_posterior_predictive_sample_moments_match_its_mean_and_variance(
 
 
 def _mixture_cdf(y: np.ndarray, means: np.ndarray, variance: np.ndarray) -> np.ndarray:
+    """The mixture CDF at ``y``, in float64, of ``[S, *batch]`` means and a variance
+    shared as ``[*batch]`` or one per draw as ``[S, *batch]``."""
     standard = NormalDist()
     z = (y - means.astype(np.float64)) / np.sqrt(variance.astype(np.float64))
     return np.vectorize(standard.cdf)(z).mean(axis=0)
@@ -1005,14 +1007,6 @@ def test_excluded_slots_with_invalid_variances_change_nothing(
     )
 
 
-def _per_draw_mixture_cdf(
-    y: np.ndarray, means: np.ndarray, variances: np.ndarray
-) -> np.ndarray:
-    """The mixture CDF at ``y`` of ``[S, *batch]`` means and variances, in float64."""
-    z = (y - means.astype(np.float64)) / np.sqrt(variances.astype(np.float64))
-    return np.vectorize(NormalDist().cdf)(z).mean(axis=0)
-
-
 @settings(deadline=None, max_examples=25)
 @given(
     components=per_draw_posterior_predictives(),
@@ -1030,7 +1024,7 @@ def test_a_per_draw_variance_quantile_inverts_its_cdf(
 
     np.testing.assert_allclose(mixture.cdf(quantile), probability, atol=1e-4)
     np.testing.assert_allclose(
-        _per_draw_mixture_cdf(np.asarray(quantile, np.float64), means, variances),
+        _mixture_cdf(np.asarray(quantile, np.float64), means, variances),
         probability,
         atol=1e-4,
     )
@@ -1039,24 +1033,16 @@ def test_a_per_draw_variance_quantile_inverts_its_cdf(
 @settings(deadline=None, max_examples=15)
 @given(components=per_draw_posterior_predictives(), targets=_FINITE)
 def test_a_per_draw_variance_crps_matches_numerical_integration(
-    components: tuple[np.ndarray, np.ndarray], targets: float
+    components: tuple[np.ndarray, np.ndarray],
+    targets: float,
+    mixture_crps_oracle: Callable[[np.ndarray, np.ndarray, float], np.ndarray],
 ) -> None:
     means, variances = components
     mixture = PosteriorPredictive(
         draws=jnp.asarray(means), aleatoric_variance=jnp.asarray(variances)
     )
-    means64 = means.astype(np.float64)
-    scales = np.sqrt(variances.astype(np.float64))
 
-    def squared_error(grid: np.ndarray, step: float) -> np.ndarray:
-        cdf = ndtr((grid[:, None, None] - means64) / scales).mean(axis=1)
-        return np.trapezoid((cdf - step) ** 2, grid, axis=0)
-
-    # Integrate either side of the target, where the step jumps; the CDF is
-    # 0 and 1 to float64 precision 10 standard deviations out.
-    expected = squared_error(np.linspace(-60.0, targets, 40_001), 0.0) + (
-        squared_error(np.linspace(targets, 60.0, 40_001), 1.0)
-    )
+    expected = mixture_crps_oracle(means, variances, targets)
 
     np.testing.assert_allclose(
         mixture.crps(jnp.full(means.shape[1:], targets, jnp.float32)),

@@ -422,30 +422,6 @@ def test_expected_gaussian_mixture_crps_is_least_at_the_matching_location(
     assert np.all(shifted >= matched - 1e-6)
 
 
-def _integrated_mixture_crps(
-    means: np.ndarray, scales: np.ndarray, target: float
-) -> float:
-    """Integrate ``(F(z) - 1{z >= target})**2`` numerically for an equally weighted
-    Gaussian mixture with component means ``means`` and scales ``scales``."""
-    reach = 10.0 * scales.max()
-    standard_cdf = np.vectorize(NormalDist().cdf)
-
-    def squared_error(grid: np.ndarray, step: float) -> float:
-        # Each side of the target is smooth, so the trapezoid rule converges fast.
-        mixture_cdf = np.mean(
-            [
-                standard_cdf((grid - mean) / scale)
-                for mean, scale in zip(means, scales, strict=True)
-            ],
-            axis=0,
-        )
-        return float(np.trapezoid((mixture_cdf - step) ** 2, grid))
-
-    below = np.linspace(min(means.min(), target) - reach, target, 4_001)
-    above = np.linspace(target, max(means.max(), target) + reach, 4_001)
-    return squared_error(below, 0.0) + squared_error(above, 1.0)
-
-
 @st.composite
 def _per_component_mixtures(
     draw: st.DrawFn,
@@ -471,11 +447,12 @@ def _per_component_mixtures(
 @given(mixture=_per_component_mixtures())
 def test_expected_gaussian_mixture_crps_with_per_component_variances_is_the_integral(
     mixture: tuple[np.ndarray, np.ndarray, np.ndarray],
+    mixture_crps_oracle: Callable[[np.ndarray, np.ndarray, float], np.ndarray],
 ) -> None:
     draw_means, variance, reference = mixture
 
     expected = [
-        np.mean([_integrated_mixture_crps(means, np.sqrt(var), y) for y in targets])
+        np.mean([mixture_crps_oracle(means, var, y) for y in targets])
         for means, var, targets in zip(draw_means, variance, reference, strict=True)
     ]
 

@@ -256,9 +256,14 @@ def gaussian_mixture_crps_kernel(
     core passes NumPy, and the JAX backend passes ``jax.numpy``, which keeps the
     result traceable under ``jax.jit``. It does no validation; callers check
     their inputs. With ``A(mu, v) = E|Z|`` for ``Z ~ N(mu, v)``, the CRPS of a
-    mixture with component weights ``w_m`` at a target ``y`` is::
+    mixture of components ``N(mu_m, s_m**2)`` with weights ``w_m`` at a target
+    ``y`` is::
 
-        sum_m w_m A(mu_m - y, s**2) - (1/2) sum_{m,m'} w_m w_m' A(mu_m - mu_m', 2 s**2)
+        sum_m w_m A(mu_m - y, s_m**2)
+            - (1/2) sum_{m,m'} w_m w_m' A(mu_m - mu_m', s_m**2 + s_m'**2)
+
+    With a variance ``s**2`` shared by every component, the pairwise variance is
+    ``2 s**2``.
 
     The outer sums run over blocks of components, so no intermediate is larger
     than ``[block, max(M, R), *batch]`` rather than ``[M, M, *batch]``.
@@ -267,8 +272,8 @@ def gaussian_mixture_crps_kernel(
         xp: The array module, ``numpy`` or ``jax.numpy``.
         erf: The error function matching ``xp``.
         draw_means: Component means, shaped ``[M, *batch]``; all must be finite.
-        variance: The positive variance every component shares, shaped
-            ``[*batch]``.
+        variance: The positive variance of each component, shaped
+            ``[M, *batch]``; a weightless component's must still be positive.
         references: Reference samples, shaped ``[R, *batch]``.
         weights: Component weights summing to one, shaped ``[M]``.
         sum_blocks: Sums a function of one block over the leading axis of a
@@ -291,23 +296,28 @@ def gaussian_mixture_crps_kernel(
     widest = max(components, references.shape[0])
     block = max(1, min(components, _CRPS_BLOCK_ELEMENTS // (widest * units)))
     padding = -components % block
-    # Padded components repeat the first mean, so every difference stays
-    # finite, and weigh nothing.
-    padded_means = xp.concatenate(
-        [draw_means, xp.broadcast_to(draw_means[:1], (padding, *draw_means.shape[1:]))]
-    )
+
+    # Padded components repeat the first component, so every difference and
+    # variance stays valid, and weigh nothing.
+    def pad(values: Any) -> Any:
+        return xp.concatenate(
+            [values, xp.broadcast_to(values[:1], (padding, *values.shape[1:]))]
+        )
+
+    padded_means = pad(draw_means)
+    padded_variances = pad(variance)
     padded_weights = xp.concatenate([weights, xp.zeros(padding, dtype=weights.dtype)])
     expand = (1,) * (draw_means.ndim - 1)
     column_weights = xp.reshape(weights, (1, -1, *expand))
 
     def block_crps(block_arrays: Any) -> Any:
-        means, block_weights = block_arrays
+        means, variances, block_weights = block_arrays
         block_weights = xp.reshape(block_weights, (-1, *expand))
         absolute_error = expected_absolute(
-            means[:, None] - references[None, :], variance
+            means[:, None] - references[None, :], variances[:, None]
         ).mean(axis=1)
         pairwise = expected_absolute(
-            means[:, None] - draw_means[None, :], 2.0 * variance
+            means[:, None] - draw_means[None, :], variances[:, None] + variance[None, :]
         )
         spread = xp.sum(column_weights * pairwise, axis=1)
         return xp.sum(block_weights * (absolute_error - spread / 2.0), axis=0)
@@ -316,6 +326,7 @@ def gaussian_mixture_crps_kernel(
         block_crps,
         (
             xp.reshape(padded_means, (-1, block, *draw_means.shape[1:])),
+            xp.reshape(padded_variances, (-1, block, *draw_means.shape[1:])),
             xp.reshape(padded_weights, (-1, block)),
         ),
     )
@@ -327,11 +338,14 @@ def expected_gaussian_mixture_crps(
     """Return the closed-form expected CRPS of each unit's Gaussian mixture.
 
     Each scoring unit (row) predicts an equally weighted mixture of Gaussians
-    ``N(mu_m, s**2)``, one per draw mean, all sharing the unit's variance
-    ``s**2``. With ``A(mu, v) = E|Z|`` for ``Z ~ N(mu, v)``, its CRPS at a
-    target ``y`` is (Grimit et al. 2006)::
+    ``N(mu_m, s_m**2)``, one per draw. The variances are either one per unit,
+    shared by every component (``s_m = s``, as for a staged posterior), or one
+    per unit and component (as for a joint posterior, whose every draw predicts
+    its own variance). With ``A(mu, v) = E|Z|`` for ``Z ~ N(mu, v)``, its CRPS
+    at a target ``y`` is (Grimit et al. 2006)::
 
-        (1/M) sum_m A(mu_m - y, s**2) - (1/(2 M**2)) sum_{m,m'} A(mu_m - mu_m', 2 s**2)
+        (1/M) sum_m A(mu_m - y, s_m**2)
+            - (1/(2 M**2)) sum_{m,m'} A(mu_m - mu_m', s_m**2 + s_m'**2)
 
     and this function returns its mean over the unit's reference samples. A
     point target is a single reference sample (``R = 1``). With one draw it is
@@ -343,7 +357,8 @@ def expected_gaussian_mixture_crps(
     Args:
         draw_means: Mean of each mixture component, of shape ``(units, M)``.
         variance: The variance every component of a unit shares, of shape
-            ``(units,)``.
+            ``(units,)``, or the variance of each component, of shape
+            ``(units, M)``.
         reference_samples: Reference samples of shape ``(units, R)``, such as
             the observed target (``R = 1``) or draws from a simulator.
 
@@ -353,22 +368,35 @@ def expected_gaussian_mixture_crps(
     Raises:
         ValueError: If an input is empty or non-finite, if ``draw_means`` or
             ``reference_samples`` is not two-dimensional, if ``variance`` is
-            not one-dimensional or not positive, or if the numbers of units
-            differ.
+            shaped neither ``(units,)`` nor ``(units, M)`` or is not positive,
+            or if the numbers of units differ.
     """
     means = _as_nonempty_matrix(draw_means, name="draw_means")
     reference = _as_nonempty_matrix(reference_samples, name="reference_samples")
-    shared_variance = _as_nonempty_vector(variance, name="variance")
-    if not means.shape[0] == reference.shape[0] == shared_variance.shape[0]:
+    variances = np.asarray(variance, dtype=float)
+    if variances.ndim == 1:
+        variances = _as_nonempty_vector(variances, name="variance")[:, None]
+    else:
+        variances = _as_nonempty_matrix(variances, name="variance")
+        if variances.shape[1] != means.shape[1]:
+            raise ValueError(
+                "variance must be shaped (units,) or (units, M) like draw_means."
+            )
+    if not means.shape[0] == reference.shape[0] == variances.shape[0]:
         raise ValueError(
             "draw_means, variance and reference_samples must have the same number "
             "of units."
         )
-    if np.any(shared_variance <= 0.0):
+    if np.any(variances <= 0.0):
         raise ValueError("variance must be positive.")
     draws = means.shape[1]
     return gaussian_mixture_crps_kernel(
-        np, _erf, means.T, shared_variance, reference.T, np.full(draws, 1.0 / draws)
+        np,
+        _erf,
+        means.T,
+        np.broadcast_to(variances, means.shape).T,
+        reference.T,
+        np.full(draws, 1.0 / draws),
     )
 
 

@@ -5,6 +5,14 @@ All notable changes to `stagereg` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `expected_gaussian_mixture_crps` accepts a `(units, M)` variance, one per
+  mixture component, as well as the `(units,)` variance shared by every
+  component. The pairwise term then uses the sum of the two components'
+  variances (Grimit et al. 2006); a shared variance gives the same values as
+  before.
+
 ## [0.6.0] - 2026-11-08
 
 ### Breaking changes

@@ -5,7 +5,7 @@ from statistics import NormalDist
 
 import numpy as np
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from stagereg.core import metrics
@@ -422,6 +422,103 @@ def test_expected_gaussian_mixture_crps_is_least_at_the_matching_location(
     assert np.all(shifted >= matched - 1e-6)
 
 
+def _integrated_mixture_crps(
+    means: np.ndarray, scales: np.ndarray, target: float
+) -> float:
+    """Integrate ``(F(z) - 1{z >= target})**2`` numerically for an equally weighted
+    Gaussian mixture with component means ``means`` and scales ``scales``."""
+    reach = 10.0 * scales.max()
+    standard_cdf = np.vectorize(NormalDist().cdf)
+
+    def squared_error(grid: np.ndarray, step: float) -> float:
+        # Each side of the target is smooth, so the trapezoid rule converges fast.
+        mixture_cdf = np.mean(
+            [
+                standard_cdf((grid - mean) / scale)
+                for mean, scale in zip(means, scales, strict=True)
+            ],
+            axis=0,
+        )
+        return float(np.trapezoid((mixture_cdf - step) ** 2, grid))
+
+    below = np.linspace(min(means.min(), target) - reach, target, 4_001)
+    above = np.linspace(target, max(means.max(), target) + reach, 4_001)
+    return squared_error(below, 0.0) + squared_error(above, 1.0)
+
+
+@st.composite
+def _per_component_mixtures(
+    draw: st.DrawFn,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Draw ``(units, M)`` draw means, ``(units, M)`` variances, ``(units, R)``
+    references, on a range numerical integration resolves."""
+    units = draw(st.integers(1, 2))
+    components = draw(st.integers(1, 3))
+    references = draw(st.integers(1, 2))
+    values = st.floats(-5.0, 5.0)
+
+    def matrix(elements: st.SearchStrategy[float], columns: int) -> np.ndarray:
+        cells = draw(
+            st.lists(elements, min_size=units * columns, max_size=units * columns)
+        )
+        return np.reshape(cells, (units, columns))
+
+    scales = matrix(st.floats(0.1, 3.0), components)
+    return matrix(values, components), np.square(scales), matrix(values, references)
+
+
+@settings(max_examples=20, deadline=None)
+@given(mixture=_per_component_mixtures())
+def test_expected_gaussian_mixture_crps_with_per_component_variances_is_the_integral(
+    mixture: tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> None:
+    draw_means, variance, reference = mixture
+
+    expected = [
+        np.mean([_integrated_mixture_crps(means, np.sqrt(var), y) for y in targets])
+        for means, var, targets in zip(draw_means, variance, reference, strict=True)
+    ]
+
+    assert expected_gaussian_mixture_crps(
+        draw_means, variance, reference
+    ) == pytest.approx(expected, abs=1e-5)
+
+
+@given(mixture=_mixtures())
+def test_expected_gaussian_mixture_crps_of_equal_component_variances_is_the_shared_variance_crps(
+    mixture: tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> None:
+    draw_means, variance, reference = mixture
+    per_component = np.repeat(variance[:, None], draw_means.shape[1], axis=1)
+
+    assert expected_gaussian_mixture_crps(
+        draw_means, per_component, reference
+    ) == pytest.approx(
+        expected_gaussian_mixture_crps(draw_means, variance, reference),
+        rel=1e-12,
+        abs=1e-12,
+    )
+
+
+@pytest.mark.parametrize("block_elements", [1, 7, 40])
+def test_expected_gaussian_mixture_crps_with_per_component_variances_is_the_same_in_blocks(
+    monkeypatch: pytest.MonkeyPatch, block_elements: int
+) -> None:
+    rng = np.random.default_rng(0)
+    draw_means = rng.normal(size=(3, 11))
+    variance = rng.uniform(0.1, 2.0, size=(3, 11))
+    reference = rng.normal(size=(3, 4))
+    whole = expected_gaussian_mixture_crps(draw_means, variance, reference)
+
+    monkeypatch.setattr(metrics, "_CRPS_BLOCK_ELEMENTS", block_elements)
+
+    np.testing.assert_allclose(
+        expected_gaussian_mixture_crps(draw_means, variance, reference),
+        whole,
+        rtol=1e-12,
+    )
+
+
 @pytest.mark.parametrize("block_elements", [1, 7, 40])
 def test_expected_gaussian_mixture_crps_is_the_same_in_blocks_of_components(
     monkeypatch: pytest.MonkeyPatch, block_elements: int
@@ -451,7 +548,11 @@ def test_expected_gaussian_mixture_crps_is_the_same_in_blocks_of_components(
         ([[1.0]], [1.0], [[np.inf]]),
         ([[1.0]], [np.nan], [[1.0]]),
         ([1.0, 2.0], [1.0], [[1.0]]),
-        ([[1.0]], [[1.0]], [[1.0]]),
+        ([[1.0]], [[1.0, 1.0]], [[1.0]]),
+        ([[1.0]], [[[1.0]]], [[1.0]]),
+        ([[1.0], [2.0]], [[1.0]], [[1.0], [2.0]]),
+        ([[1.0, 2.0]], [[1.0, np.nan]], [[1.0]]),
+        ([[1.0, 2.0]], [[1.0, 0.0]], [[1.0]]),
         ([[1.0]], [1.0], [[[1.0]]]),
         ([[1.0], [2.0]], [1.0, 1.0], [[1.0]]),
         ([[1.0], [2.0]], [1.0], [[1.0], [2.0]]),

@@ -103,7 +103,9 @@ def _gaussian_mixture_crps(
 
     Args:
         draw_means: Component means, shaped ``[M, *batch]``; all must be finite.
-        variance: The variance every component shares, shaped ``[*batch]``.
+        variance: The variance every component shares, shaped ``[*batch]``,
+            or each component's variance, shaped ``[M, *batch]``; all must be
+            positive.
         references: Reference samples, shaped ``[R, *batch]``.
         weights: Component weights summing to one, shaped ``[M]``. Defaults
             to ``None``, which weights every component equally.
@@ -117,7 +119,7 @@ def _gaussian_mixture_crps(
         jnp,
         jsp.erf,
         draw_means,
-        variance,
+        jnp.broadcast_to(variance, draw_means.shape),
         references,
         weights,
         # A sequential map keeps one block of components in memory under jit.

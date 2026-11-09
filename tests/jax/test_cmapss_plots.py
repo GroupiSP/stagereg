@@ -448,3 +448,104 @@ def test_rul_curves_reject_an_empty_model_sequence(
             window_length=4,
         )
     assert captured_show == []
+
+
+# Draw offsets spread evenly over [-20, 20]: with 41 draws, linear-interpolated
+# 2.5% and 97.5% quantiles of the draws fall exactly on the second and
+# second-to-last offsets, -19 and 19.
+_DRAW_OFFSETS = np.linspace(-20.0, 20.0, 41)
+_EPISTEMIC_HALF_WIDTH = 19.0
+
+
+class _StubPosteriorModel:
+    """A model predicting a library posterior predictive with known draws."""
+
+    def __init__(self, *, aleatoric_std: float = 3.0, offset: float = 0.0) -> None:
+        """Fix each draw's aleatoric standard deviation and a mean offset.
+
+        Args:
+            aleatoric_std: Every draw's aleatoric standard deviation.
+            offset: Added to every draw's mean, to tell models apart.
+        """
+        self.aleatoric_std = aleatoric_std
+        self.offset = offset
+        self.calls = 0
+
+    def __call__(self, inputs: Any) -> Any:
+        """Predict draws centred on a mean counting up over the batch.
+
+        Args:
+            inputs: Windowed sensor readings, shape `(n_windows,
+                window_length, n_features)`.
+
+        Returns:
+            A posterior predictive whose draw `s` at window `i` has mean
+            `offset + i + _DRAW_OFFSETS[s]` and the fixed aleatoric variance.
+        """
+        stagereg_jax = pytest.importorskip("stagereg.jax")
+        self.calls += 1
+        n_windows = np.asarray(inputs).shape[0]
+        loc = self.offset + np.arange(n_windows, dtype=float)
+        draws = loc[None, :, None] + _DRAW_OFFSETS[:, None, None]
+        return stagereg_jax.PosteriorPredictive(
+            draws=np.asarray(draws, dtype=np.float32),
+            aleatoric_variance=np.full(
+                (n_windows, 1), self.aleatoric_std**2, dtype=np.float32
+            ),
+        )
+
+
+def _band_edges(band: Any, n_points: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return a `fill_between` band's lower and upper edges, in x order."""
+    vertices = band.get_paths()[0].vertices
+    # fill_between traces the lower edge forwards, then the upper backwards,
+    # with one closing vertex before and after each edge.
+    lower = vertices[1 : n_points + 1, 1]
+    upper = vertices[n_points + 2 : 2 * n_points + 2, 1][::-1]
+    return lower, upper
+
+
+def _bands_by_label(axes: Any) -> dict[str, Any]:
+    """Index an axes' filled bands by their legend label."""
+    return {band.get_label(): band for band in axes.collections}
+
+
+def test_posterior_row_draws_the_mixture_central_95_percent_interval(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    from scipy import stats
+
+    trajectories = build_trajectories({1: 12})
+    window_length = 3
+    n_windows = 12 - window_length + 1
+    aleatoric_std = 3.0
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        [
+            cmapss_plots.LabelledModel(
+                "Joint MC-Dropout", _StubPosteriorModel(aleatoric_std=aleatoric_std)
+            )
+        ],
+        units=spanning_units(1, 1, 1),
+        window_length=window_length,
+    )
+
+    axes = figure.axes[0]
+    loc = np.arange(n_windows, dtype=float)
+    # The draws are symmetric about `loc`, so the mixture mean is `loc`.
+    predicted = _lines_by_label(axes)[cmapss_plots._PREDICTED_MEAN_LABEL]
+    np.testing.assert_allclose(predicted.get_ydata(), loc, atol=1e-4)
+    total = _bands_by_label(axes)[cmapss_plots._TOTAL_INTERVAL_LABEL]
+    lower, upper = _band_edges(total, n_windows)
+    # Each edge sits where the equally weighted Gaussian mixture puts 2.5%
+    # and 97.5% of its mass, and is unclipped at zero.
+    draws = loc[None, :] + _DRAW_OFFSETS[:, None]
+    lower_mass = stats.norm.cdf(lower[None, :], draws, aleatoric_std).mean(axis=0)
+    upper_mass = stats.norm.cdf(upper[None, :], draws, aleatoric_std).mean(axis=0)
+    np.testing.assert_allclose(lower_mass, 0.025, atol=1e-3)
+    np.testing.assert_allclose(upper_mass, 0.975, atol=1e-3)
+    assert lower.min() < 0.0

@@ -136,7 +136,10 @@ eval mode, so every consumer scores the same model in the same mode.
 `evaluate_test_metrics` scores any model whose output is a Gaussian, the
 staged model included. The mean and Gamma training functions take their
 event sinks as a parameter, so each entry point decides how verbose
-training is.
+training is. Next to them sit the MC-Dropout helpers `compare.py` uses:
+`train_joint_mcd_model` and the predictive wrapper `McDropoutPredictive`
+(built by `build_mc_dropout_predictive`). The script itself does not use
+them.
 
 Run it with:
 
@@ -205,3 +208,36 @@ Note that the joint model has one backbone where the staged model has two
 (one per stage), so it has roughly half the staged model's parameters. The
 comparison holds the architecture and the per-model epoch budget fixed, not
 the parameter count.
+
+#### `--posterior-stage`: MC-Dropout posteriors
+
+Pass `--posterior-stage` to add the **joint MC-Dropout model** (`joint+mcd`).
+The models per seed are then `joint`, `joint+mcd` and `staged`, in that
+order; `joint` and `staged` are the same models as without the flag.
+
+```shell
+uv run --group example-cmapss python examples/jax/cmapss/compare.py --posterior-stage
+```
+
+`joint+mcd` is a Gaussian-head CNN at `dropout_rate`, trained from a random
+initialization on the Gaussian NLL with dropout active and no prior term. It
+is validated after every epoch on the NLL of its MC mixture and stops early
+after `early_stopping_patience` epochs without improvement, with
+`joint_mcd_epochs` as the maximum; the best epoch's parameters are kept. Its
+prediction evaluates the network under `num_draws` dropout-mask sets, each
+one applied to the whole batch, and keeps each draw's own mean and aleatoric
+variance: a posterior predictive scored on its exact mixture. The masks come
+from a fixed key derived from the seed, so validation, test scoring and the
+figure use the same draws. Its figure row shows a total band (the mixture's
+central 95% interval) and an epistemic band (the 2.5–97.5% quantiles of the
+draws' means).
+
+The MC-Dropout settings live in `CmapssConfig` (`run.py`):
+
+| Field | Default |
+| --- | --- |
+| `dropout_rate` | 0.1 |
+| `joint_mcd_epochs` | 60 |
+| `mcd_learning_rate` | 1e-3 (provisional, not yet tuned) |
+| `num_draws` | 100 |
+| `early_stopping_patience` | 5 |

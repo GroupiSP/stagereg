@@ -17,6 +17,13 @@ initialization changes.
 It then draws the first seed's validation RUL curves: the staged model's row
 above the joint model's, for the same lifetime-spanning validation units.
 
+With `--posterior-stage` it adds the **joint MC-Dropout model**
+(`joint+mcd`): a Gaussian-head CNN with dropout active, trained on the
+Gaussian NLL and early-stopped on its MC mixture's validation NLL, whose
+prediction is a posterior predictive over fixed dropout-mask sets with each
+draw's own aleatoric variance. The models are then `joint`, `joint+mcd` and
+`staged`, in that order, in the per-run lines, the table and the figure.
+
 Run it with:
 
     uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5
@@ -189,7 +196,9 @@ class SeedComparison:
     Attributes:
         seed: The seed every model was initialized from.
         models: One result per model, in the table's column order and the
-            figure's row order: the staged model's, then the joint model's.
+            figure's row order: the staged model's, then the joint model's;
+            with a posterior stage, the joint, the joint MC-Dropout and the
+            staged model's.
     """
 
     seed: int
@@ -413,7 +422,7 @@ def print_run(model: str, seed: int, metrics: dict[str, float]) -> None:
     """Print one finished (seed, model) run's test metrics on one line.
 
     Args:
-        model: The model's name, `"staged"` or `"joint"`.
+        model: The model's name, e.g. `"staged"` or `"joint+mcd"`.
         seed: The seed the model was initialized from.
         metrics: The model's test metrics by name.
     """
@@ -424,15 +433,16 @@ def print_run(model: str, seed: int, metrics: dict[str, float]) -> None:
 def main() -> None:
     """Compare the staged and the joint model over seeds, print and plot the results.
 
-    Pass `--seeds` to set the number of seeds (default 5), and `--plot-path` to save the
-    first seed's RUL-curves figure to that path instead of displaying it.
+    Pass `--seeds` to set the number of seeds (default 5), `--plot-path` to save the
+    first seed's RUL-curves figure to that path instead of displaying it, and
+    `--posterior-stage` to add the joint MC-Dropout model.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--seeds",
         type=int,
         default=5,
-        help="Number of seeds to train both models from (default: 5).",
+        help="Number of seeds to train the models from (default: 5).",
     )
     parser.add_argument(
         "--plot-path",
@@ -443,13 +453,27 @@ def main() -> None:
             "instead of displaying it."
         ),
     )
+    parser.add_argument(
+        "--posterior-stage",
+        action="store_true",
+        help=(
+            "Add the joint MC-Dropout model (joint+mcd); the models are then "
+            "joint, joint+mcd and staged."
+        ),
+    )
     args = parser.parse_args()
     if args.seeds <= 0:
         parser.error("--seeds must be positive.")
 
     config = CmapssConfig()
     prepared = prepare_cmapss_windows(config)
-    results = compare_models(prepared, config, seeds=args.seeds, on_run=print_run)
+    results = compare_models(
+        prepared,
+        config,
+        seeds=args.seeds,
+        posterior_stage=args.posterior_stage,
+        on_run=print_run,
+    )
     print(f"\nFD001 test metrics over {args.seeds} seeds (mean ± std):")
     print(format_comparison_table(results))
 

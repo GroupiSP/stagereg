@@ -402,3 +402,54 @@ def test_main_prints_one_line_per_run_and_a_mean_std_table_then_plots(
     for row in ("RMSE", "95% coverage", "closed-form CRPS", "NLL"):
         (line,) = [line for line in table if line.startswith(row)]
         assert re.fullmatch(rf"{re.escape(row)}\s+{_CELL}\s+{_CELL}", line)
+
+
+@pytest.mark.usefixtures("offline_fd001")
+def test_main_with_a_posterior_stage_reports_tabulates_and_plots_joint_mcd(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plot_path = tmp_path / "comparison.png"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare.py",
+            "--seeds",
+            "2",
+            "--posterior-stage",
+            "--plot-path",
+            str(plot_path),
+        ],
+    )
+    monkeypatch.setattr(cmapss_compare, "CmapssConfig", lambda: mcd_config)
+    plotted_labels: list[str] = []
+    plot = cmapss_compare.plot_validation_rul_curves
+
+    def record_plot(*args: Any, **kwargs: Any) -> None:
+        plotted_labels.extend(model.label for model in args[2])
+        plot(*args, **kwargs)
+
+    monkeypatch.setattr(cmapss_compare, "plot_validation_rul_curves", record_plot)
+
+    cmapss_compare.main()
+
+    lines = capsys.readouterr().out.splitlines()
+    names = ("joint", "joint+mcd", "staged")
+    seeds = [f"seed={seed}]" for seed in (mcd_config.seed, mcd_config.seed + 1)]
+    run_lines = [line for line in lines if line.startswith("[")]
+    assert [tuple(line.split()[:2]) for line in run_lines] == [
+        (f"[{name}", seed) for seed in seeds for name in names
+    ]
+    (header,) = [
+        line for line in lines if re.search(r"joint\s+joint\+mcd\s+staged", line)
+    ]
+    table = lines[lines.index(header) + 1 :]
+    for row in ("RMSE", "95% coverage", "closed-form CRPS", "NLL"):
+        (line,) = [line for line in table if line.startswith(row)]
+        assert re.fullmatch(rf"{re.escape(row)}\s+{_CELL}\s+{_CELL}\s+{_CELL}", line)
+    assert plotted_labels == ["Joint model", "Joint MC-Dropout model", "Staged model"]
+    assert plot_path.is_file()

@@ -137,6 +137,17 @@ model's parameters.
 uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5
 ```
 
+Add `--posterior-stage` to compare four models: `joint`, a joint MC-Dropout
+model (`joint+mcd`) trained with dropout active from a random initialization,
+`staged`, and a staged MC-Dropout model (`staged+mcd`) whose
+[posterior stage](posterior-stage.md) fine-tunes the staged mean network with
+`MCDropout`. The MC-Dropout models are scored on their exact posterior
+predictive, and their figure rows show a total and an epistemic 95% band.
+
+```bash
+uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5 --posterior-stage
+```
+
 The first run downloads the CMAPSS archive from NASA and caches it on disk, so
 it needs network access once. The README explains how to point the example at
 a copy you already have.

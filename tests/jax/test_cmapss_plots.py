@@ -549,3 +549,55 @@ def test_posterior_row_draws_the_mixture_central_95_percent_interval(
     np.testing.assert_allclose(lower_mass, 0.025, atol=1e-3)
     np.testing.assert_allclose(upper_mass, 0.975, atol=1e-3)
     assert lower.min() < 0.0
+
+
+def test_posterior_row_draws_the_draw_mean_epistemic_band_inside_the_total(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 12})
+    window_length = 3
+    n_windows = 12 - window_length + 1
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        [cmapss_plots.LabelledModel("Joint MC-Dropout", _StubPosteriorModel())],
+        units=spanning_units(1, 1, 1),
+        window_length=window_length,
+    )
+
+    axes = figure.axes[0]
+    bands = _bands_by_label(axes)
+    loc = np.arange(n_windows, dtype=float)
+    epistemic_lower, epistemic_upper = _band_edges(
+        bands[cmapss_plots._EPISTEMIC_INTERVAL_LABEL], n_windows
+    )
+    np.testing.assert_allclose(epistemic_lower, loc - _EPISTEMIC_HALF_WIDTH, atol=1e-4)
+    np.testing.assert_allclose(epistemic_upper, loc + _EPISTEMIC_HALF_WIDTH, atol=1e-4)
+    total_lower, total_upper = _band_edges(
+        bands[cmapss_plots._TOTAL_INTERVAL_LABEL], n_windows
+    )
+    assert np.all(total_lower < epistemic_lower)
+    assert np.all(epistemic_upper < total_upper)
+
+
+def test_posterior_rows_evaluate_each_unit_once(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 20, 2: 9, 3: 14})
+    model = _StubPosteriorModel()
+
+    cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        [cmapss_plots.LabelledModel("Joint MC-Dropout", model)],
+        units=spanning_units(2, 3, 1),
+        window_length=3,
+    )
+
+    # One evaluation per curve, so each draw is one function along it.
+    assert model.calls == 3

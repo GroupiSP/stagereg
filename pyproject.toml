@@ -1,6 +1,6 @@
 [project]
 name = "stagereg"
-version = "0.5.0"
+version = "0.6.0"
 description = "Stage-oriented probabilistic regression"
 readme = "README.md"
 authors = [
@@ -99,3 +99,4 @@ reportUnusedVariable = false
 "examples/jax/cmapss/*.py" = ["E402"]
 "tests/jax/test_cmapss_*.py" = ["E402"]
 "examples/jax/tracking/*.py" = ["E402"]
+"examples/jax/clustered_data/compare.py" = ["E402"]

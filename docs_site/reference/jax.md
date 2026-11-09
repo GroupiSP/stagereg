@@ -23,6 +23,8 @@ module that defines it. Using it needs the `jax` extra.
 
 ::: stagereg.jax.GammaHead
 
+::: stagereg.jax.ResidualScale
+
 ## `stagereg.jax.evaluation`
 
 ::: stagereg.jax.SupervisedLoss

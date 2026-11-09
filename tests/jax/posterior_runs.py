@@ -148,7 +148,9 @@ def build_stages(
             checkpoint_store=checkpoint_store,
         ),
     )
-    variance_model = GammaHead(1, 1, rngs=nnx.Rngs(seed + 2))
+    # Without a residual scale, the variance stage trains on the raw residuals,
+    # so the pinned posterior losses and best epochs are unchanged.
+    variance_model = GammaHead(1, 1, rngs=nnx.Rngs(seed + 2), residual_scaling=False)
     variance_stage = GammaVarianceStage(
         model=variance_model,
         optimizer=create_optimizer(variance_model, optax.adam(0.05)),

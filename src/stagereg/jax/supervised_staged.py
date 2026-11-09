@@ -29,6 +29,7 @@ from stagereg.core.types import (
     TrainingState,
     ValidationResult,
 )
+from stagereg.jax.distributions import ResidualScale
 from stagereg.jax.evaluation import SupervisedLoss
 from stagereg.jax.losses import make_supervised_loss
 from stagereg.jax.metrics import MetricSuite
@@ -118,6 +119,61 @@ def _materialize_residual_batch(mean_model: nnx.Module, batch: Batch) -> Batch:
         sample_weight=batch.sample_weight,
         metadata=batch.metadata,
     )
+
+
+def _mean_squared_residual(residual_loader: LoaderFactory) -> float:
+    """Return the mean of the materialized training squared residuals.
+
+    The mean is unweighted and taken over every target element, so a
+    multi-output model gets one scalar scale.
+
+    Args:
+        residual_loader: The materialized residual loader.
+
+    Returns:
+        The mean squared residual of the ``"train"`` split.
+
+    Raises:
+        ValueError: If the training split was not materialized, or if the mean
+            is not positive and finite.
+    """
+    targets = [
+        batch.targets
+        for batch in residual_loader(split="train", epoch=0)
+        if batch.targets is not None
+    ]
+    total = sum(float(jnp.sum(target)) for target in targets)
+    count = sum(target.size for target in targets)
+    mean = total / count if count else math.nan
+    if not math.isfinite(mean) or mean <= 0.0:
+        raise ValueError(
+            f"training squared residuals must have a positive finite mean, got {mean}."
+        )
+    return mean
+
+
+def _holds_residual_scale(model: nnx.Module) -> bool:
+    """Return whether ``model`` holds a [`ResidualScale`][stagereg.jax.ResidualScale].
+
+    Args:
+        model: The variance model.
+
+    Returns:
+        ``True`` if ``model`` holds at least one ``ResidualScale``.
+    """
+    return bool(jax.tree.leaves(nnx.state(model, ResidualScale)))
+
+
+def _set_residual_scale(model: nnx.Module, scale: float) -> None:
+    """Set every [`ResidualScale`][stagereg.jax.ResidualScale] in ``model``.
+
+    Args:
+        model: The variance model; one without a ``ResidualScale`` is left
+            unchanged.
+        scale: The value every ``ResidualScale`` is set to.
+    """
+    scales = nnx.state(model, ResidualScale)
+    nnx.update(model, jax.tree.map(lambda value: jnp.full_like(value, scale), scales))
 
 
 @dataclass(frozen=True)
@@ -377,12 +433,22 @@ class GammaVarianceStage:
     def prepare(self, state: TrainingState) -> None:
         """Validate Step 1 output and materialize fixed residual targets.
 
+        If the variance model holds a
+        [`ResidualScale`][stagereg.jax.ResidualScale], also sets every one to
+        the mean squared residual of the ``"train"`` split, so a
+        [`GammaHead`][stagereg.jax.GammaHead] trains at unit scale. A model
+        without one, such as ``GammaHead(..., residual_scaling=False)``, trains
+        on the raw residuals.
+
         Args:
             state: Shared state whose mean component is ready.
 
         Raises:
             TypeError: If the registered mean component is not an NNX module.
-            ValueError: If lifecycle, ownership, or registrations are invalid.
+            ValueError: If lifecycle, ownership, or registrations are invalid,
+                or, when the variance model holds a ``ResidualScale``, if
+                ``"train"`` is not among the materialized splits or the
+                training squared residuals' mean is not positive and finite.
         """
         if state.lifecycle_state is not StageState.MEAN_READY:
             raise ValueError("variance stage requires MEAN_READY lifecycle state.")
@@ -415,12 +481,19 @@ class GammaVarianceStage:
             splits=self.splits,
             source_epoch=self.source_epoch,
         )
+        residual_scale = (
+            _mean_squared_residual(residual_loader)
+            if _holds_residual_scale(self.model)
+            else None
+        )
         validation = (
             self.validation_factory(residual_loader)
             if self.validation_factory is not None
             else self.options.validation
         )
 
+        if residual_scale is not None:
+            _set_residual_scale(self.model, residual_scale)
         state.register_component(self.model_name, self.model)
         state.register_optimizer(self.optimizer_name, self.optimizer)
         state.parameter_roles[self.model_name] = ParameterRole.VARIANCE

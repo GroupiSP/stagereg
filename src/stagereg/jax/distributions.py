@@ -394,7 +394,10 @@ class PosteriorPredictive:
     The aleatoric variance is read per draw when it has as many dimensions as
     ``draws`` and a leading axis of size ``S``; otherwise it is shared by every
     draw. A variance that could be read either way is therefore read per draw,
-    and a shared one is given without the leading draw axis.
+    and a shared one is given without the leading draw axis. With ``S > 1``, a
+    leading axis of size 1, as in ``[1, *batch]``, is not the draw axis: such a
+    variance is shared, broadcast against ``draws[0]`` like any other, so it
+    adds a leading batch axis of size 1.
 
     A ``draw_mask`` excludes draw slots from the mixture, which is then the
     equally weighted mixture over the included draws alone. It lets a posterior
@@ -406,7 +409,9 @@ class PosteriorPredictive:
             ``[S, *batch]`` with ``S >= 1`` draw slots on the leading axis.
         aleatoric_variance: The positive aleatoric variance, either shared by
             every draw and broadcastable against ``draws[0]``, or one per draw
-            and broadcastable against ``draws``, shaped ``[S, *batch]``.
+            and broadcastable against ``draws``, shaped ``[S, *batch]``. A
+            leading axis of size 1, as in ``[1, *batch]``, is read per draw
+            only when ``S`` is 1; with more draws it is shared, not per draw.
         draw_mask: Which of the ``S`` draw slots the mixture includes, a
             boolean array shaped ``[S]`` with at least one ``True``; the means
             and per-draw variances in excluded slots are ignored and may be
@@ -431,15 +436,7 @@ class PosteriorPredictive:
         """
         if jnp.ndim(self.draws) == 0 or jnp.shape(self.draws)[0] == 0:
             raise ValueError("draws must have a non-empty leading draw axis.")
-        try:
-            self.batch_shape  # noqa: B018 - computing it validates the shapes.
-        except ValueError as error:
-            raise ValueError(
-                "aleatoric_variance must broadcast against draws[0], shared by "
-                "every draw, or against draws, one variance per draw; got "
-                f"{jnp.shape(self.aleatoric_variance)} for draws "
-                f"{jnp.shape(self.draws)}."
-            ) from error
+        self._validate_variance_shape()
         if self.draw_mask is None:
             return
         if jnp.shape(self.draw_mask) != (self.num_draws,):
@@ -454,10 +451,34 @@ class PosteriorPredictive:
         """The number of draw slots ``S``, including any the mask excludes."""
         return self.draws.shape[0]
 
-    def _has_per_draw_variance(self) -> bool:
-        """Return whether the aleatoric variance carries the leading draw axis."""
+    def _variance_draw_shape(self) -> tuple[int, ...]:
+        """Return the aleatoric variance's shape with a leading draw axis.
+
+        The one place that tells a per-draw variance from a shared one: a
+        per-draw variance keeps its shape, ``[S, *batch]``; a shared one gains
+        a leading axis of size 1, which broadcasts across the draws.
+        """
         shape = jnp.shape(self.aleatoric_variance)
-        return len(shape) == jnp.ndim(self.draws) and shape[0] == self.num_draws
+        if len(shape) == jnp.ndim(self.draws) and shape[0] == self.num_draws:
+            return shape
+        return (1, *shape)
+
+    def _validate_variance_shape(self) -> None:
+        """Check that the aleatoric variance broadcasts against the draws.
+
+        Raises:
+            ValueError: If ``aleatoric_variance`` broadcasts neither against
+                ``draws[0]`` nor against ``draws``.
+        """
+        try:
+            jnp.broadcast_shapes(self.draws.shape[1:], self._variance_draw_shape()[1:])
+        except ValueError as error:
+            raise ValueError(
+                "aleatoric_variance must broadcast against draws[0], shared by "
+                "every draw, or against draws, one variance per draw; got "
+                f"{jnp.shape(self.aleatoric_variance)} for draws "
+                f"{jnp.shape(self.draws)}."
+            ) from error
 
     def _included_count(self) -> int | jax.Array:
         """Return the number of draws the mixture averages over."""
@@ -481,10 +502,9 @@ class PosteriorPredictive:
     @property
     def batch_shape(self) -> tuple[int, ...]:
         """The broadcast shape of one draw's mean and its aleatoric variance."""
-        variance_shape = jnp.shape(self.aleatoric_variance)
-        if self._has_per_draw_variance():
-            variance_shape = variance_shape[1:]
-        return jnp.broadcast_shapes(self.draws.shape[1:], variance_shape)
+        return jnp.broadcast_shapes(
+            self.draws.shape[1:], self._variance_draw_shape()[1:]
+        )
 
     @property
     def event_shape(self) -> tuple[int, ...]:
@@ -494,12 +514,16 @@ class PosteriorPredictive:
     def _component_variance(self) -> jax.Array:
         """Return each draw's aleatoric variance, shaped ``(S,) + batch_shape``.
 
-        Excluded slots hold one, so that no operation reads an invalid variance.
+        Excluded slots of a per-draw variance hold one, so that no operation reads an
+        invalid variance. A single variance row, shared or the only draw's, is valid for
+        every slot and is broadcast as it is.
         """
+        variance_shape = self._variance_draw_shape()
         variance = jnp.broadcast_to(
-            self.aleatoric_variance, (self.num_draws, *self.batch_shape)
+            jnp.reshape(self.aleatoric_variance, variance_shape),
+            (self.num_draws, *self.batch_shape),
         )
-        if not self._has_per_draw_variance():
+        if variance_shape[0] == 1:
             return variance
         return self._included(variance, 1.0)
 
@@ -638,12 +662,11 @@ class PosteriorPredictive:
             mask = jnp.reshape(self.draw_mask, (-1,) + (1,) * len(batch_shape))
             loc = jnp.where(mask, loc, self.mean())
             weights = self.draw_mask / self._included_count()
-        if self._has_per_draw_variance():
-            variance = self._component_variance()
-        else:
-            variance = jnp.broadcast_to(self.aleatoric_variance, batch_shape)
         return _gaussian_mixture_crps(
-            loc, variance, _reference_axis(targets, batch_shape), weights
+            loc,
+            self._component_variance(),
+            _reference_axis(targets, batch_shape),
+            weights,
         )
 
     def moment_matched(self) -> MomentMatchedPredictive:
@@ -657,8 +680,13 @@ class PosteriorPredictive:
             The [`MomentMatchedPredictive`][stagereg.jax.MomentMatchedPredictive],
             with both variance parts broadcast to ``batch_shape``.
         """
-        aleatoric_variance = self.aleatoric_variance
-        if self._has_per_draw_variance():
+        variance_shape = self._variance_draw_shape()
+        if variance_shape[0] == 1:
+            # One variance row, shared or the single draw's, is its own average.
+            aleatoric_variance = jnp.reshape(
+                self.aleatoric_variance, variance_shape[1:]
+            )
+        else:
             aleatoric_variance = self._included_average(self._component_variance())
         return MomentMatchedPredictive(
             loc=self.mean(),

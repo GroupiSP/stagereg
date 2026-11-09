@@ -956,6 +956,18 @@ def test_a_variance_with_the_draw_axis_is_read_per_draw() -> None:
     np.testing.assert_allclose(mixture.moment_matched().aleatoric_variance, [2.0, 2.0])
 
 
+def test_a_variance_with_a_leading_axis_of_one_is_shared_by_several_draws() -> None:
+    # With S > 1 a leading axis of size 1 is not the draw axis: the variance is
+    # shared, broadcast against one draw's mean like any other.
+    shared = PosteriorPredictive(
+        draws=jnp.array([[0.0, 1.0], [2.0, 3.0]]),
+        aleatoric_variance=jnp.array([[1.0, 4.0]]),
+    )
+
+    assert shared.batch_shape == (1, 2)
+    np.testing.assert_allclose(shared.moment_matched().aleatoric_variance, [[1.0, 4.0]])
+
+
 _GARBAGE_VARIANCE = st.sampled_from([0.0, -1.0, float("inf"), float("nan")])
 _GARBAGE_MEAN = st.sampled_from([3e38, -3e38, float("inf"), float("nan"), 0.0])
 

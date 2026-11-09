@@ -90,6 +90,99 @@ def test_compare_models_scores_lie_in_their_ranges(
             assert math.isfinite(metrics[name])
 
 
+def _fixed_posterior_model(low: float, high: float, scales: tuple[float, float]) -> Any:
+    """Return a stand-in model mapping any windows to the same two-draw mixture.
+
+    Draw one centres every unit at `low`, draw two at `high`, each with its own
+    aleatoric standard deviation, so the predictive is a bimodal mixture.
+    """
+    import jax.numpy as jnp
+    from flax import nnx
+
+    from stagereg.jax import PosteriorPredictive
+
+    class FixedPosteriorModel(nnx.Module):
+        def __call__(self, windows: Any) -> Any:
+            shape = (windows.shape[0], 1)
+            draws = jnp.stack([jnp.full(shape, low), jnp.full(shape, high)])
+            variance = jnp.stack([jnp.full(shape, scale**2) for scale in scales])
+            return PosteriorPredictive(draws=draws, aleatoric_variance=variance)
+
+    return FixedPosteriorModel()
+
+
+def test_score_on_test_split_scores_a_posterior_predictive_on_its_exact_mixture(
+    cmapss_compare: ModuleType,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    import dataclasses
+
+    import numpy as np
+
+    # Targets at the two modes and at the trough between them.
+    test_rul = np.array([0.0, 10.0, 5.0], dtype=np.float32)
+    prepared = synthetic_prepared_data()
+    prepared = dataclasses.replace(
+        prepared, test_windows=prepared.test_windows[:3], test_rul=test_rul
+    )
+    model = _fixed_posterior_model(low=0.0, high=10.0, scales=(1.0, 2.0))
+
+    metrics = cmapss_compare.score_on_test_split(model, prepared)
+
+    assert set(metrics) == _METRIC_NAMES
+
+    def normal_pdf(y: float, loc: float, scale: float) -> float:
+        return math.exp(-0.5 * ((y - loc) / scale) ** 2) / (
+            scale * math.sqrt(2 * math.pi)
+        )
+
+    mixture_nll = -np.mean(
+        [
+            math.log(0.5 * normal_pdf(y, 0.0, 1.0) + 0.5 * normal_pdf(y, 10.0, 2.0))
+            for y in test_rul
+        ]
+    )
+    assert metrics["nll"] == pytest.approx(mixture_nll, rel=1e-4)
+    # The mixture mean is 5 everywhere: residuals 5, 5 and 0.
+    assert metrics["rmse"] == pytest.approx(math.sqrt(50 / 3), rel=1e-5)
+    # The central 95% mixture interval holds both modes and the trough; the
+    # moment-matched Gaussian's would hold them too, so coverage is 1.
+    assert metrics["coverage"] == pytest.approx(1.0)
+
+
+@settings(max_examples=5, deadline=None)
+@given(
+    loc=st.floats(min_value=-50.0, max_value=50.0),
+    scale=st.floats(min_value=0.5, max_value=20.0),
+)
+def test_score_on_test_split_scores_a_one_point_posterior_as_its_gaussian(
+    cmapss_compare: ModuleType,
+    synthetic_prepared_data: Callable[..., Any],
+    loc: float,
+    scale: float,
+) -> None:
+    import jax.numpy as jnp
+    from flax import nnx
+
+    from stagereg.jax import Gaussian
+
+    prepared = synthetic_prepared_data()
+
+    class GaussianModel(nnx.Module):
+        def __call__(self, windows: Any) -> Any:
+            shape = (windows.shape[0], 1)
+            return Gaussian(loc=jnp.full(shape, loc), scale=jnp.full(shape, scale))
+
+    posterior_model = _fixed_posterior_model(low=loc, high=loc, scales=(scale, scale))
+
+    gaussian = cmapss_compare.score_on_test_split(GaussianModel(), prepared)
+    posterior = cmapss_compare.score_on_test_split(posterior_model, prepared)
+
+    assert posterior.keys() == gaussian.keys()
+    for name, value in gaussian.items():
+        assert posterior[name] == pytest.approx(value, rel=1e-4, abs=1e-4)
+
+
 _CELL = r"-?\d+\.\d+ ± \d+\.\d+"
 
 
@@ -113,6 +206,30 @@ def test_format_comparison_table_gives_each_model_a_mean_and_sample_std_column(
     assert header.split() == ["staged", "joint"]
     # Mean 2 and sample std sqrt(2) for the staged model; no spread for the joint.
     assert rmse.split() == ["RMSE", "2.0000", "±", "1.4142", "10.0000", "±", "0.0000"]
+
+
+def test_format_comparison_table_gives_one_column_per_model_result_in_order(
+    cmapss_compare: ModuleType,
+) -> None:
+    names = ("joint", "joint+mcd", "staged", "staged+mcd")
+
+    def model(name: str, nll: float) -> Any:
+        metrics = {"rmse": 0.0, "coverage": 1.0, "closed_form_crps": 0.0, "nll": nll}
+        return cmapss_compare.ModelResult(
+            name=name, label=name, model=None, metrics=metrics
+        )
+
+    seed = cmapss_compare.SeedComparison(
+        seed=0,
+        models=tuple(model(name, float(index)) for index, name in enumerate(names)),
+    )
+
+    table = cmapss_compare.format_comparison_table([seed])
+
+    header, *rows = table.splitlines()
+    assert tuple(header.split()) == names
+    (nll,) = [row for row in rows if row.startswith("NLL")]
+    assert nll.split()[1::3] == ["0.0000", "1.0000", "2.0000", "3.0000"]
 
 
 @pytest.mark.usefixtures("offline_fd001")

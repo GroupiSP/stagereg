@@ -33,6 +33,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
@@ -61,7 +62,10 @@ from stagereg.core import NegativeLogLikelihood, NegativeLogLikelihoodLoss
 from stagereg.core.metric_registry import EpochMetric
 from stagereg.core.tracking import EventSink
 from stagereg.jax import (
+    GaussianPredictor,
     HeldOutValidation,
+    PosteriorPredictive,
+    PosteriorPredictivePredictor,
     initialize_training_state,
     make_supervised_loss,
     run_supervised,
@@ -123,6 +127,39 @@ def train_joint_model(
     return setup.model
 
 
+def score_on_test_split(
+    model: nnx.Module, prepared: PreparedCmapssData
+) -> dict[str, float]:
+    """Score a model on the FD001 test split with `COMPARISON_METRICS`.
+
+    The predictor is chosen by the model's output: `GaussianPredictor` for a
+    `Gaussian`, `PosteriorPredictivePredictor` for a `PosteriorPredictive`,
+    which scores the exact mixture (mixture log-density, mixture-quantile
+    coverage and the mixture's closed-form CRPS).
+
+    Args:
+        model: An eval-mode model mapping windows to a `Gaussian` or a
+            `PosteriorPredictive`.
+        prepared: The prepared FD001 windows whose test split is scored.
+
+    Returns:
+        The model's `COMPARISON_METRICS` on the test split, by metric name.
+    """
+    output = model(jnp.asarray(prepared.test_windows[:1], dtype=jnp.float32))
+    predictor = (
+        PosteriorPredictivePredictor()
+        if isinstance(output, PosteriorPredictive)
+        else GaussianPredictor()
+    )
+    return evaluate_test_metrics(
+        model,
+        prepared.test_windows,
+        prepared.test_rul,
+        epoch_metrics=COMPARISON_METRICS,
+        predictor=predictor,
+    )
+
+
 @dataclass(frozen=True)
 class ModelResult:
     """One trained model of a comparison and its test-split scores.
@@ -131,7 +168,8 @@ class ModelResult:
         name: The model's name in the per-run lines and the table's column
             header, e.g. `"staged"`.
         label: The model's row label in the figure, e.g. `"Staged model"`.
-        model: The trained, eval-mode model.
+        model: The trained, eval-mode model, returning a `Gaussian` or a
+            `PosteriorPredictive`.
         metrics: The model's `COMPARISON_METRICS` on the test split, by
             metric name.
     """
@@ -144,15 +182,16 @@ class ModelResult:
 
 @dataclass(frozen=True)
 class SeedComparison:
-    """Both models trained from one seed, and their test-split scores.
+    """The models trained from one seed, and their test-split scores.
 
     Attributes:
-        seed: The seed both models were initialized from.
-        models: The staged model's result, then the joint model's.
+        seed: The seed every model was initialized from.
+        models: One result per model, in the table's column order and the
+            figure's row order: the staged model's, then the joint model's.
     """
 
     seed: int
-    models: tuple[ModelResult, ModelResult]
+    models: tuple[ModelResult, ...]
 
 
 RunReporter = Callable[[str, int, dict[str, float]], None]
@@ -186,12 +225,7 @@ def _train_and_score_seed(
     """
 
     def score(name: str, label: str, model: nnx.Module) -> ModelResult:
-        metrics = evaluate_test_metrics(
-            model,
-            prepared.test_windows,
-            prepared.test_rul,
-            epoch_metrics=COMPARISON_METRICS,
-        )
+        metrics = score_on_test_split(model, prepared)
         on_run(name, config.seed, metrics)
         return ModelResult(name=name, label=label, model=model, metrics=metrics)
 
@@ -280,7 +314,7 @@ def _mean_std(values: Sequence[float]) -> str:
 
 
 def format_comparison_table(results: Sequence[SeedComparison]) -> str:
-    """Tabulate both models' test metrics as `mean ± std` over seeds.
+    """Tabulate every model's test metrics as `mean ± std` over seeds.
 
     Args:
         results: The per-seed comparisons from `compare_models`; at least
@@ -288,8 +322,8 @@ def format_comparison_table(results: Sequence[SeedComparison]) -> str:
 
     Returns:
         A table with one row per metric (RMSE, 95% coverage, closed-form
-        CRPS, NLL) and one column per model, headed by its name, in the
-        comparisons' model order: `staged`, then `joint`.
+        CRPS, NLL) and one column per model result, headed by its name, in
+        the comparisons' model order.
     """
     names = [model.name for model in results[0].models]
     rows = [

@@ -77,6 +77,7 @@ from stagereg.jax import (
     HeldOutValidation,
     MeanStage,
     MetricSuite,
+    Predictor,
     SupervisedStageOptions,
     create_optimizer,
     evaluate_loader,
@@ -401,14 +402,15 @@ def evaluate_test_metrics(
     test_rul: np.ndarray,
     *,
     epoch_metrics: tuple[EpochMetric, ...] = TEST_METRICS,
+    predictor: Predictor | None = None,
 ) -> dict[str, float]:
-    """Score a Gaussian-output model against the FD001 test split.
+    """Score a model against the FD001 test split.
 
-    Works for any model whose output is a `Gaussian`, such as the staged
-    model from `build_composite_model`. Scoring goes through `stagereg`'s
-    `MetricSuite`, `GaussianPredictor`, and `evaluate_loader`; the closed-form
-    CRPS needs neither predictive samples nor an evaluation grid, so the
-    scores carry no Monte Carlo noise. No loss is computed.
+    By default works for any model whose output is a `Gaussian`, such as the
+    staged model from `build_composite_model`. Scoring goes through
+    `stagereg`'s `MetricSuite`, the predictor, and `evaluate_loader`; the
+    closed-form CRPS needs neither predictive samples nor an evaluation grid,
+    so the scores carry no Monte Carlo noise. No loss is computed.
 
     Args:
         model: An eval-mode model mapping windows to a `Gaussian`.
@@ -418,6 +420,10 @@ def evaluate_test_metrics(
         epoch_metrics: The metrics to report. Defaults to `TEST_METRICS`:
             RMSE (`"rmse"`), 95% interval coverage (`"coverage"`) and the
             closed-form CRPS (`"closed_form_crps"`).
+        predictor: Materializes the metrics' data from the model's output.
+            Defaults to `GaussianPredictor()`; pass a
+            `PosteriorPredictivePredictor()` for a model returning a
+            `PosteriorPredictive`.
 
     Returns:
         A mapping from each metric's name to its value on the test split.
@@ -426,7 +432,10 @@ def evaluate_test_metrics(
     targets = jnp.asarray(test_rul, dtype=jnp.float32).reshape(-1, 1)
     batch = Batch(inputs=inputs, targets=targets)
 
-    metric_suite = MetricSuite(epoch=epoch_metrics, predictor=GaussianPredictor())
+    metric_suite = MetricSuite(
+        epoch=epoch_metrics,
+        predictor=GaussianPredictor() if predictor is None else predictor,
+    )
     # No metric draws predictive samples, so the key never affects a score.
     metrics, _ = evaluate_loader(
         model, [batch], key=jax.random.key(0), metrics=metric_suite

@@ -208,6 +208,57 @@ def test_cmapss_config_gives_the_joint_model_the_same_default_budget_as_each_sta
     assert config.joint_epochs == 20
 
 
+def test_cmapss_config_accepts_the_mc_dropout_defaults(cmapss_run: ModuleType) -> None:
+    config = cmapss_run.CmapssConfig()
+
+    assert config.dropout_rate == 0.1
+    assert config.joint_mcd_epochs == 60
+    assert config.num_draws == 100
+    assert config.early_stopping_patience == 5
+    assert config.mcd_learning_rate > 0.0
+
+
+@given(dropout_rate=st.floats(min_value=0.0, max_value=0.999))
+def test_cmapss_config_accepts_a_dropout_rate_in_the_unit_interval(
+    cmapss_run: ModuleType, dropout_rate: float
+) -> None:
+    assert cmapss_run.CmapssConfig(dropout_rate=dropout_rate).dropout_rate == (
+        dropout_rate
+    )
+
+
+@given(
+    dropout_rate=st.one_of(
+        st.floats(max_value=0.0, exclude_max=True, allow_nan=False),
+        st.floats(min_value=1.0, allow_nan=False),
+    )
+)
+def test_cmapss_config_rejects_a_dropout_rate_outside_the_unit_interval(
+    cmapss_run: ModuleType, dropout_rate: float
+) -> None:
+    with pytest.raises(ValueError, match="dropout_rate"):
+        cmapss_run.CmapssConfig(dropout_rate=dropout_rate)
+
+
+@pytest.mark.parametrize(
+    "field", ["joint_mcd_epochs", "num_draws", "early_stopping_patience"]
+)
+@given(value=st.integers(max_value=0))
+def test_cmapss_config_rejects_non_positive_mc_dropout_counts(
+    cmapss_run: ModuleType, field: str, value: int
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        cmapss_run.CmapssConfig(**{field: value})
+
+
+@given(learning_rate=st.floats(max_value=0.0, allow_nan=False))
+def test_cmapss_config_rejects_a_non_positive_mc_dropout_learning_rate(
+    cmapss_run: ModuleType, learning_rate: float
+) -> None:
+    with pytest.raises(ValueError, match="mcd_learning_rate"):
+        cmapss_run.CmapssConfig(mcd_learning_rate=learning_rate)
+
+
 def test_cmapss_config_has_no_predictive_sample_count(cmapss_run: ModuleType) -> None:
     # The closed-form CRPS draws no predictive samples, so the run has no
     # sample count to configure.

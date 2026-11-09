@@ -111,6 +111,16 @@ class CmapssConfig:
         variance_epochs: Number of Stage-2 Gamma-model training epochs.
         joint_epochs: Number of training epochs for the joint model of the
             staged-vs-joint comparison.
+        dropout_rate: Dropout rate of the MC-Dropout models' backbones, in
+            `[0, 1)`.
+        joint_mcd_epochs: Maximum number of training epochs of the joint
+            MC-Dropout model, which stops early on its validation NLL.
+        mcd_learning_rate: Adam learning rate of the MC-Dropout training.
+            Provisional until tuned.
+        num_draws: Number of dropout-mask sets an MC-Dropout model's posterior
+            predictive mixes.
+        early_stopping_patience: Number of epochs without a better validation
+            NLL an MC-Dropout model trains on before it stops.
         seed: Base JAX random seed for splitting, model init, and training.
     """
 
@@ -123,14 +133,20 @@ class CmapssConfig:
     mean_epochs: int = 20
     variance_epochs: int = 20
     joint_epochs: int = 20
+    dropout_rate: float = 0.1
+    joint_mcd_epochs: int = 60
+    mcd_learning_rate: float = 1e-3
+    num_draws: int = 100
+    early_stopping_patience: int = 5
     seed: int = 0
 
     def __post_init__(self) -> None:
-        """Validate size, fraction, and epoch configuration.
+        """Validate size, fraction, epoch, and MC-Dropout configuration.
 
         Raises:
-            ValueError: If sizes/epochs are not positive or the validation
-                fraction is not in (0, 1).
+            ValueError: If sizes, epochs, draws, patience or the MC-Dropout
+                learning rate are not positive, the validation fraction is
+                not in (0, 1), or the dropout rate is not in [0, 1).
         """
         if self.window_length <= 0 or self.batch_size <= 0:
             raise ValueError("window_length and batch_size must be positive.")
@@ -142,6 +158,13 @@ class CmapssConfig:
             raise ValueError("joint_epochs must be positive.")
         if not 0.0 < self.validation_fraction < 1.0:
             raise ValueError("validation_fraction must be within (0, 1).")
+        if not 0.0 <= self.dropout_rate < 1.0:
+            raise ValueError("dropout_rate must be within [0, 1).")
+        for name in ("joint_mcd_epochs", "num_draws", "early_stopping_patience"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if not self.mcd_learning_rate > 0.0:
+            raise ValueError("mcd_learning_rate must be positive.")
 
 
 def make_window_loader(

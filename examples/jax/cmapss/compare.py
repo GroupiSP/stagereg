@@ -43,7 +43,7 @@ _MODULE_DIR = Path(__file__).resolve().parent
 if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
-from model import Cnn1DGaussianModel
+from model import Cnn1DGammaModel, Cnn1DGaussianModel, Cnn1DMeanModel
 from plots import LabelledModel, plot_validation_rul_curves
 from preprocessing import select_lifetime_spanning_units
 from run import (
@@ -51,10 +51,12 @@ from run import (
     CmapssConfig,
     PreparedCmapssData,
     build_composite_model,
+    build_mc_dropout_predictive,
     build_supervised_training_setup,
     evaluate_test_metrics,
     prepare_cmapss_windows,
     train_gamma_model,
+    train_joint_mcd_model,
     train_mean_model,
 )
 
@@ -209,26 +211,18 @@ def _ignore_run(model: str, seed: int, metrics: dict[str, float]) -> None:
     del model, seed, metrics
 
 
-def _train_and_score_seed(
-    prepared: PreparedCmapssData, config: CmapssConfig, *, on_run: RunReporter
-) -> SeedComparison:
-    """Train and score the staged and then the joint model from `config.seed`.
+def _train_staged_networks(
+    prepared: PreparedCmapssData, config: CmapssConfig
+) -> tuple[Cnn1DMeanModel, Cnn1DGammaModel]:
+    """Silently train the staged model's mean and Gamma variance networks.
 
     Args:
-        prepared: The prepared FD001 windows to train, validate and score on.
-        config: Example configuration; its `seed` initializes both models.
-        on_run: Called with each model's name, the seed and its test metrics
-            as soon as that model is scored.
+        prepared: The prepared FD001 windows to train and validate on.
+        config: Example configuration; its `seed` initializes both networks.
 
     Returns:
-        The seed's `SeedComparison`.
+        The trained mean network and Gamma variance network.
     """
-
-    def score(name: str, label: str, model: nnx.Module) -> ModelResult:
-        metrics = score_on_test_split(model, prepared)
-        on_run(name, config.seed, metrics)
-        return ModelResult(name=name, label=label, model=model, metrics=metrics)
-
     mean_model, state = train_mean_model(
         prepared.train_windows,
         prepared.train_targets,
@@ -244,15 +238,77 @@ def _train_and_score_seed(
         config,
         event_sinks=(),
     )
-    staged = score(
-        "staged", "Staged model", build_composite_model(mean_model, variance_model)
-    )
+    return mean_model, variance_model
 
+
+def _train_joint(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.Module:
+    """Silently train the joint model and return an eval-mode clone of it."""
     joint_model = nnx.clone(train_joint_model(prepared, config, event_sinks=()))
     joint_model.eval()
-    joint = score("joint", "Joint model", joint_model)
+    return joint_model
 
-    return SeedComparison(seed=config.seed, models=(staged, joint))
+
+def _train_joint_mcd(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.Module:
+    """Silently train the joint MC-Dropout model and return its predictive."""
+    network = train_joint_mcd_model(
+        prepared.train_windows,
+        prepared.train_targets,
+        prepared.validation_windows,
+        prepared.validation_targets,
+        config,
+        event_sinks=(),
+    )
+    return build_mc_dropout_predictive(network, config)
+
+
+def _train_and_score_seed(
+    prepared: PreparedCmapssData,
+    config: CmapssConfig,
+    *,
+    posterior_stage: bool,
+    on_run: RunReporter,
+) -> SeedComparison:
+    """Train and score every model of the comparison from `config.seed`.
+
+    Without a posterior stage the models are the staged and then the joint
+    model; with one, the joint, the joint MC-Dropout and the staged model.
+    Each model is trained and scored in that order.
+
+    Args:
+        prepared: The prepared FD001 windows to train, validate and score on.
+        config: Example configuration; its `seed` initializes every model.
+        posterior_stage: Whether to add the MC-Dropout models.
+        on_run: Called with each model's name, the seed and its test metrics
+            as soon as that model is scored.
+
+    Returns:
+        The seed's `SeedComparison`.
+    """
+
+    def score(name: str, label: str, model: nnx.Module) -> ModelResult:
+        metrics = score_on_test_split(model, prepared)
+        on_run(name, config.seed, metrics)
+        return ModelResult(name=name, label=label, model=model, metrics=metrics)
+
+    def staged() -> ModelResult:
+        mean_model, variance_model = _train_staged_networks(prepared, config)
+        return score(
+            "staged", "Staged model", build_composite_model(mean_model, variance_model)
+        )
+
+    def joint() -> ModelResult:
+        return score("joint", "Joint model", _train_joint(prepared, config))
+
+    if not posterior_stage:
+        return SeedComparison(seed=config.seed, models=(staged(), joint()))
+
+    def joint_mcd() -> ModelResult:
+        return score(
+            "joint+mcd", "Joint MC-Dropout model", _train_joint_mcd(prepared, config)
+        )
+
+    models = (joint(), joint_mcd(), staged())
+    return SeedComparison(seed=config.seed, models=models)
 
 
 def compare_models(
@@ -260,22 +316,27 @@ def compare_models(
     config: CmapssConfig,
     *,
     seeds: int,
+    posterior_stage: bool = False,
     on_run: RunReporter = _ignore_run,
 ) -> list[SeedComparison]:
-    """Train and score the staged and the joint model once per seed.
+    """Train and score the comparison's models once per seed.
 
     Every seed trains on the same `prepared` data, so only initialization
-    varies: seed index `i` initializes both models from `config.seed + i`.
-    Training is silent. Each `SeedComparison` keeps both trained models, so
-    a caller can plot, say, the first seed's models without retraining.
+    varies: seed index `i` initializes every model, and the MC-Dropout
+    model's masks, from `config.seed + i`. Training is silent. Each
+    `SeedComparison` keeps its trained models, so a caller can plot, say,
+    the first seed's models without retraining.
 
     Args:
         prepared: The prepared FD001 windows, shared by every seed.
         config: Example configuration; its `seed` is the first seed.
-        seeds: Number of seeds to train both models from.
-        on_run: Called with the model's name (`"staged"` or `"joint"`), the
-            seed and the test metrics as soon as each run is scored. Does
-            nothing by default.
+        seeds: Number of seeds to train the models from.
+        posterior_stage: Off, the default, compares the staged and the joint
+            model, in that order. On, it compares the joint, the joint
+            MC-Dropout (`"joint+mcd"`) and the staged model, in that order;
+            the joint and staged models are the same as with it off.
+        on_run: Called with the model's name, the seed and the test metrics
+            as soon as each run is scored. Does nothing by default.
 
     Returns:
         One `SeedComparison` per seed, in seed order.
@@ -284,6 +345,7 @@ def compare_models(
         _train_and_score_seed(
             prepared,
             dataclasses.replace(config, seed=config.seed + index),
+            posterior_stage=posterior_stage,
             on_run=on_run,
         )
         for index in range(seeds)

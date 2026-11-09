@@ -90,6 +90,105 @@ def test_compare_models_scores_lie_in_their_ranges(
             assert math.isfinite(metrics[name])
 
 
+@pytest.fixture(scope="module")
+def mcd_config(tiny_cmapss_config: Any) -> Any:
+    """The tiny configuration with a two-epoch, eight-draw MC-Dropout budget."""
+    import dataclasses
+
+    return dataclasses.replace(
+        tiny_cmapss_config,
+        dropout_rate=0.2,
+        joint_mcd_epochs=2,
+        num_draws=8,
+        early_stopping_patience=1,
+    )
+
+
+def test_compare_models_with_a_posterior_stage_scores_joint_mcd_between_the_baselines(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    from stagereg.jax import Gaussian, PosteriorPredictive
+
+    prepared = synthetic_prepared_data()
+
+    results = cmapss_compare.compare_models(
+        prepared, mcd_config, seeds=2, posterior_stage=True
+    )
+
+    assert [result.seed for result in results] == [3, 4]
+    for result in results:
+        assert [(model.name, model.label) for model in result.models] == [
+            ("joint", "Joint model"),
+            ("joint+mcd", "Joint MC-Dropout model"),
+            ("staged", "Staged model"),
+        ]
+        for model in result.models:
+            assert set(model.metrics) == _METRIC_NAMES
+            assert 0.0 <= model.metrics["coverage"] <= 1.0
+            assert model.metrics["rmse"] >= 0.0
+            assert model.metrics["closed_form_crps"] >= 0.0
+            assert math.isfinite(model.metrics["nll"])
+        joint, joint_mcd, _ = result.models
+        windows = prepared.test_windows
+        assert isinstance(joint.model(windows), Gaussian)
+        predictive = joint_mcd.model(windows)
+        assert isinstance(predictive, PosteriorPredictive)
+        assert predictive.num_draws == mcd_config.num_draws
+        # Each draw keeps its own aleatoric variance.
+        assert predictive.aleatoric_variance.shape == predictive.draws.shape
+        # Dropout stays active at prediction: the mask sets give distinct draws.
+        assert len({float(draw.sum()) for draw in predictive.draws}) > 1
+
+
+def test_compare_models_posterior_stage_leaves_the_baselines_unchanged(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    prepared = synthetic_prepared_data()
+
+    (without,) = cmapss_compare.compare_models(prepared, mcd_config, seeds=1)
+    (with_flag,) = cmapss_compare.compare_models(
+        prepared, mcd_config, seeds=1, posterior_stage=True
+    )
+
+    assert [model.name for model in without.models] == ["staged", "joint"]
+    by_name = {model.name: model.metrics for model in with_flag.models}
+    for model in without.models:
+        assert by_name[model.name] == model.metrics
+
+
+def test_compare_models_posterior_stage_trains_silently_and_reproduces_a_seed(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import numpy as np
+
+    prepared = synthetic_prepared_data()
+
+    def joint_mcd(seeds: int) -> list[Any]:
+        results = cmapss_compare.compare_models(
+            prepared, mcd_config, seeds=seeds, posterior_stage=True
+        )
+        return [result.models[1] for result in results]
+
+    (first,) = joint_mcd(1)
+    (second,) = joint_mcd(1)
+    _, other_seed = joint_mcd(2)
+
+    assert capsys.readouterr().out == ""
+    assert first.metrics == second.metrics
+    windows = prepared.test_windows
+    np.testing.assert_array_equal(
+        first.model(windows).draws, second.model(windows).draws
+    )
+    assert first.metrics != other_seed.metrics
+
+
 def _fixed_posterior_model(low: float, high: float, scales: tuple[float, float]) -> Any:
     """Return a stand-in model mapping any windows to the same two-draw mixture.
 

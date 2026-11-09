@@ -49,7 +49,12 @@ from data import (
     load_fd001_test_data,
     load_fd001_test_rul,
 )
-from model import Cnn1DGammaModel, Cnn1DMeanModel, CompositeGaussianModel
+from model import (
+    Cnn1DGammaModel,
+    Cnn1DGaussianModel,
+    Cnn1DMeanModel,
+    CompositeGaussianModel,
+)
 from plots import LabelledModel, plot_validation_rul_curves
 from preprocessing import (
     SensorStandardization,
@@ -61,7 +66,9 @@ from preprocessing import (
     split_by_unit,
 )
 
-from stagereg.core.losses import SquaredErrorLoss
+from stagereg.core import EarlyStopper, OptimizationMode, Split
+from stagereg.core.checkpoints import InMemoryCheckpointStore
+from stagereg.core.losses import NegativeLogLikelihoodLoss, SquaredErrorLoss
 from stagereg.core.metric_registry import (
     ClosedFormContinuousRankedProbabilityScore,
     EpochMetric,
@@ -77,11 +84,15 @@ from stagereg.jax import (
     HeldOutValidation,
     MeanStage,
     MetricSuite,
+    PosteriorPredictive,
     Predictor,
     SupervisedStageOptions,
     create_optimizer,
     evaluate_loader,
+    initialize_training_state,
     make_supervised_loss,
+    restore_checkpoint,
+    run_supervised,
 )
 
 _SENSOR_NAMES = [f"sensor_{i}" for i in (11, 12, 4, 7, 15, 20, 21, 2, 17)]
@@ -244,16 +255,21 @@ def build_supervised_training_setup[ModelT: nnx.Module](
     validation_windows: np.ndarray,
     validation_targets: np.ndarray,
     config: CmapssConfig,
+    *,
+    dropout_rate: float = 0.0,
+    learning_rate: float | None = None,
 ) -> SupervisedTrainingSetup[ModelT]:
     """Initialize a 1D-CNN model and its optimizer and loaders from `config`.
 
     The key `config.seed` is split into the model's initialization key and
     the training key. The model is built with the configured channel width
     and kernel size, and optimized with Adam at the configured learning rate.
+    Dropout adds no parameters, so the initial parameters do not depend on
+    `dropout_rate`.
 
     Args:
         model_type: The model class, constructed as `model_type(n_sensors, *,
-            hidden_channels, kernel_size, rngs)`.
+            hidden_channels, kernel_size, dropout_rate, rngs)`.
         train_windows: Training sliding windows, shape `(n_train,
             window_length, n_sensors)`.
         train_targets: Training RUL targets, shape `(n_train,)`.
@@ -261,6 +277,10 @@ def build_supervised_training_setup[ModelT: nnx.Module](
             `train_windows`.
         validation_targets: Held-out validation RUL targets.
         config: Example configuration controlling model size and training.
+        dropout_rate: The model's dropout rate; 0, the default, disables
+            dropout.
+        learning_rate: Adam learning rate; `None`, the default, uses
+            `config.learning_rate`.
 
     Returns:
         The model, its optimizer, the training key, and both loaders.
@@ -270,11 +290,14 @@ def build_supervised_training_setup[ModelT: nnx.Module](
         train_windows.shape[-1],
         hidden_channels=config.hidden_channels,
         kernel_size=config.kernel_size,
+        dropout_rate=dropout_rate,
         rngs=nnx.Rngs(model_key),
     )
+    if learning_rate is None:
+        learning_rate = config.learning_rate
     return SupervisedTrainingSetup(
         model=model,
-        optimizer=create_optimizer(model, optax.adam(config.learning_rate)),
+        optimizer=create_optimizer(model, optax.adam(learning_rate)),
         rng_key=rng_key,
         train_loader=make_window_loader(
             train_windows, train_targets, batch_size=config.batch_size
@@ -393,6 +416,214 @@ def train_gamma_model(
     stage.prepare(state)
     stage.train(state)
     return model
+
+
+MC_DROPOUT_DRAW_STREAM = 2
+"""The stream folded into `config.seed`'s key for the MC-Dropout masks."""
+
+JOINT_MCD_STAGE = "joint_mcd"
+"""The stage segment the joint MC-Dropout model's training is reported under."""
+
+
+def mc_dropout_draw_key(config: CmapssConfig) -> jax.Array:
+    """Return the fixed key an MC-Dropout model's mask sets are drawn from.
+
+    Derived from `config.seed` alone, so validation, test scoring and the
+    figure all score the same draws (ADR 0014), and a seed's draws are
+    reproducible run to run.
+
+    Args:
+        config: Example configuration; its `seed` is read.
+
+    Returns:
+        A JAX PRNG key.
+    """
+    return jax.random.fold_in(jax.random.key(config.seed), MC_DROPOUT_DRAW_STREAM)
+
+
+class McDropoutPredictive(nnx.Module):
+    """A Gaussian-head network with active dropout, as a posterior predictive.
+
+    Evaluates the network under `num_draws` dropout-mask sets drawn from a
+    fixed key and stacks each draw's mean and its own aleatoric variance
+    into a [`PosteriorPredictive`][stagereg.jax.PosteriorPredictive]. Each
+    draw is one mask set applied to the whole batch, so a draw is the same
+    function at every window, and the same key gives the same draws on any
+    batch. Dropout stays active whatever mode the wrapper is put in.
+    """
+
+    def __init__(
+        self, network: Cnn1DGaussianModel, *, num_draws: int, key: jax.Array
+    ) -> None:
+        """Wrap a network, without copying it.
+
+        Args:
+            network: The Gaussian-head network; later changes to its
+                parameters are seen.
+            num_draws: Number of dropout-mask sets to draw.
+            key: The key the mask sets are drawn from.
+        """
+        self.network = network
+        self.num_draws = num_draws
+        self.key = nnx.data(key)
+
+    def __call__(self, inputs: jax.Array) -> PosteriorPredictive:
+        """Predict the posterior predictive for each windowed example.
+
+        Args:
+            inputs: Windowed sensor readings, shape ``(batch, window_length,
+                n_sensors)``.
+
+        Returns:
+            A [`PosteriorPredictive`][stagereg.jax.PosteriorPredictive] whose
+            draws and per-draw aleatoric variances are shaped
+            ``(num_draws, batch, 1)``.
+        """
+        graph, state = nnx.split(self.network)
+
+        def draw(key: jax.Array) -> jax.Array:
+            network = nnx.merge(graph, state)
+            network.set_attributes(
+                nnx.Dropout, deterministic=False, raise_if_not_found=False
+            )
+            gaussian = network(inputs, dropout_key=key)
+            return jnp.stack([gaussian.loc, gaussian.scale**2])
+
+        outputs = jax.vmap(draw)(jax.random.split(self.key, self.num_draws))
+        return PosteriorPredictive(
+            draws=outputs[:, 0], aleatoric_variance=outputs[:, 1]
+        )
+
+
+def build_mc_dropout_predictive(
+    network: Cnn1DGaussianModel, config: CmapssConfig
+) -> McDropoutPredictive:
+    """Wrap a clone of a trained network as its MC-Dropout posterior predictive.
+
+    Args:
+        network: The trained Gaussian-head network with dropout.
+        config: Example configuration; `num_draws` and `seed` are read.
+
+    Returns:
+        An eval-mode `McDropoutPredictive` over a clone of `network`,
+        independent of later training, drawing its masks from
+        `mc_dropout_draw_key`.
+    """
+    predictive = McDropoutPredictive(
+        nnx.clone(network),
+        num_draws=config.num_draws,
+        key=mc_dropout_draw_key(config),
+    )
+    predictive.eval()
+    return predictive
+
+
+def _fixed_order_loader(
+    windows: np.ndarray, targets: np.ndarray, *, batch_size: int
+) -> LoaderFactory:
+    """Build a `LoaderFactory` yielding the same unshuffled batches every epoch."""
+    inputs = jnp.asarray(windows, dtype=jnp.float32)
+    targets_array = jnp.asarray(targets, dtype=jnp.float32).reshape(-1, 1)
+    batches = [
+        Batch(
+            inputs=inputs[start : start + batch_size],
+            targets=targets_array[start : start + batch_size],
+        )
+        for start in range(0, inputs.shape[0], batch_size)
+    ]
+
+    def loader(*, split: str, epoch: int) -> list[Batch]:
+        del split, epoch
+        return batches
+
+    return loader
+
+
+def train_joint_mcd_model(
+    train_windows: np.ndarray,
+    train_targets: np.ndarray,
+    validation_windows: np.ndarray,
+    validation_targets: np.ndarray,
+    config: CmapssConfig,
+    *,
+    event_sinks: Sequence[EventSink],
+) -> Cnn1DGaussianModel:
+    """Train a joint MC-Dropout network on the Gaussian NLL with dropout active.
+
+    A Gaussian-head CNN at `config.dropout_rate`, from a random
+    initialization, trained with `run_supervised` at
+    `config.mcd_learning_rate` and no prior term. After every epoch it is
+    validated on the NLL of its MC mixture (`McDropoutPredictive` under
+    `mc_dropout_draw_key`), and it stops once that NLL has not improved for
+    `config.early_stopping_patience` epochs, after at most
+    `config.joint_mcd_epochs`.
+
+    Args:
+        train_windows: Training sliding windows, shape `(n_train,
+            window_length, n_sensors)`.
+        train_targets: Training RUL targets, shape `(n_train,)`.
+        validation_windows: Held-out validation windows, same layout as
+            `train_windows`.
+        validation_targets: Held-out validation RUL targets.
+        config: Example configuration; `config.seed` sets the
+            initialization, the training masks and the validation draws.
+        event_sinks: Sinks notified of the training events; pass none to
+            train silently.
+
+    Returns:
+        The network with its best validation epoch's parameters; wrap it
+        with `build_mc_dropout_predictive` to predict.
+    """
+    setup = build_supervised_training_setup(
+        Cnn1DGaussianModel,
+        train_windows,
+        train_targets,
+        validation_windows,
+        validation_targets,
+        config,
+        dropout_rate=config.dropout_rate,
+        learning_rate=config.mcd_learning_rate,
+    )
+    loss = make_supervised_loss(NegativeLogLikelihoodLoss())
+    state = initialize_training_state(
+        setup.model, setup.optimizer, rng_key=setup.rng_key
+    )
+    store = InMemoryCheckpointStore()
+    run_supervised(
+        model=setup.model,
+        optimizer=setup.optimizer,
+        train_loader=setup.train_loader,
+        loss=loss,
+        state=state,
+        epochs=config.joint_mcd_epochs,
+        validation=HeldOutValidation(
+            model=McDropoutPredictive(
+                setup.model,
+                num_draws=config.num_draws,
+                key=mc_dropout_draw_key(config),
+            ),
+            loader=_fixed_order_loader(
+                validation_windows, validation_targets, batch_size=config.batch_size
+            ),
+            loss=loss,
+        ),
+        early_stopper=EarlyStopper(
+            metric="loss",
+            mode=OptimizationMode.MIN,
+            patience=config.early_stopping_patience,
+            source=Split.VALIDATION,
+        ),
+        event_sinks=event_sinks,
+        checkpoint_store=store,
+        stage=JOINT_MCD_STAGE,
+    )
+    restore_checkpoint(
+        store.load(f"{JOINT_MCD_STAGE}/best"),
+        state=state,
+        model=setup.model,
+        optimizer=setup.optimizer,
+    )
+    return setup.model
 
 
 def build_composite_model(

@@ -291,6 +291,8 @@ def gaussian_mixture_crps_kernel(
         density = xp.exp(-0.5 * z**2) / math.sqrt(2.0 * math.pi)
         return 2.0 * scale * density + location * erf(z / math.sqrt(2.0))
 
+    # An integer variance would overflow in the pairwise sum below.
+    variance = xp.asarray(variance, dtype=xp.result_type(variance, float))
     components = draw_means.shape[0]
     units = math.prod(draw_means.shape[1:])
     widest = max(components, references.shape[0])

@@ -763,6 +763,26 @@ def test_extreme_means_in_excluded_slots_leave_the_crps_finite(extreme: float) -
     )
 
 
+@pytest.mark.parametrize("variance_shape", [(1,), (2, 1)], ids=["shared", "per-draw"])
+def test_an_integer_variance_crps_matches_the_float_variance_crps(
+    variance_shape: tuple[int, ...],
+) -> None:
+    # Two variances of 2**30 sum past the int32 range, so the pairwise
+    # variance must be formed in floating point.
+    variance = jnp.full(variance_shape, 2**30, dtype=jnp.int32)
+    draws = jnp.zeros((2, 1))
+
+    np.testing.assert_allclose(
+        PosteriorPredictive(draws=draws, aleatoric_variance=variance).crps(
+            jnp.zeros(1)
+        ),
+        PosteriorPredictive(
+            draws=draws, aleatoric_variance=variance.astype(jnp.float32)
+        ).crps(jnp.zeros(1)),
+        rtol=1e-6,
+    )
+
+
 @settings(deadline=None, max_examples=25)
 @given(posterior_predictives_and_references(), st.booleans())
 def test_moment_matched_crps_matches_the_core_function(

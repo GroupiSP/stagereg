@@ -92,17 +92,10 @@ def test_compare_models_scores_lie_in_their_ranges(
 
 @pytest.fixture(scope="module")
 def mcd_config(tiny_cmapss_config: Any) -> Any:
-    """The tiny configuration with two-epoch, eight-draw MC-Dropout budgets."""
+    """The tiny configuration with eight-draw MC-Dropout models."""
     import dataclasses
 
-    return dataclasses.replace(
-        tiny_cmapss_config,
-        dropout_rate=0.2,
-        joint_mcd_epochs=2,
-        posterior_epochs=2,
-        num_draws=8,
-        early_stopping_patience=1,
-    )
+    return dataclasses.replace(tiny_cmapss_config, dropout_rate=0.2, num_draws=8)
 
 
 def test_compare_models_with_a_posterior_stage_scores_each_baseline_then_its_mcd(
@@ -150,7 +143,7 @@ def test_compare_models_with_a_posterior_stage_scores_each_baseline_then_its_mcd
         )
 
 
-def test_staged_mcd_starts_from_the_staged_models_networks(
+def test_mcd_models_without_dropout_are_their_baselines(
     cmapss_compare: ModuleType,
     mcd_config: Any,
     synthetic_prepared_data: Callable[..., Any],
@@ -159,57 +152,27 @@ def test_staged_mcd_starts_from_the_staged_models_networks(
 
     import numpy as np
 
-    # Without dropout and with a negligible step, the posterior stage cannot
-    # move off its warm start: every draw is the staged model's mean network.
-    config = dataclasses.replace(mcd_config, dropout_rate=0.0, mcd_learning_rate=1e-12)
+    # Each MC-Dropout model is its baseline trained once with dropout, and the
+    # staged posterior stage does not train; without dropout every draw is
+    # the baseline's Gaussian.
+    config = dataclasses.replace(mcd_config, dropout_rate=0.0)
     prepared = synthetic_prepared_data()
 
     (result,) = cmapss_compare.compare_models(
         prepared, config, seeds=1, posterior_stage=True
     )
 
-    _, _, staged, staged_mcd = result.models
+    joint, joint_mcd, staged, staged_mcd = result.models
     windows = prepared.test_windows
-    gaussian = staged.model(windows)
-    predictive = staged_mcd.model(windows)
-    for draw in predictive.draws:
-        np.testing.assert_allclose(draw, gaussian.loc, rtol=1e-5, atol=1e-5)
-    # Re-fitted to an unchanged mean from the same initialization, the Gamma
-    # network reproduces the staged model's variance, shared by every draw.
-    np.testing.assert_allclose(
-        np.broadcast_to(predictive.aleatoric_variance, gaussian.scale.shape),
-        gaussian.scale**2,
-        rtol=1e-5,
-    )
-
-
-def test_joint_mcd_starts_from_the_joint_models_network(
-    cmapss_compare: ModuleType,
-    mcd_config: Any,
-    synthetic_prepared_data: Callable[..., Any],
-) -> None:
-    import dataclasses
-
-    import numpy as np
-
-    # Without dropout and with a negligible step, the fine-tune cannot move
-    # off its warm start: every draw is the joint model's Gaussian.
-    config = dataclasses.replace(mcd_config, dropout_rate=0.0, mcd_learning_rate=1e-12)
-    prepared = synthetic_prepared_data()
-
-    (result,) = cmapss_compare.compare_models(
-        prepared, config, seeds=1, posterior_stage=True
-    )
-
-    joint, joint_mcd, _, _ = result.models
-    windows = prepared.test_windows
-    gaussian = joint.model(windows)
-    predictive = joint_mcd.model(windows)
-    for draw, variance in zip(
-        predictive.draws, predictive.aleatoric_variance, strict=True
-    ):
-        np.testing.assert_allclose(draw, gaussian.loc, rtol=1e-5, atol=1e-5)
-        np.testing.assert_allclose(variance, gaussian.scale**2, rtol=1e-5)
+    for baseline, mcd in ((joint, joint_mcd), (staged, staged_mcd)):
+        gaussian = baseline.model(windows)
+        predictive = mcd.model(windows)
+        variances = np.broadcast_to(
+            predictive.aleatoric_variance, predictive.draws.shape
+        )
+        for draw, variance in zip(predictive.draws, variances, strict=True):
+            np.testing.assert_allclose(draw, gaussian.loc, rtol=1e-5, atol=1e-5)
+            np.testing.assert_allclose(variance, gaussian.scale**2, rtol=1e-5)
 
 
 def test_compare_models_posterior_stage_leaves_the_baselines_unchanged(

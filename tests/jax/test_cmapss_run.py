@@ -212,10 +212,7 @@ def test_cmapss_config_accepts_the_mc_dropout_defaults(cmapss_run: ModuleType) -
     config = cmapss_run.CmapssConfig()
 
     assert config.dropout_rate == 0.1
-    assert config.joint_mcd_epochs == config.posterior_epochs == 20
     assert config.num_draws == 100
-    assert config.early_stopping_patience == 5
-    assert config.mcd_learning_rate > 0.0
 
 
 @given(dropout_rate=st.floats(min_value=0.0, max_value=0.999))
@@ -240,48 +237,12 @@ def test_cmapss_config_rejects_a_dropout_rate_outside_the_unit_interval(
         cmapss_run.CmapssConfig(dropout_rate=dropout_rate)
 
 
-@pytest.mark.parametrize(
-    "field", ["joint_mcd_epochs", "num_draws", "early_stopping_patience"]
-)
-@given(value=st.integers(max_value=0))
-def test_cmapss_config_rejects_non_positive_mc_dropout_counts(
-    cmapss_run: ModuleType, field: str, value: int
+@given(num_draws=st.integers(max_value=0))
+def test_cmapss_config_rejects_a_non_positive_num_draws(
+    cmapss_run: ModuleType, num_draws: int
 ) -> None:
-    with pytest.raises(ValueError, match=field):
-        cmapss_run.CmapssConfig(**{field: value})
-
-
-@given(learning_rate=st.floats(max_value=0.0, allow_nan=False))
-def test_cmapss_config_rejects_a_non_positive_mc_dropout_learning_rate(
-    cmapss_run: ModuleType, learning_rate: float
-) -> None:
-    with pytest.raises(ValueError, match="mcd_learning_rate"):
-        cmapss_run.CmapssConfig(mcd_learning_rate=learning_rate)
-
-
-def test_cmapss_config_accepts_the_posterior_stage_defaults(
-    cmapss_run: ModuleType,
-) -> None:
-    config = cmapss_run.CmapssConfig()
-
-    assert config.posterior_epochs > 0
-    assert config.prior_precision > 0.0
-
-
-@given(epochs=st.integers(max_value=0))
-def test_cmapss_config_rejects_non_positive_posterior_epochs(
-    cmapss_run: ModuleType, epochs: int
-) -> None:
-    with pytest.raises(ValueError, match="posterior_epochs"):
-        cmapss_run.CmapssConfig(posterior_epochs=epochs)
-
-
-@given(precision=st.floats(max_value=0.0, allow_nan=False))
-def test_cmapss_config_rejects_a_non_positive_prior_precision(
-    cmapss_run: ModuleType, precision: float
-) -> None:
-    with pytest.raises(ValueError, match="prior_precision"):
-        cmapss_run.CmapssConfig(prior_precision=precision)
+    with pytest.raises(ValueError, match="num_draws"):
+        cmapss_run.CmapssConfig(num_draws=num_draws)
 
 
 def test_cmapss_config_gives_the_gamma_model_a_narrow_weight_decayed_default(
@@ -362,6 +323,43 @@ def test_gamma_weight_decay_shrinks_the_gamma_models_weights(
         return float(sum(jnp.sum(jnp.square(leaf)) for leaf in leaves))
 
     assert squared_norm(100.0) < squared_norm(0.0)
+
+
+def test_staged_mcd_posterior_stage_does_not_train_the_mean_network(
+    cmapss_run: ModuleType,
+    tiny_cmapss_config: Any,
+    synthetic_windows: Callable[..., tuple[np.ndarray, np.ndarray]],
+) -> None:
+    config = dataclasses.replace(tiny_cmapss_config, dropout_rate=0.2, num_draws=8)
+    rng = np.random.default_rng(5)
+    train_windows, train_targets = synthetic_windows(rng, 32)
+    validation_windows, validation_targets = synthetic_windows(rng, 8)
+    mean_model, state = cmapss_run.train_mean_model(
+        train_windows,
+        train_targets,
+        validation_windows,
+        validation_targets,
+        config,
+        event_sinks=(),
+        dropout_rate=config.dropout_rate,
+    )
+    cmapss_run.train_gamma_model(
+        state, train_windows, train_targets, config, event_sinks=()
+    )
+
+    predictive = cmapss_run.build_staged_mcd_posterior(
+        state, train_windows, train_targets, config, event_sinks=()
+    )
+
+    trained = jax.tree.leaves(nnx.state(mean_model, nnx.Param))
+    posterior = jax.tree.leaves(state.posterior_state)
+    assert len(posterior) == len(trained)
+    for posterior_leaf, trained_leaf in zip(posterior, trained, strict=True):
+        np.testing.assert_array_equal(posterior_leaf, trained_leaf)
+    draws = predictive(jnp.asarray(train_windows, dtype=jnp.float32)).draws
+    assert draws.shape[0] == config.num_draws
+    # Dropout stays active at prediction: the mask sets give distinct draws.
+    assert len({float(draw.sum()) for draw in draws}) > 1
 
 
 def test_cmapss_config_has_no_predictive_sample_count(cmapss_run: ModuleType) -> None:

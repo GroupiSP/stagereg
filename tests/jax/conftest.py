@@ -152,6 +152,7 @@ def tiny_cmapss_config(cmapss_run: ModuleType) -> Any:
         kernel_size=3,
         mean_epochs=2,
         variance_epochs=2,
+        gamma_hidden_channels=2,
         joint_epochs=2,
         seed=3,
     )

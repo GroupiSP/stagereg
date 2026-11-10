@@ -138,10 +138,12 @@ uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5
 ```
 
 Add `--posterior-stage` to compare four models: `joint`, a joint MC-Dropout
-model (`joint+mcd`) trained with dropout active from a random initialization,
+model (`joint+mcd`) that fine-tunes the `joint` network with dropout active,
 `staged`, and a staged MC-Dropout model (`staged+mcd`) whose
 [posterior stage](posterior-stage.md) fine-tunes the staged mean network with
-`MCDropout`. The MC-Dropout models are scored on their exact posterior
+`MCDropout` before its Gamma variance is re-fitted to the fine-tuned mean. The
+staged models' Gamma network is narrower than the mean network and trained
+with weight decay. The MC-Dropout models are scored on their exact posterior
 predictive, and their figure rows show a total and an epistemic 95% band.
 
 ```bash

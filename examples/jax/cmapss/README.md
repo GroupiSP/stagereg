@@ -136,11 +136,18 @@ eval mode, so every consumer scores the same model in the same mode.
 `evaluate_test_metrics` scores any model whose output is a Gaussian, the
 staged model included. The mean and Gamma training functions take their
 event sinks as a parameter, so each entry point decides how verbose
-training is. Next to them sit the MC-Dropout helpers `compare.py` uses:
+training is. The Gamma network is narrower than the mean network
+(`gamma_hidden_channels`, default 4 against `hidden_channels` 16) and trains
+with AdamW weight decay (`gamma_weight_decay`, default 0.1): its targets are
+the mean's in-sample squared residuals, which understate the held-out error,
+and a full-width, unregularized Gamma network overfits them into a spiky,
+overconfident variance (see [the variance network](#the-variance-network)).
+Next to them sit the MC-Dropout helpers `compare.py` uses:
 `train_joint_mcd_model` and the predictive wrapper `McDropoutPredictive`
-(built by `build_mc_dropout_predictive`), and the staged posterior-stage
-runner `train_staged_mcd_posterior`, which returns a
-`PosteriorStagePredictive`. The script itself does not use them.
+(built by `build_mc_dropout_predictive`), the staged posterior-stage runner
+`train_staged_mcd_posterior`, which returns a `PosteriorStagePredictive`,
+and `refit_gamma_to_posterior_mean`, which re-fits the Gamma network to that
+predictive's mean. The script itself does not use them.
 
 Run it with:
 
@@ -221,9 +228,9 @@ figure-row order:
 | Column | Model | How it is trained | Predictive distribution |
 | --- | --- | --- | --- |
 | `joint` | joint model | as without the flag, no dropout | Gaussian |
-| `joint+mcd` | joint MC-Dropout | Gaussian-head CNN with dropout active, from a random initialization, on the Gaussian NLL; early-stopped on its MC mixture's validation NLL | posterior predictive, each draw with its own aleatoric variance |
+| `joint+mcd` | joint MC-Dropout | the `joint` network, fine-tuned with dropout active on the Gaussian NLL under the posterior stage's prior; early-stopped on its MC mixture's validation NLL | posterior predictive, each draw with its own aleatoric variance |
 | `staged` | staged model | as without the flag | Gaussian |
-| `staged+mcd` | staged MC-Dropout | posterior stage (`MCDropout`) fine-tuning the `staged` mean network with dropout active; early-stopped on the validation mixture NLL | posterior predictive, all draws sharing the Gamma stage's aleatoric variance |
+| `staged+mcd` | staged MC-Dropout | posterior stage (`MCDropout`) fine-tuning the `staged` mean network with dropout active; early-stopped on the validation mixture NLL; then the Gamma network re-fitted to the posterior predictive's mean | posterior predictive, all draws sharing the re-fitted aleatoric variance |
 
 `joint` and `staged` are the same models, with the same scores, as without
 the flag. All four are scored on RMSE, 95% coverage, closed-form CRPS and
@@ -245,11 +252,20 @@ takes about a minute on a laptop CPU, against about 20 seconds without.
 
 ##### How the MC-Dropout models are trained
 
-`joint+mcd` is a Gaussian-head CNN at `dropout_rate`, trained from a random
-initialization on the Gaussian NLL with dropout active and no prior term. It
-is validated after every epoch on the NLL of its MC mixture and stops early
-after `early_stopping_patience` epochs without improvement, with
-`joint_mcd_epochs` as the maximum; the best epoch's parameters are kept. Its
+Both MC-Dropout models fine-tune a network first trained with dropout off,
+so the joint and staged paths differ only in single against separate
+training.
+
+`joint+mcd` reuses the `joint` column's trained network from the same seed:
+a Gaussian-head CNN at `dropout_rate` is warm-started from it and fine-tuned
+on the Gaussian NLL with dropout active, at `mcd_learning_rate`, under the
+posterior stage's isotropic Gaussian prior at `prior_precision`. The prior
+enters as the L2 penalty's gradient `prior_precision / n_train * w`, added
+before Adam: the NLL is averaged over a batch where the posterior stage sums
+the log-likelihood over the training set. It is validated after every epoch
+on the NLL of its MC mixture and stops early after `early_stopping_patience`
+epochs without improvement, with `joint_mcd_epochs` (the same 20 as
+`posterior_epochs`) as the maximum; the best epoch's parameters are kept. Its
 prediction evaluates the network under `num_draws` dropout-mask sets, each
 one applied to the whole batch, and keeps each draw's own mean and aleatoric
 variance: a posterior predictive scored on its exact mixture. The masks come
@@ -258,16 +274,21 @@ figure use the same draws.
 
 `staged+mcd` reuses the `staged` column's trained mean and Gamma variance
 networks from the same seed, without retraining, so the difference between
-`staged` and `staged+mcd` is the posterior stage alone. A `PosteriorStage`
+`staged` and `staged+mcd` is the posterior stage and the variance re-fit
+alone. A `PosteriorStage`
 with the `MCDropout` inference method fine-tunes the whole mean network,
 rebuilt with dropout active at `dropout_rate`, at `mcd_learning_rate` under
 an isotropic Gaussian prior at `prior_precision`; the Gamma stage's
 aleatoric variance is held fixed. It runs at most `posterior_epochs` epochs,
 stops early on the validation mixture NLL after `early_stopping_patience`
-epochs without improvement, and keeps the best epoch. Its prediction is the
-stage's posterior predictive with `num_draws` draws under the same fixed,
-seed-derived key it was validated under, every draw sharing the one
-aleatoric variance.
+epochs without improvement, and keeps the best epoch. The fine-tune moves the
+mean, so the Gamma variance it held fixed was fitted to the residuals of a
+mean that no longer exists: `refit_gamma_to_posterior_mean` then trains a
+fresh Gamma network, from the same initialization and with the same width
+and weight decay, on the squared residuals of the posterior predictive's
+mean. The prediction is the stage's posterior predictive with `num_draws`
+draws under the same fixed, seed-derived key it was validated under, every
+draw sharing the re-fitted aleatoric variance.
 
 ##### Reading the total and epistemic bands
 
@@ -295,15 +316,20 @@ The MC-Dropout settings live in `CmapssConfig` (`run.py`):
 | Field | Default | Source |
 | --- | --- | --- |
 | `dropout_rate` | 0.1 | fixed by the spec (#173) |
-| `joint_mcd_epochs` | 60 | fixed by the spec: about the staged path's total epoch budget |
+| `joint_mcd_epochs` | 20 | the same fine-tune budget as `posterior_epochs` |
 | `mcd_learning_rate` | 1e-3 | tuned, below; shared by both MC-Dropout models |
 | `posterior_epochs` | 20 | tuned, below |
 | `prior_precision` | 1.0 | tuned, below |
 | `num_draws` | 100 | fixed by the spec |
 | `early_stopping_patience` | 5 | fixed by the spec |
+| `gamma_hidden_channels` | 4 | chosen, [below](#the-variance-network) |
+| `gamma_weight_decay` | 0.1 | chosen, [below](#the-variance-network) |
 
 The three tuned values come from a grid on real FD001, seeds 0 and 1, with
-every other setting at its default:
+every other setting at its default. The grid predates the variance-network
+changes and the matched warm starts: `joint+mcd` then trained from a random
+initialization for up to 60 epochs with no prior, and `staged+mcd` held a
+full-width, unregularized Gamma variance with no re-fit.
 
 - `joint+mcd`: `mcd_learning_rate` in {1e-4, 3e-4, 1e-3, 3e-3}.
 - `staged+mcd`: `mcd_learning_rate` in {1e-4, 3e-4, 1e-3, 3e-3} ×
@@ -354,28 +380,61 @@ How the values were chosen:
   reached its best validation NLL within its first four epochs and stopped
   after at most ten, so 20 is a cap that early stopping always reaches
   first.
-- **Spec-fixed values.** None is broken, so none was changed. Note that at
-  `mcd_learning_rate = 1e-3` `joint+mcd` uses its whole 60-epoch budget
-  (best epoch 56 of 60): its early stopping does not fire, and more epochs
-  would likely improve it a little. The budget is kept at about the staged
-  path's total on purpose, so that the comparison holds the training budget
-  fixed.
+- **Spec-fixed values.** None is broken, so none was changed. In the grid,
+  at `mcd_learning_rate = 1e-3`, `joint+mcd` used its whole 60-epoch budget
+  from a random initialization (best epoch 56 of 60). It now fine-tunes the
+  `joint` network instead, like the posterior stage fine-tunes the `staged`
+  mean, so it shares the posterior stage's 20-epoch cap.
 
 Reproduce the grid by calling `train_joint_mcd_model` and
 `train_staged_mcd_posterior` (`run.py`) with `dataclasses.replace`-d
 configurations and an event sink that records the `validation_end`
-events. The chosen defaults then give, with `--seeds 2 --posterior-stage`:
+events. The current defaults give, with `--seeds 5 --posterior-stage`:
 
 ```text
-FD001 test metrics over 2 seeds (mean ± std):
-                             joint         joint+mcd            staged        staged+mcd
-RMSE              44.9407 ± 8.1235  29.4997 ± 0.6067  25.1384 ± 2.1268  23.4862 ± 2.8211
-95% coverage       0.9900 ± 0.0000   0.9650 ± 0.0071   0.8900 ± 0.0000   0.9500 ± 0.0283
-closed-form CRPS  25.3361 ± 4.2376  15.5427 ± 0.6044  14.2690 ± 0.7339  13.3144 ± 1.3830
-NLL                5.2000 ± 0.1457   4.6037 ± 0.0607   4.6679 ± 0.0405   4.5593 ± 0.0982
+FD001 test metrics over 5 seeds (mean ± std):
+                              joint          joint+mcd             staged         staged+mcd
+RMSE              61.0066 ± 19.9944   31.1243 ± 1.5233   25.3996 ± 1.2857   27.1698 ± 1.2162
+95% coverage        0.9740 ± 0.0219    0.9900 ± 0.0000    0.9880 ± 0.0084    0.9860 ± 0.0055
+closed-form CRPS   33.2752 ± 9.4750   17.0551 ± 0.7183   14.2778 ± 0.3020   14.5206 ± 0.5125
+NLL                 5.4207 ± 0.2507    4.7619 ± 0.0295    4.6213 ± 0.0223    4.5785 ± 0.0233
 ```
 
-On this run the posterior stage improves every metric of `staged`, bringing
-its coverage from 0.89 to the nominal 0.95. `joint+mcd` is far better than
-`joint`, whose unscaled-target training is unstable across seeds, but stays
-behind both staged models on RMSE and CRPS.
+Both staged models beat `joint+mcd` on every metric, and `staged+mcd` has
+the best NLL. `joint+mcd` is far better than `joint`, whose
+unscaled-target training is unstable across seeds. Every model over-covers
+the test split, whose one window per unit sits late in life, where the
+variance is smallest; the variance is calibrated over whole lifetimes
+instead, see below.
+
+#### The variance network
+
+The test split holds only each unit's last window, so it says little about
+early-life uncertainty. The held-out validation units span whole lifetimes,
+and on them a Gamma network as wide as the mean network (16 channels,
+plain Adam) was overconfident: its 95% coverage was 0.96 on the training
+windows it was fitted on but 0.82 on the validation windows, whose mean
+squared residual is 1.31 times the training one. In-sample residuals
+understate the held-out error, and a flexible Gamma network fits them
+closely, giving a spiky, overconfident variance.
+
+Shrinking it fixes most of that. Over 5 seeds, on the validation windows
+(`staged+mcd` with the full-width Gamma network and no re-fit, against the
+defaults):
+
+| Gamma network | val NLL | val 95% coverage | test NLL |
+| --- | --- | --- | --- |
+| 16 channels, Adam, no re-fit | 5.433 ± 0.182 | 0.851 | 4.569 ± 0.053 |
+| 4 channels, AdamW 0.1, re-fit | 4.939 ± 0.047 | 0.916 | 4.579 ± 0.021 |
+
+With weight decay alone, at 16 channels, the validation NLL of the `staged`
+Gamma variance went from 5.62 (no decay) to 5.57, 5.35 and 5.04 at decays
+0.01, 0.1 and 1, and its log-variance roughness along a unit's lifetime
+from 0.17 to 0.02; at decay 1 the band is almost constant and the test
+coverage 0.99. The defaults narrow the network and keep the decay at 0.1.
+
+What no variance network fixes is the mean's bias on long lifetimes: past a
+true RUL of 200 the mean levels off around 150, and the validation coverage
+there is 0.38 for `staged+mcd` (0.50 for a from-scratch joint MC-Dropout
+model). That error is absent from the training residuals the variance is
+fitted to.

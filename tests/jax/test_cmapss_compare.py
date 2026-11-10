@@ -174,12 +174,42 @@ def test_staged_mcd_starts_from_the_staged_models_networks(
     predictive = staged_mcd.model(windows)
     for draw in predictive.draws:
         np.testing.assert_allclose(draw, gaussian.loc, rtol=1e-5, atol=1e-5)
-    # The Gamma stage's aleatoric variance is held fixed and shared by every draw.
+    # Re-fitted to an unchanged mean from the same initialization, the Gamma
+    # network reproduces the staged model's variance, shared by every draw.
     np.testing.assert_allclose(
         np.broadcast_to(predictive.aleatoric_variance, gaussian.scale.shape),
         gaussian.scale**2,
         rtol=1e-5,
     )
+
+
+def test_joint_mcd_starts_from_the_joint_models_network(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    import dataclasses
+
+    import numpy as np
+
+    # Without dropout and with a negligible step, the fine-tune cannot move
+    # off its warm start: every draw is the joint model's Gaussian.
+    config = dataclasses.replace(mcd_config, dropout_rate=0.0, mcd_learning_rate=1e-12)
+    prepared = synthetic_prepared_data()
+
+    (result,) = cmapss_compare.compare_models(
+        prepared, config, seeds=1, posterior_stage=True
+    )
+
+    joint, joint_mcd, _, _ = result.models
+    windows = prepared.test_windows
+    gaussian = joint.model(windows)
+    predictive = joint_mcd.model(windows)
+    for draw, variance in zip(
+        predictive.draws, predictive.aleatoric_variance, strict=True
+    ):
+        np.testing.assert_allclose(draw, gaussian.loc, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(variance, gaussian.scale**2, rtol=1e-5)
 
 
 def test_compare_models_posterior_stage_leaves_the_baselines_unchanged(

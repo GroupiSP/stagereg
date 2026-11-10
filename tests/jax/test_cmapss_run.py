@@ -212,7 +212,7 @@ def test_cmapss_config_accepts_the_mc_dropout_defaults(cmapss_run: ModuleType) -
     config = cmapss_run.CmapssConfig()
 
     assert config.dropout_rate == 0.1
-    assert config.joint_mcd_epochs == 60
+    assert config.joint_mcd_epochs == config.posterior_epochs == 20
     assert config.num_draws == 100
     assert config.early_stopping_patience == 5
     assert config.mcd_learning_rate > 0.0
@@ -282,6 +282,86 @@ def test_cmapss_config_rejects_a_non_positive_prior_precision(
 ) -> None:
     with pytest.raises(ValueError, match="prior_precision"):
         cmapss_run.CmapssConfig(prior_precision=precision)
+
+
+def test_cmapss_config_gives_the_gamma_model_a_narrow_weight_decayed_default(
+    cmapss_run: ModuleType,
+) -> None:
+    config = cmapss_run.CmapssConfig()
+
+    assert config.gamma_hidden_channels < config.hidden_channels
+    assert config.gamma_weight_decay > 0.0
+
+
+@given(channels=st.integers(max_value=0))
+def test_cmapss_config_rejects_non_positive_gamma_hidden_channels(
+    cmapss_run: ModuleType, channels: int
+) -> None:
+    with pytest.raises(ValueError, match="gamma_hidden_channels"):
+        cmapss_run.CmapssConfig(gamma_hidden_channels=channels)
+
+
+@given(weight_decay=st.floats(max_value=0.0, exclude_max=True, allow_nan=False))
+def test_cmapss_config_rejects_a_negative_gamma_weight_decay(
+    cmapss_run: ModuleType, weight_decay: float
+) -> None:
+    with pytest.raises(ValueError, match="gamma_weight_decay"):
+        cmapss_run.CmapssConfig(gamma_weight_decay=weight_decay)
+
+
+def _train_gamma(
+    cmapss_run: ModuleType,
+    config: Any,
+    synthetic_windows: Callable[..., tuple[np.ndarray, np.ndarray]],
+) -> Any:
+    rng = np.random.default_rng(5)
+    train_windows, train_targets = synthetic_windows(rng, 32)
+    validation_windows, validation_targets = synthetic_windows(rng, 8)
+    _, state = cmapss_run.train_mean_model(
+        train_windows,
+        train_targets,
+        validation_windows,
+        validation_targets,
+        config,
+        event_sinks=(),
+    )
+    return cmapss_run.train_gamma_model(
+        state, train_windows, train_targets, config, event_sinks=()
+    )
+
+
+def test_train_gamma_model_is_gamma_hidden_channels_wide(
+    cmapss_run: ModuleType,
+    tiny_cmapss_config: Any,
+    synthetic_windows: Callable[..., tuple[np.ndarray, np.ndarray]],
+) -> None:
+    from model import Cnn1DGammaModel
+
+    config = dataclasses.replace(tiny_cmapss_config, gamma_hidden_channels=3)
+
+    trained = _train_gamma(cmapss_run, config, synthetic_windows)
+
+    reference = Cnn1DGammaModel(
+        3, hidden_channels=3, kernel_size=config.kernel_size, rngs=nnx.Rngs(0)
+    )
+    shapes = jax.tree.map(jnp.shape, nnx.state(trained, nnx.Param))
+    assert shapes == jax.tree.map(jnp.shape, nnx.state(reference, nnx.Param))
+
+
+def test_gamma_weight_decay_shrinks_the_gamma_models_weights(
+    cmapss_run: ModuleType,
+    tiny_cmapss_config: Any,
+    synthetic_windows: Callable[..., tuple[np.ndarray, np.ndarray]],
+) -> None:
+    def squared_norm(weight_decay: float) -> float:
+        config = dataclasses.replace(
+            tiny_cmapss_config, gamma_weight_decay=weight_decay
+        )
+        trained = _train_gamma(cmapss_run, config, synthetic_windows)
+        leaves = jax.tree.leaves(nnx.state(trained, nnx.Param))
+        return float(sum(jnp.sum(jnp.square(leaf)) for leaf in leaves))
+
+    assert squared_norm(100.0) < squared_norm(0.0)
 
 
 def test_cmapss_config_has_no_predictive_sample_count(cmapss_run: ModuleType) -> None:

@@ -77,7 +77,7 @@ from stagereg.core.metric_registry import (
 )
 from stagereg.core.protocols import LoaderFactory
 from stagereg.core.tracking import EventSink, TrainingEvent
-from stagereg.core.types import Batch, TrainingState
+from stagereg.core.types import Batch, ParameterRole, StageState, TrainingState
 from stagereg.jax import (
     GammaVarianceStage,
     GaussianPredictor,
@@ -118,18 +118,24 @@ class CmapssConfig:
         validation_fraction: Fraction of training units held out for
             validation, grouped by whole unit ID.
         batch_size: Number of windows per mini-batch.
-        hidden_channels: Convolutional channel width of the mean and Gamma
-            models.
+        hidden_channels: Convolutional channel width of the mean, joint and
+            MC-Dropout models.
         kernel_size: Convolution kernel width along the time axis.
         learning_rate: Adam learning rate for both stages.
         mean_epochs: Number of Stage-1 mean-model training epochs.
         variance_epochs: Number of Stage-2 Gamma-model training epochs.
+        gamma_hidden_channels: Convolutional channel width of the Gamma
+            model, kept below `hidden_channels` so the variance does not
+            overfit the in-sample squared residuals.
+        gamma_weight_decay: AdamW decoupled weight decay of the Gamma
+            model's training, which shrinks it toward a constant variance.
         joint_epochs: Number of training epochs for the joint model of the
             staged-vs-joint comparison.
         dropout_rate: Dropout rate of the MC-Dropout models' backbones, in
             `[0, 1)`.
-        joint_mcd_epochs: Maximum number of training epochs of the joint
-            MC-Dropout model, which stops early on its validation NLL.
+        joint_mcd_epochs: Maximum number of MC-Dropout fine-tuning epochs of
+            the joint MC-Dropout model, which stops early on its validation
+            NLL; matches `posterior_epochs`.
         mcd_learning_rate: Adam learning rate of the MC-Dropout training,
             shared by both MC-Dropout models; tuned on FD001 (see the
             example's README).
@@ -137,8 +143,9 @@ class CmapssConfig:
             model's posterior stage, which stops early on its validation
             mixture NLL; tuned on FD001.
         prior_precision: Precision of the isotropic Gaussian prior over the
-            mean network's parameters in the staged MC-Dropout model's
-            posterior stage; tuned on FD001.
+            fine-tuned network's parameters, in the staged MC-Dropout
+            model's posterior stage and the joint MC-Dropout model's
+            fine-tune alike; tuned on FD001.
         num_draws: Number of dropout-mask sets an MC-Dropout model's posterior
             predictive mixes.
         early_stopping_patience: Number of epochs without a better validation
@@ -154,9 +161,11 @@ class CmapssConfig:
     learning_rate: float = 1e-3
     mean_epochs: int = 20
     variance_epochs: int = 20
+    gamma_hidden_channels: int = 4
+    gamma_weight_decay: float = 0.1
     joint_epochs: int = 20
     dropout_rate: float = 0.1
-    joint_mcd_epochs: int = 60
+    joint_mcd_epochs: int = 20
     mcd_learning_rate: float = 1e-3
     posterior_epochs: int = 20
     prior_precision: float = 1.0
@@ -169,13 +178,18 @@ class CmapssConfig:
 
         Raises:
             ValueError: If sizes, epochs, draws, patience, the MC-Dropout
-                learning rate or the prior precision are not positive, the validation fraction is
+                learning rate or the prior precision are not positive, the
+                Gamma weight decay is negative, the validation fraction is
                 not in (0, 1), or the dropout rate is not in [0, 1).
         """
         if self.window_length <= 0 or self.batch_size <= 0:
             raise ValueError("window_length and batch_size must be positive.")
         if self.hidden_channels <= 0 or self.kernel_size <= 0:
             raise ValueError("hidden_channels and kernel_size must be positive.")
+        if self.gamma_hidden_channels <= 0:
+            raise ValueError("gamma_hidden_channels must be positive.")
+        if not self.gamma_weight_decay >= 0.0:
+            raise ValueError("gamma_weight_decay must be non-negative.")
         if self.mean_epochs <= 0 or self.variance_epochs <= 0:
             raise ValueError("mean_epochs and variance_epochs must be positive.")
         if self.joint_epochs <= 0:
@@ -277,12 +291,14 @@ def build_supervised_training_setup[ModelT: nnx.Module](
     *,
     dropout_rate: float = 0.0,
     learning_rate: float | None = None,
+    weight_decay: float = 0.0,
 ) -> SupervisedTrainingSetup[ModelT]:
     """Initialize a 1D-CNN model and its optimizer and loaders from `config`.
 
     The key `config.seed` is split into the model's initialization key and
     the training key. The model is built with the configured channel width
-    and kernel size, and optimized with Adam at the configured learning rate.
+    and kernel size, and optimized with Adam at the configured learning rate,
+    after an optional L2 penalty's gradient.
     Dropout adds no parameters, so the initial parameters do not depend on
     `dropout_rate`.
 
@@ -300,6 +316,8 @@ def build_supervised_training_setup[ModelT: nnx.Module](
             dropout.
         learning_rate: Adam learning rate; `None`, the default, uses
             `config.learning_rate`.
+        weight_decay: Coefficient of the L2 penalty's gradient added before
+            Adam's rescaling; 0, the default, adds none.
 
     Returns:
         The model, its optimizer, the training key, and both loaders.
@@ -316,7 +334,12 @@ def build_supervised_training_setup[ModelT: nnx.Module](
         learning_rate = config.learning_rate
     return SupervisedTrainingSetup(
         model=model,
-        optimizer=create_optimizer(model, optax.adam(learning_rate)),
+        optimizer=create_optimizer(
+            model,
+            optax.chain(
+                optax.add_decayed_weights(weight_decay), optax.adam(learning_rate)
+            ),
+        ),
         rng_key=rng_key,
         train_loader=make_window_loader(
             train_windows, train_targets, batch_size=config.batch_size
@@ -395,6 +418,10 @@ def train_gamma_model(
 
     Consumes the frozen, already-trained Stage-1 mean model's squared
     residuals on the training split, per `GammaVarianceStage`'s contract.
+    The network is `config.gamma_hidden_channels` wide and trained with
+    AdamW at `config.gamma_weight_decay`: in-sample residuals understate the
+    held-out error, and a full-width, unregularized Gamma network overfits
+    them into a spiky, overconfident variance.
 
     Args:
         state: The `MEAN_READY` staged training state produced by
@@ -413,11 +440,14 @@ def train_gamma_model(
     model_key = seed_stream_key(config, GAMMA_NETWORK_STREAM)
     model = Cnn1DGammaModel(
         n_sensors,
-        hidden_channels=config.hidden_channels,
+        hidden_channels=config.gamma_hidden_channels,
         kernel_size=config.kernel_size,
         rngs=nnx.Rngs(model_key),
     )
-    optimizer = create_optimizer(model, optax.adam(config.learning_rate))
+    optimizer = create_optimizer(
+        model,
+        optax.adamw(config.learning_rate, weight_decay=config.gamma_weight_decay),
+    )
     train_loader = make_window_loader(
         train_windows, train_targets, batch_size=config.batch_size
     )
@@ -631,6 +661,7 @@ def _fixed_order_loader(
 
 
 def train_joint_mcd_model(
+    joint_model: Cnn1DGaussianModel,
     train_windows: np.ndarray,
     train_targets: np.ndarray,
     validation_windows: np.ndarray,
@@ -639,25 +670,32 @@ def train_joint_mcd_model(
     *,
     event_sinks: Sequence[EventSink],
 ) -> Cnn1DGaussianModel:
-    """Train a joint MC-Dropout network on the Gaussian NLL with dropout active.
+    """Fine-tune a trained joint model into a joint MC-Dropout network.
 
-    A Gaussian-head CNN at `config.dropout_rate`, from a random
-    initialization, trained with `run_supervised` at
-    `config.mcd_learning_rate` and no prior term. After every epoch it is
-    validated on the NLL of its MC mixture (`McDropoutPredictive` under
-    `mc_dropout_draw_key`), and it stops once that NLL has not improved for
-    `config.early_stopping_patience` epochs, after at most
-    `config.joint_mcd_epochs`.
+    The joint counterpart of the staged MC-Dropout model's posterior stage:
+    both start from a network trained with dropout off. A Gaussian-head CNN
+    at `config.dropout_rate` is warm-started from `joint_model`'s parameters
+    and fine-tuned on the Gaussian NLL with dropout active, with `run_supervised`
+    at `config.mcd_learning_rate`, under the posterior stage's isotropic
+    Gaussian prior at `config.prior_precision`. The prior enters as the L2
+    penalty's gradient `prior_precision / n_train * w` before Adam, since the
+    NLL is averaged over a batch rather than summed over the training set.
+    After every epoch it is validated on the NLL of its MC mixture
+    (`McDropoutPredictive` under `mc_dropout_draw_key`), and it stops once
+    that NLL has not improved for `config.early_stopping_patience` epochs,
+    after at most `config.joint_mcd_epochs`.
 
     Args:
+        joint_model: The trained joint model, with dropout off, to start
+            from; it is not modified.
         train_windows: Training sliding windows, shape `(n_train,
             window_length, n_sensors)`.
         train_targets: Training RUL targets, shape `(n_train,)`.
         validation_windows: Held-out validation windows, same layout as
             `train_windows`.
         validation_targets: Held-out validation RUL targets.
-        config: Example configuration; `config.seed` sets the
-            initialization, the training masks and the validation draws.
+        config: Example configuration; `config.seed` sets the training masks
+            and the validation draws.
         event_sinks: Sinks notified of the training events; pass none to
             train silently.
 
@@ -674,7 +712,11 @@ def train_joint_mcd_model(
         config,
         dropout_rate=config.dropout_rate,
         learning_rate=config.mcd_learning_rate,
+        weight_decay=config.prior_precision / train_windows.shape[0],
     )
+    # Adam's state starts at zero whatever the parameters, so overwriting the
+    # freshly initialized ones after building the optimizer is safe.
+    nnx.update(setup.model, nnx.state(joint_model, nnx.Param))
     loss = make_supervised_loss(NegativeLogLikelihoodLoss())
     state = initialize_training_state(
         setup.model, setup.optimizer, rng_key=setup.rng_key
@@ -814,6 +856,85 @@ def train_staged_mcd_posterior(
     stage.prepare(state)
     stage.train(state)
     return PosteriorStagePredictive(stage, key=key)
+
+
+class PredictiveMean(nnx.Module, pytree=False):
+    """The posterior predictive's mean, as a deterministic mean model."""
+
+    def __init__(self, predictive: PosteriorStagePredictive) -> None:
+        """Wrap a trained posterior stage's predictive.
+
+        Args:
+            predictive: The posterior predictive under its fixed key.
+        """
+        self.predictive: PosteriorStagePredictive = predictive
+
+    def __call__(self, inputs: jax.Array) -> jax.Array:
+        """Return the mixture mean, shape ``(batch, 1)``."""
+        return self.predictive(inputs).mean()
+
+
+class RefitVariancePredictive(nnx.Module, pytree=False):
+    """A posterior predictive's draws under a re-fitted Gamma variance."""
+
+    def __init__(
+        self, predictive: PosteriorStagePredictive, variance_model: Cnn1DGammaModel
+    ) -> None:
+        """Pair the posterior's draws with the re-fitted variance network.
+
+        Args:
+            predictive: The posterior predictive under its fixed key.
+            variance_model: The Gamma network re-fitted to the predictive
+                mean's squared residuals; cloned and put in eval mode.
+        """
+        self.predictive: PosteriorStagePredictive = predictive
+        variance_model = nnx.clone(variance_model)
+        variance_model.eval()
+        self.variance_model: Cnn1DGammaModel = variance_model
+
+    def __call__(self, inputs: jax.Array) -> PosteriorPredictive:
+        """Return the draws, all sharing the re-fitted aleatoric variance."""
+        return PosteriorPredictive(
+            draws=self.predictive(inputs).draws,
+            aleatoric_variance=self.variance_model(inputs).mean(),
+        )
+
+
+def refit_gamma_to_posterior_mean(
+    predictive: PosteriorStagePredictive,
+    train_windows: np.ndarray,
+    train_targets: np.ndarray,
+    config: CmapssConfig,
+    *,
+    event_sinks: Sequence[EventSink],
+) -> RefitVariancePredictive:
+    """Re-fit the Gamma network to the fine-tuned posterior's mean.
+
+    The posterior stage moves the mean but holds the Gamma variance it was
+    given fixed, so that variance was fit to the residuals of the mean
+    before the fine-tune. This trains a fresh Gamma network, from the same
+    initialization, on the squared residuals of the posterior predictive's
+    mean, through a new `MEAN_READY` state, and pairs it with the
+    posterior's draws.
+
+    Args:
+        predictive: The trained posterior stage's predictive.
+        train_windows: Training sliding windows.
+        train_targets: Training RUL targets.
+        config: Example configuration.
+        event_sinks: Sinks notified of the Gamma stage's training events.
+
+    Returns:
+        The posterior's draws under the re-fitted aleatoric variance.
+    """
+    state = TrainingState(rng_state=seed_stream_key(config, GAMMA_NETWORK_STREAM))
+    state.register_component("mean_model", PredictiveMean(predictive))
+    state.parameter_roles["mean_model"] = ParameterRole.MEAN
+    state.lifecycle_state = StageState.MEAN_READY
+    variance_model = train_gamma_model(
+        state, train_windows, train_targets, config, event_sinks=event_sinks
+    )
+    return RefitVariancePredictive(predictive, variance_model)
 
 
 def build_composite_model(

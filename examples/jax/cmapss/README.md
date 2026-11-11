@@ -317,27 +317,31 @@ The MC-Dropout settings live in `CmapssConfig` (`run.py`):
 | `num_draws` | 100 | fixed by the spec |
 | `gamma_hidden_channels` | 4 | chosen, [below](#the-variance-network) |
 | `gamma_weight_decay` | 0.1 | chosen, [below](#the-variance-network) |
+| `proxy_variance_floor_cycles` | 5.0 | chosen, see [`--proxy-variance`](#--proxy-variance-a-proxy-variance-mean-stage) |
 
 Every other setting, epochs and learning rate included, is the baseline's.
-The current defaults give, with `--seeds 5 --posterior-stage`:
+The current defaults give, with `--seeds 5 --posterior-stage --proxy-variance`:
 
 ```text
 FD001 test metrics over 5 seeds (mean ± std):
-                              joint          joint+mcd             staged         staged+mcd
-RMSE              61.0066 ± 19.9944  49.1285 ± 12.0127   25.3996 ± 1.2857   27.3938 ± 2.0976
-95% coverage        0.9740 ± 0.0219    0.9960 ± 0.0055    0.9880 ± 0.0084    0.9780 ± 0.0110
-closed-form CRPS   33.2752 ± 9.4750   26.8821 ± 6.4763   14.2778 ± 0.3020   15.0790 ± 1.0761
-NLL                 5.4207 ± 0.2507    5.2065 ± 0.2426    4.6213 ± 0.0223    4.6531 ± 0.0632
+                             joint         joint+mcd            staged        staged+mcd  staged+mcd+proxy
+RMSE              30.9961 ± 1.9310  27.9156 ± 3.3373  35.1783 ± 1.4871  30.7421 ± 2.1824  26.1984 ± 1.4167
+95% coverage       0.5340 ± 0.0695   0.8280 ± 0.0327   0.4660 ± 0.0493   0.7340 ± 0.0182   0.7920 ± 0.0526
+closed-form CRPS  18.8358 ± 1.8020  15.1768 ± 1.5091  22.4508 ± 0.7821  17.4228 ± 1.5317  14.6956 ± 0.6630
+NLL                9.8387 ± 1.0811   4.8459 ± 0.1354   8.9416 ± 1.0310   5.3339 ± 0.1887   5.1286 ± 0.2107
 ```
 
-Both staged models beat both joint models on every metric. Dropout
-improves the joint model on average but does not cure the instability of
-its training on unscaled targets: `joint+mcd` varies as much across seeds,
-and in the figure its mean rises again near the end of life. `staged+mcd`
-is close to `staged`, slightly worse on average, with a larger spread
-across seeds. Every model over-covers the test split, whose one window per
-unit sits late in life, where the variance is smallest; the variance is
-calibrated over whole lifetimes instead, see below.
+Dropout improves both baselines on every metric: `joint+mcd` over `joint`
+and `staged+mcd` over `staged`. `staged+mcd+proxy` has the best RMSE and
+CRPS, and beats `staged+mcd` on every metric. `joint+mcd` keeps the best
+NLL and coverage. In the figure, the proxy model's epistemic band narrows
+over the last few dozen cycles of each unit's life and stays wide early in
+life. The `staged+mcd` band stays wide up to failure.
+
+Every model under-covers the test split, whose one window per unit sits
+late in life. The Gaussian baselines under-cover worst, at about half the
+nominal 95%, which drives their NLL to around 9–10. The variance is fitted
+on in-sample training residuals; see below.
 
 #### The variance network
 

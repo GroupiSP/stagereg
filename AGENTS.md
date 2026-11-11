@@ -9,8 +9,8 @@ The package manager is **`uv`**, not pip. Every Python command runs through it: 
 `uv run pre-commit run --all-files`. Dev setup is `uv sync --extra jax --group dev --group docs`
 then `uv run pre-commit install`. The `jax` extra is required because `uv run pytest` also runs the
 snippets in `README.md` and `docs_site/`, which import JAX, Flax and Optax; the docs site
-(`docs_site/`, built by `mkdocs.yml`) needs the `docs` group as well. Examples have their own dependency groups (`example-cmapss`,
-`example-tracking`); install one with `uv sync --group <name>`.
+(`docs_site/`, built by `mkdocs.yml`) needs the `docs` group as well. The tracking example has its
+own dependency group; install it with `uv sync --group example-tracking`.
 
 ## Verification gate
 

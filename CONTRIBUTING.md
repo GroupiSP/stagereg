@@ -42,7 +42,7 @@ superfences brace form, and link to the runnable example:
 
 ````markdown
 ```{.python notest}
-result = run_cmapss_example()
+result = run_tracking_example()
 ```
 ````
 

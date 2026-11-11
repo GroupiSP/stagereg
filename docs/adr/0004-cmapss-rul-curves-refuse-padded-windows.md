@@ -1,5 +1,7 @@
 # RUL curves refuse padded windows, while training accepts them
 
+_Status: the CMAPSS example has moved out of this repository, to an application-layer repo (#186). This record is kept as history._
+
 `build_windows` left-pads a unit shorter than the window length by repeating its first observed cycle, so that every unit contributes at least one training window. `build_unit_rul_curve`, which prepares a single unit's per-cycle RUL curve, deliberately does the opposite: it raises `ValueError` for such a unit rather than padding it. The two padding policies live in the same module and disagree on purpose.
 
 The reason is what a padded window means in each setting. A padded window's sensor rows are fabricated — repeated readings that were never observed — while its RUL target is always computed from the unit's real `time_cycles`. As a training sample that is a tolerable approximation, and dropping the unit entirely would lose real data. As a plotted point it is a claim about the model's behaviour at a cycle where the model was never given genuine history, drawn indistinguishably from the points either side of it. The figure exists to let a reader judge the model's accuracy and its stated uncertainty, so a point with no support in the data is worse than a missing one.

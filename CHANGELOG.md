@@ -3,6 +3,15 @@
 All notable changes to `stagereg` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Removed
+
+- The CMAPSS FD001 example (`examples/jax/cmapss/`), its tests, the
+  `example-cmapss` dependency group and the benchmark harness's `cmapss`
+  workload. The example has moved to an application-layer repo; the library
+  is unchanged.
+
 ## [0.7.0] - 2026-11-09
 
 ### Added

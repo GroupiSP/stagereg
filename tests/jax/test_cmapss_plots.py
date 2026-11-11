@@ -448,3 +448,254 @@ def test_rul_curves_reject_an_empty_model_sequence(
             window_length=4,
         )
     assert captured_show == []
+
+
+# Draw offsets spread evenly over [-20, 20]: with 41 draws, linear-interpolated
+# 2.5% and 97.5% quantiles of the draws fall exactly on the second and
+# second-to-last offsets, -19 and 19.
+_DRAW_OFFSETS = np.linspace(-20.0, 20.0, 41)
+_EPISTEMIC_HALF_WIDTH = 19.0
+
+
+class _StubPosteriorModel:
+    """A model predicting a library posterior predictive with known draws."""
+
+    def __init__(
+        self,
+        *,
+        aleatoric_std: float = 3.0,
+        offset: float = 0.0,
+        masked_outlier: float | None = None,
+    ) -> None:
+        """Fix each draw's aleatoric standard deviation and a mean offset.
+
+        Args:
+            aleatoric_std: Every draw's aleatoric standard deviation.
+            offset: Added to every draw's mean, to tell models apart.
+            masked_outlier: If given, one more draw slot, offset by this much,
+                which the prediction's `draw_mask` excludes.
+        """
+        self.aleatoric_std: float = aleatoric_std
+        self.offset: float = offset
+        self.masked_outlier: float | None = masked_outlier
+        self.calls: int = 0
+
+    def __call__(self, inputs: Any) -> Any:
+        """Predict draws centred on a mean counting up over the batch.
+
+        Args:
+            inputs: Windowed sensor readings, shape `(n_windows,
+                window_length, n_features)`.
+
+        Returns:
+            A posterior predictive whose draw `s` at window `i` has mean
+            `offset + i + _DRAW_OFFSETS[s]` and the fixed aleatoric variance.
+        """
+        stagereg_jax = pytest.importorskip("stagereg.jax")
+        self.calls += 1
+        n_windows = np.asarray(inputs).shape[0]
+        loc = self.offset + np.arange(n_windows, dtype=float)
+        offsets = _DRAW_OFFSETS
+        draw_mask = None
+        if self.masked_outlier is not None:
+            offsets = np.append(offsets, self.masked_outlier)
+            draw_mask = np.arange(offsets.size) < _DRAW_OFFSETS.size
+        draws = loc[None, :, None] + offsets[:, None, None]
+        return stagereg_jax.PosteriorPredictive(
+            draws=np.asarray(draws, dtype=np.float32),
+            aleatoric_variance=np.full(
+                (n_windows, 1), self.aleatoric_std**2, dtype=np.float32
+            ),
+            draw_mask=draw_mask,
+        )
+
+
+def _band_edges(band: Any, n_points: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return a `fill_between` band's lower and upper edges, in x order."""
+    vertices = band.get_paths()[0].vertices
+    # fill_between traces the lower edge forwards, then the upper backwards,
+    # with one closing vertex before and after each edge.
+    lower = vertices[1 : n_points + 1, 1]
+    upper = vertices[n_points + 2 : 2 * n_points + 2, 1][::-1]
+    return lower, upper
+
+
+def _bands_by_label(axes: Any) -> dict[str, Any]:
+    """Index an axes' filled bands by their legend label."""
+    return {band.get_label(): band for band in axes.collections}
+
+
+def test_posterior_row_draws_the_mixture_central_95_percent_interval(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    from scipy import stats
+
+    trajectories = build_trajectories({1: 12})
+    window_length = 3
+    n_windows = 12 - window_length + 1
+    aleatoric_std = 3.0
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        [
+            cmapss_plots.LabelledModel(
+                "Joint MC-Dropout", _StubPosteriorModel(aleatoric_std=aleatoric_std)
+            )
+        ],
+        units=spanning_units(1, 1, 1),
+        window_length=window_length,
+    )
+
+    axes = figure.axes[0]
+    loc = np.arange(n_windows, dtype=float)
+    # The draws are symmetric about `loc`, so the mixture mean is `loc`.
+    predicted = _lines_by_label(axes)[cmapss_plots._PREDICTED_MEAN_LABEL]
+    np.testing.assert_allclose(predicted.get_ydata(), loc, atol=1e-4)
+    total = _bands_by_label(axes)[cmapss_plots._TOTAL_INTERVAL_LABEL]
+    lower, upper = _band_edges(total, n_windows)
+    # Each edge sits where the equally weighted Gaussian mixture puts 2.5%
+    # and 97.5% of its mass, and is unclipped at zero.
+    draws = loc[None, :] + _DRAW_OFFSETS[:, None]
+    lower_mass = stats.norm.cdf(lower[None, :], draws, aleatoric_std).mean(axis=0)
+    upper_mass = stats.norm.cdf(upper[None, :], draws, aleatoric_std).mean(axis=0)
+    np.testing.assert_allclose(lower_mass, 0.025, atol=1e-3)
+    np.testing.assert_allclose(upper_mass, 0.975, atol=1e-3)
+    assert lower.min() < 0.0
+
+
+def test_posterior_row_draws_the_draw_mean_epistemic_band_inside_the_total(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 12})
+    window_length = 3
+    n_windows = 12 - window_length + 1
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        [cmapss_plots.LabelledModel("Joint MC-Dropout", _StubPosteriorModel())],
+        units=spanning_units(1, 1, 1),
+        window_length=window_length,
+    )
+
+    axes = figure.axes[0]
+    bands = _bands_by_label(axes)
+    loc = np.arange(n_windows, dtype=float)
+    epistemic_lower, epistemic_upper = _band_edges(
+        bands[cmapss_plots._EPISTEMIC_INTERVAL_LABEL], n_windows
+    )
+    np.testing.assert_allclose(epistemic_lower, loc - _EPISTEMIC_HALF_WIDTH, atol=1e-4)
+    np.testing.assert_allclose(epistemic_upper, loc + _EPISTEMIC_HALF_WIDTH, atol=1e-4)
+    total_lower, total_upper = _band_edges(
+        bands[cmapss_plots._TOTAL_INTERVAL_LABEL], n_windows
+    )
+    assert np.all(total_lower < epistemic_lower)
+    assert np.all(epistemic_upper < total_upper)
+
+
+def test_posterior_row_epistemic_band_leaves_out_masked_draw_slots(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 12})
+    window_length = 3
+    n_windows = 12 - window_length + 1
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        [
+            cmapss_plots.LabelledModel(
+                "Staged MC-Dropout", _StubPosteriorModel(masked_outlier=1000.0)
+            )
+        ],
+        units=spanning_units(1, 1, 1),
+        window_length=window_length,
+    )
+
+    bands = _bands_by_label(figure.axes[0])
+    loc = np.arange(n_windows, dtype=float)
+    epistemic_lower, epistemic_upper = _band_edges(
+        bands[cmapss_plots._EPISTEMIC_INTERVAL_LABEL], n_windows
+    )
+    np.testing.assert_allclose(epistemic_lower, loc - _EPISTEMIC_HALF_WIDTH, atol=1e-4)
+    np.testing.assert_allclose(epistemic_upper, loc + _EPISTEMIC_HALF_WIDTH, atol=1e-4)
+
+
+def test_posterior_rows_evaluate_each_unit_once(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 20, 2: 9, 3: 14})
+    model = _StubPosteriorModel()
+
+    cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        [cmapss_plots.LabelledModel("Joint MC-Dropout", model)],
+        units=spanning_units(2, 3, 1),
+        window_length=3,
+    )
+
+    # One evaluation per curve, so each draw is one function along it.
+    assert model.calls == 3
+
+
+def test_mixed_figure_has_one_row_per_model_and_names_both_bands(
+    cmapss_plots: ModuleType,
+    spanning_units: Callable[[int, int, int], Any],
+    captured_show: list[bool],
+) -> None:
+    trajectories = build_trajectories({1: 30, 2: 12, 3: 20})
+    window_length = 4
+    models = [
+        cmapss_plots.LabelledModel("joint", _StubModel(offset=0.0)),
+        cmapss_plots.LabelledModel("joint+mcd", _StubPosteriorModel(offset=100.0)),
+        cmapss_plots.LabelledModel("staged", _StubModel(offset=200.0)),
+        cmapss_plots.LabelledModel("staged+mcd", _StubPosteriorModel(offset=300.0)),
+    ]
+    offsets = (0.0, 100.0, 200.0, 300.0)
+    gaussian_bands = {cmapss_plots._INTERVAL_LABEL}
+    posterior_bands = {
+        cmapss_plots._TOTAL_INTERVAL_LABEL,
+        cmapss_plots._EPISTEMIC_INTERVAL_LABEL,
+    }
+
+    figure = cmapss_plots.plot_validation_rul_curves(
+        trajectories,
+        FEATURE_COLUMNS,
+        models,
+        units=spanning_units(2, 3, 1),
+        window_length=window_length,
+    )
+
+    grid = np.asarray(figure.axes, dtype=object).reshape(len(models), 3)
+    for row, (labelled, offset) in enumerate(zip(models, offsets, strict=True)):
+        assert labelled.label in grid[row, 0].get_ylabel()
+        expected_bands = (
+            posterior_bands if labelled.label.endswith("+mcd") else gaussian_bands
+        )
+        for column, lifetime in enumerate((12, 20, 30)):
+            axes = grid[row, column]
+            assert set(_bands_by_label(axes)) == expected_bands
+            predicted = _lines_by_label(axes)[cmapss_plots._PREDICTED_MEAN_LABEL]
+            n_windows = lifetime - window_length + 1
+            np.testing.assert_allclose(
+                predicted.get_ydata(), offset + np.arange(n_windows), atol=1e-3
+            )
+    # The single legend lists the union of everything drawn, each once.
+    (legend,) = figure.legends
+    assert [text.get_text() for text in legend.get_texts()] == [
+        cmapss_plots._TRUE_RUL_LABEL,
+        cmapss_plots._PREDICTED_MEAN_LABEL,
+        cmapss_plots._INTERVAL_LABEL,
+        cmapss_plots._TOTAL_INTERVAL_LABEL,
+        cmapss_plots._EPISTEMIC_INTERVAL_LABEL,
+    ]

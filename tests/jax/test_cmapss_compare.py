@@ -90,6 +90,283 @@ def test_compare_models_scores_lie_in_their_ranges(
             assert math.isfinite(metrics[name])
 
 
+@pytest.fixture(scope="module")
+def mcd_config(tiny_cmapss_config: Any) -> Any:
+    """The tiny configuration with eight-draw MC-Dropout models."""
+    import dataclasses
+
+    return dataclasses.replace(tiny_cmapss_config, dropout_rate=0.2, num_draws=8)
+
+
+def test_compare_models_with_a_posterior_stage_scores_each_baseline_then_its_mcd(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    from stagereg.jax import Gaussian, PosteriorPredictive
+
+    prepared = synthetic_prepared_data()
+
+    results = cmapss_compare.compare_models(
+        prepared, mcd_config, seeds=2, posterior_stage=True
+    )
+
+    assert [result.seed for result in results] == [3, 4]
+    for result in results:
+        assert [(model.name, model.label) for model in result.models] == [
+            ("joint", "Joint model"),
+            ("joint+mcd", "Joint MC-Dropout model"),
+            ("staged", "Staged model"),
+            ("staged+mcd", "Staged MC-Dropout model"),
+        ]
+        for model in result.models:
+            assert set(model.metrics) == _METRIC_NAMES
+            assert 0.0 <= model.metrics["coverage"] <= 1.0
+            assert model.metrics["rmse"] >= 0.0
+            assert model.metrics["closed_form_crps"] >= 0.0
+            assert math.isfinite(model.metrics["nll"])
+        joint, joint_mcd, staged, staged_mcd = result.models
+        windows = prepared.test_windows
+        assert isinstance(joint.model(windows), Gaussian)
+        assert isinstance(staged.model(windows), Gaussian)
+        for mcd in (joint_mcd, staged_mcd):
+            predictive = mcd.model(windows)
+            assert isinstance(predictive, PosteriorPredictive)
+            assert predictive.num_draws == mcd_config.num_draws
+            # Dropout stays active at prediction: the mask sets give distinct draws.
+            assert len({float(draw.sum()) for draw in predictive.draws}) > 1
+        # The joint MC-Dropout model's draws each keep their own aleatoric
+        # variance; the staged one's share the Gamma stage's.
+        joint_predictive = joint_mcd.model(windows)
+        assert joint_predictive.aleatoric_variance.shape == (
+            joint_predictive.draws.shape
+        )
+
+
+def test_both_joint_models_train_for_joint_epochs(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dataclasses
+
+    config = dataclasses.replace(
+        mcd_config, mean_epochs=2, variance_epochs=3, joint_epochs=4
+    )
+    trained_epochs: list[int] = []
+    run_supervised = cmapss_compare.run_supervised
+
+    def record_run_supervised(**kwargs: Any) -> Any:
+        trained_epochs.append(kwargs["epochs"])
+        return run_supervised(**kwargs)
+
+    monkeypatch.setattr(cmapss_compare, "run_supervised", record_run_supervised)
+
+    cmapss_compare.compare_models(
+        synthetic_prepared_data(), config, seeds=1, posterior_stage=True
+    )
+
+    # Joint, then joint+mcd, independently of the stages' epochs.
+    assert trained_epochs == [4, 4]
+
+
+def test_compare_models_predict_in_cycles(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    import numpy as np
+
+    # Targets are uniform in [1, 1000) cycles, so their mean is near 500: a
+    # model left predicting in standardized units would put its means near 0.
+    prepared = synthetic_prepared_data(max_rul=1000.0)
+
+    (result,) = cmapss_compare.compare_models(
+        prepared, mcd_config, seeds=1, posterior_stage=True
+    )
+
+    for model in result.models:
+        output = model.model(prepared.test_windows)
+        mean = output.mean() if hasattr(output, "draws") else output.loc
+        assert float(np.mean(mean)) > 100.0, model.name
+
+
+def test_mcd_models_without_dropout_are_their_baselines(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    import dataclasses
+
+    import numpy as np
+
+    # Each MC-Dropout model is its baseline trained once with dropout, and the
+    # staged posterior stage does not train; without dropout every draw is
+    # the baseline's Gaussian.
+    config = dataclasses.replace(mcd_config, dropout_rate=0.0)
+    prepared = synthetic_prepared_data()
+
+    (result,) = cmapss_compare.compare_models(
+        prepared, config, seeds=1, posterior_stage=True
+    )
+
+    joint, joint_mcd, staged, staged_mcd = result.models
+    windows = prepared.test_windows
+    for baseline, mcd in ((joint, joint_mcd), (staged, staged_mcd)):
+        gaussian = baseline.model(windows)
+        predictive = mcd.model(windows)
+        variances = np.broadcast_to(
+            predictive.aleatoric_variance, predictive.draws.shape
+        )
+        for draw, variance in zip(predictive.draws, variances, strict=True):
+            np.testing.assert_allclose(draw, gaussian.loc, rtol=1e-5, atol=1e-5)
+            np.testing.assert_allclose(variance, gaussian.scale**2, rtol=1e-5)
+
+
+def test_compare_models_posterior_stage_leaves_the_baselines_unchanged(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    prepared = synthetic_prepared_data()
+
+    (without,) = cmapss_compare.compare_models(prepared, mcd_config, seeds=1)
+    (with_flag,) = cmapss_compare.compare_models(
+        prepared, mcd_config, seeds=1, posterior_stage=True
+    )
+
+    assert [model.name for model in without.models] == ["staged", "joint"]
+    by_name = {model.name: model.metrics for model in with_flag.models}
+    for model in without.models:
+        assert by_name[model.name] == model.metrics
+
+
+def test_compare_models_posterior_stage_trains_silently_and_reproduces_a_seed(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import numpy as np
+
+    prepared = synthetic_prepared_data()
+
+    def mcd_models(seeds: int) -> list[tuple[Any, Any]]:
+        results = cmapss_compare.compare_models(
+            prepared, mcd_config, seeds=seeds, posterior_stage=True
+        )
+        return [(result.models[1], result.models[3]) for result in results]
+
+    (first,) = mcd_models(1)
+    (second,) = mcd_models(1)
+    _, other_seed = mcd_models(2)
+
+    assert capsys.readouterr().out == ""
+    windows = prepared.test_windows
+    for first_model, second_model, other_model in zip(
+        first, second, other_seed, strict=True
+    ):
+        assert first_model.metrics == second_model.metrics
+        np.testing.assert_array_equal(
+            first_model.model(windows).draws, second_model.model(windows).draws
+        )
+        assert first_model.metrics != other_model.metrics
+
+
+def _fixed_posterior_model(low: float, high: float, scales: tuple[float, float]) -> Any:
+    """Return a stand-in model mapping any windows to the same two-draw mixture.
+
+    Draw one centres every unit at `low`, draw two at `high`, each with its own
+    aleatoric standard deviation, so the predictive is a bimodal mixture.
+    """
+    import jax.numpy as jnp
+    from flax import nnx
+
+    from stagereg.jax import PosteriorPredictive
+
+    class FixedPosteriorModel(nnx.Module):
+        def __call__(self, windows: Any) -> Any:
+            shape = (windows.shape[0], 1)
+            draws = jnp.stack([jnp.full(shape, low), jnp.full(shape, high)])
+            variance = jnp.stack([jnp.full(shape, scale**2) for scale in scales])
+            return PosteriorPredictive(draws=draws, aleatoric_variance=variance)
+
+    return FixedPosteriorModel()
+
+
+def test_score_on_test_split_scores_a_posterior_predictive_on_its_exact_mixture(
+    cmapss_compare: ModuleType,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    import dataclasses
+
+    import numpy as np
+
+    # Targets at the two modes and at the trough between them.
+    test_rul = np.array([0.0, 10.0, 5.0], dtype=np.float32)
+    prepared = synthetic_prepared_data()
+    prepared = dataclasses.replace(
+        prepared, test_windows=prepared.test_windows[:3], test_rul=test_rul
+    )
+    model = _fixed_posterior_model(low=0.0, high=10.0, scales=(1.0, 2.0))
+
+    metrics = cmapss_compare.score_on_test_split(model, prepared)
+
+    assert set(metrics) == _METRIC_NAMES
+
+    def normal_pdf(y: float, loc: float, scale: float) -> float:
+        return math.exp(-0.5 * ((y - loc) / scale) ** 2) / (
+            scale * math.sqrt(2 * math.pi)
+        )
+
+    mixture_nll = -np.mean(
+        [
+            math.log(0.5 * normal_pdf(y, 0.0, 1.0) + 0.5 * normal_pdf(y, 10.0, 2.0))
+            for y in test_rul
+        ]
+    )
+    assert metrics["nll"] == pytest.approx(mixture_nll, rel=1e-4)
+    # The mixture mean is 5 everywhere: residuals 5, 5 and 0.
+    assert metrics["rmse"] == pytest.approx(math.sqrt(50 / 3), rel=1e-5)
+    # The central 95% mixture interval holds both modes and the trough; the
+    # moment-matched Gaussian's would hold them too, so coverage is 1.
+    assert metrics["coverage"] == pytest.approx(1.0)
+
+
+@settings(max_examples=5, deadline=None)
+@given(
+    loc=st.floats(min_value=-50.0, max_value=50.0),
+    scale=st.floats(min_value=0.5, max_value=20.0),
+)
+def test_score_on_test_split_scores_a_one_point_posterior_as_its_gaussian(
+    cmapss_compare: ModuleType,
+    synthetic_prepared_data: Callable[..., Any],
+    loc: float,
+    scale: float,
+) -> None:
+    import jax.numpy as jnp
+    from flax import nnx
+
+    from stagereg.jax import Gaussian
+
+    prepared = synthetic_prepared_data()
+
+    class GaussianModel(nnx.Module):
+        def __call__(self, windows: Any) -> Any:
+            shape = (windows.shape[0], 1)
+            return Gaussian(loc=jnp.full(shape, loc), scale=jnp.full(shape, scale))
+
+    posterior_model = _fixed_posterior_model(low=loc, high=loc, scales=(scale, scale))
+
+    gaussian = cmapss_compare.score_on_test_split(GaussianModel(), prepared)
+    posterior = cmapss_compare.score_on_test_split(posterior_model, prepared)
+
+    assert posterior.keys() == gaussian.keys()
+    for name, value in gaussian.items():
+        assert posterior[name] == pytest.approx(value, rel=1e-4, abs=1e-4)
+
+
 _CELL = r"-?\d+\.\d+ ± \d+\.\d+"
 
 
@@ -113,6 +390,30 @@ def test_format_comparison_table_gives_each_model_a_mean_and_sample_std_column(
     assert header.split() == ["staged", "joint"]
     # Mean 2 and sample std sqrt(2) for the staged model; no spread for the joint.
     assert rmse.split() == ["RMSE", "2.0000", "±", "1.4142", "10.0000", "±", "0.0000"]
+
+
+def test_format_comparison_table_gives_one_column_per_model_result_in_order(
+    cmapss_compare: ModuleType,
+) -> None:
+    names = ("joint", "joint+mcd", "staged", "staged+mcd")
+
+    def model(name: str, nll: float) -> Any:
+        metrics = {"rmse": 0.0, "coverage": 1.0, "closed_form_crps": 0.0, "nll": nll}
+        return cmapss_compare.ModelResult(
+            name=name, label=name, model=None, metrics=metrics
+        )
+
+    seed = cmapss_compare.SeedComparison(
+        seed=0,
+        models=tuple(model(name, float(index)) for index, name in enumerate(names)),
+    )
+
+    table = cmapss_compare.format_comparison_table([seed])
+
+    header, *rows = table.splitlines()
+    assert tuple(header.split()) == names
+    (nll,) = [row for row in rows if row.startswith("NLL")]
+    assert nll.split()[1::3] == ["0.0000", "1.0000", "2.0000", "3.0000"]
 
 
 @pytest.mark.usefixtures("offline_fd001")
@@ -186,3 +487,141 @@ def test_main_prints_one_line_per_run_and_a_mean_std_table_then_plots(
     for row in ("RMSE", "95% coverage", "closed-form CRPS", "NLL"):
         (line,) = [line for line in table if line.startswith(row)]
         assert re.fullmatch(rf"{re.escape(row)}\s+{_CELL}\s+{_CELL}", line)
+
+
+@pytest.mark.usefixtures("offline_fd001")
+def test_main_with_a_posterior_stage_reports_four_models_and_plots_the_mcd_ones(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plot_path = tmp_path / "comparison.png"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare.py",
+            "--seeds",
+            "2",
+            "--posterior-stage",
+            "--plot-path",
+            str(plot_path),
+        ],
+    )
+    monkeypatch.setattr(cmapss_compare, "CmapssConfig", lambda: mcd_config)
+    plotted_labels: list[str] = []
+    plot = cmapss_compare.plot_validation_rul_curves
+
+    def record_plot(*args: Any, **kwargs: Any) -> None:
+        plotted_labels.extend(model.label for model in args[2])
+        plot(*args, **kwargs)
+
+    monkeypatch.setattr(cmapss_compare, "plot_validation_rul_curves", record_plot)
+
+    cmapss_compare.main()
+
+    lines = capsys.readouterr().out.splitlines()
+    names = ("joint", "joint+mcd", "staged", "staged+mcd")
+    seeds = [f"seed={seed}]" for seed in (mcd_config.seed, mcd_config.seed + 1)]
+    run_lines = [line for line in lines if line.startswith("[")]
+    assert [tuple(line.split()[:2]) for line in run_lines] == [
+        (f"[{name}", seed) for seed in seeds for name in names
+    ]
+    (header,) = [
+        line
+        for line in lines
+        if re.search(r"joint\s+joint\+mcd\s+staged\s+staged\+mcd\s*$", line)
+    ]
+    table = lines[lines.index(header) + 1 :]
+    for row in ("RMSE", "95% coverage", "closed-form CRPS", "NLL"):
+        (line,) = [line for line in table if line.startswith(row)]
+        assert re.fullmatch(rf"{re.escape(row)}(\s+{_CELL}){{4}}", line)
+    assert plotted_labels == ["Joint MC-Dropout model", "Staged MC-Dropout model"]
+    assert plot_path.is_file()
+
+
+_PROXY_NAMES = ("joint", "joint+mcd", "staged", "staged+mcd", "staged+mcd+proxy")
+
+
+def test_compare_models_with_a_proxy_variance_adds_a_fifth_mcd_model(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    from stagereg.jax import PosteriorPredictive
+
+    prepared = synthetic_prepared_data()
+
+    (without,) = cmapss_compare.compare_models(
+        prepared, mcd_config, seeds=1, posterior_stage=True
+    )
+    (result,) = cmapss_compare.compare_models(
+        prepared, mcd_config, seeds=1, posterior_stage=True, proxy_variance=True
+    )
+
+    assert [model.name for model in result.models] == list(_PROXY_NAMES)
+    proxy = result.models[-1]
+    assert proxy.label == "Staged MC-Dropout proxy-variance model"
+    assert set(proxy.metrics) == _METRIC_NAMES
+    predictive = proxy.model(prepared.test_windows)
+    assert isinstance(predictive, PosteriorPredictive)
+    assert predictive.num_draws == mcd_config.num_draws
+    # The first four models are unchanged; the proxy objective changes the fifth.
+    for before, after in zip(without.models, result.models, strict=False):
+        assert before.metrics == after.metrics
+    assert proxy.metrics != without.models[-1].metrics
+
+
+def test_compare_models_refuses_a_proxy_variance_without_a_posterior_stage(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    with pytest.raises(ValueError, match="posterior_stage"):
+        cmapss_compare.compare_models(
+            synthetic_prepared_data(), mcd_config, seeds=1, proxy_variance=True
+        )
+
+
+@pytest.mark.usefixtures("offline_fd001")
+def test_main_with_a_proxy_variance_reports_five_models_and_plots_three_mcd_rows(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    plot_recorder: Any,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["compare.py", "--seeds", "1", "--posterior-stage", "--proxy-variance"],
+    )
+    monkeypatch.setattr(cmapss_compare, "CmapssConfig", lambda: mcd_config)
+    monkeypatch.setattr(cmapss_compare, "plot_validation_rul_curves", plot_recorder)
+
+    cmapss_compare.main()
+
+    (plot,) = plot_recorder.calls
+    run_lines = [line for line in plot.printed.splitlines() if line.startswith("[")]
+    assert [line.split()[0] for line in run_lines] == [
+        f"[{name}" for name in _PROXY_NAMES
+    ]
+    assert [model.label for model in plot.models] == [
+        "Joint MC-Dropout model",
+        "Staged MC-Dropout model",
+        "Staged MC-Dropout proxy-variance model",
+    ]
+
+
+@pytest.mark.usefixtures("offline_fd001")
+def test_main_refuses_a_proxy_variance_without_a_posterior_stage(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["compare.py", "--proxy-variance"])
+    monkeypatch.setattr(cmapss_compare, "CmapssConfig", lambda: mcd_config)
+
+    with pytest.raises(SystemExit):
+        cmapss_compare.main()

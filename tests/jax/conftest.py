@@ -152,6 +152,7 @@ def tiny_cmapss_config(cmapss_run: ModuleType) -> Any:
         kernel_size=3,
         mean_epochs=2,
         variance_epochs=2,
+        gamma_hidden_channels=2,
         joint_epochs=2,
         seed=3,
     )
@@ -199,7 +200,11 @@ def synthetic_prepared_data(cmapss_run: ModuleType) -> Callable[..., Any]:
 
     It is called as `synthetic_prepared_data(*, seed=0, max_rul=100.0)`. Only the
     windowed arrays (32 train, 8 validation and 6 test windows of length 10 over 3
-    sensors) are meant to be trained on; the trajectories are empty.
+    sensors) are meant to be trained on. The training trajectories hold four units with
+    random lifetimes in `[1, max_rul]` and zero sensors, only so that a proxy-variance
+    schedule can be fitted to their lifetimes; the validation trajectories are empty. As
+    in the real data, the train and validation targets are standardized with statistics
+    fitted on the train targets, and the test RUL stays in cycles.
     """
     import pandas as pd
 
@@ -210,23 +215,34 @@ def synthetic_prepared_data(cmapss_run: ModuleType) -> Callable[..., Any]:
             rng, 8, max_rul=max_rul
         )
         test_windows, test_rul = _synthetic_windows(rng, 6, max_rul=max_rul)
+        target_stats = cmapss_run.fit_target_standardization(train_targets)
         n_sensors = train_windows.shape[-1]
         sensors = [f"sensor_{i}" for i in range(n_sensors)]
         columns = ["unit_id", "time_cycles", *sensors]
+        lifetimes = rng.integers(1, int(max_rul), endpoint=True, size=4)
+        train_trajectories = pd.DataFrame(
+            [
+                {"unit_id": unit, "time_cycles": cycle, **dict.fromkeys(sensors, 0.0)}
+                for unit, lifetime in enumerate(lifetimes, start=1)
+                for cycle in range(1, int(lifetime) + 1)
+            ],
+            columns=columns,
+        )
         return cmapss_run.PreparedCmapssData(
             train_windows=train_windows,
-            train_targets=train_targets,
+            train_targets=target_stats.standardize(train_targets),
             validation_windows=validation_windows,
-            validation_targets=validation_targets,
+            validation_targets=target_stats.standardize(validation_targets),
             test_windows=test_windows,
             test_rul=test_rul,
-            train_trajectories=pd.DataFrame(columns=columns),
+            train_trajectories=train_trajectories,
             validation_trajectories=pd.DataFrame(columns=columns),
             standardization=cmapss_run.SensorStandardization(
                 feature_columns=sensors,
                 mean=np.zeros(n_sensors),
                 scale=np.ones(n_sensors),
             ),
+            target_standardization=target_stats,
         )
 
     return make

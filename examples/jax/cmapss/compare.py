@@ -3,19 +3,45 @@
 Prepares the FD001 data once, exactly as `run.py` does, then for each seed
 trains two models on it:
 
-* the **staged model**: a 1D-CNN mean stage followed by a 1D-CNN Gamma
-  variance stage on its squared residuals, assembled into one Gaussian;
+* the **staged model**: a 1D-CNN mean stage followed by a narrower 1D-CNN
+  Gamma variance stage, trained with weight decay, on its squared residuals,
+  assembled into one Gaussian;
 * a **joint model**: one 1D-CNN backbone with the same architecture and
   hyperparameters, followed by a Gaussian head, trained with `run_supervised`
   on the Gaussian negative log-likelihood.
 
-Both train on the raw linear-RUL targets and are scored against the
-official FD001 test split on RMSE, 95% interval coverage, closed-form CRPS
-and NLL. The train/validation split stays fixed across seeds; only model
+Both train on the standardized linear-RUL targets, and their predictions
+are mapped back to RUL cycles to be scored against the official FD001 test
+split on RMSE, 95% interval coverage, closed-form CRPS and NLL. The train/validation split stays fixed across seeds; only model
 initialization changes.
 
-It then draws the first seed's validation RUL curves: the staged model's row
-above the joint model's, for the same lifetime-spanning validation units.
+It then draws the first seed's validation RUL curves, in cycles: the staged
+model's row above the joint model's, for the same lifetime-spanning
+validation units.
+
+With `--posterior-stage` it adds two MC-Dropout models. Each is its
+baseline trained once with dropout active, its only regularizer, and
+predicted with dropout active. The **joint MC-Dropout model** (`joint+mcd`)
+is the joint model trained with dropout; its prediction is a posterior
+predictive over fixed dropout-mask sets with each draw's own aleatoric
+variance. The **staged MC-Dropout model** (`staged+mcd`) trains the mean
+stage with dropout and the Gamma stage on its residuals, then runs a
+posterior stage with the `MCDropout` inference method that does not train:
+its posterior is the trained mean network under dropout masks. A fresh Gamma
+network is then re-fitted to the squared residuals of the posterior
+predictive's mean, and the draws share that variance. The models are then
+`joint`, `joint+mcd`, `staged` and `staged+mcd`, in that order, in the
+per-run lines and the table; the figure draws only `joint+mcd` and
+`staged+mcd`.
+
+With `--proxy-variance` as well it adds a fifth model, the **staged
+MC-Dropout proxy-variance model** (`staged+mcd+proxy`): the staged
+MC-Dropout model with its mean stage trained and validated on
+`ProxyVarianceNLL` instead of the squared error. That is a Gaussian NLL
+under a fictitious scale that shrinks linearly with the true RUL, from the
+spread of the training units' lifetimes to `proxy_variance_floor_cycles` at
+failure, so end-of-life windows weigh most and the dropout spread is pushed
+down there. The figure then draws it as a third row.
 
 Run it with:
 
@@ -33,6 +59,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
@@ -42,26 +69,40 @@ _MODULE_DIR = Path(__file__).resolve().parent
 if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
-from model import Cnn1DGaussianModel
+from model import Cnn1DGammaModel, Cnn1DGaussianModel, Cnn1DMeanModel
 from plots import LabelledModel, plot_validation_rul_curves
-from preprocessing import select_lifetime_spanning_units
+from preprocessing import (
+    fit_proxy_variance_schedule,
+    select_lifetime_spanning_units,
+    unit_lifetimes,
+)
 from run import (
     TEST_METRICS,
     CmapssConfig,
     PreparedCmapssData,
+    ProxyVarianceNLL,
+    CyclesPredictive,
     build_composite_model,
+    build_mc_dropout_predictive,
+    build_staged_mcd_posterior,
     build_supervised_training_setup,
     evaluate_test_metrics,
     prepare_cmapss_windows,
+    refit_gamma_to_posterior_mean,
     train_gamma_model,
     train_mean_model,
 )
 
 from stagereg.core import NegativeLogLikelihood, NegativeLogLikelihoodLoss
+from stagereg.core.distributions import PredictionLoss
 from stagereg.core.metric_registry import EpochMetric
 from stagereg.core.tracking import EventSink
+from stagereg.core.types import TrainingState
 from stagereg.jax import (
+    GaussianPredictor,
     HeldOutValidation,
+    PosteriorPredictive,
+    PosteriorPredictivePredictor,
     initialize_training_state,
     make_supervised_loss,
     run_supervised,
@@ -73,25 +114,32 @@ COMPARISON_METRICS: tuple[EpochMetric, ...] = (*TEST_METRICS, NegativeLogLikelih
 JOINT_STAGE = "joint"
 """The stage segment the joint model's training is reported under."""
 
+MCD_MODEL_NAMES = ("joint+mcd", "staged+mcd", "staged+mcd+proxy")
+"""The MC-Dropout models, the only ones `--posterior-stage`'s figure draws."""
+
 
 def train_joint_model(
     prepared: PreparedCmapssData,
     config: CmapssConfig,
     *,
+    epochs: int,
     event_sinks: Sequence[EventSink],
+    dropout_rate: float = 0.0,
 ) -> Cnn1DGaussianModel:
     """Train a joint model with `run_supervised` on the Gaussian NLL.
 
     The model is validated on the held-out validation windows after every
-    epoch and trained for `config.joint_epochs` epochs on the raw RUL
-    targets.
+    epoch and trained on the standardized RUL targets.
 
     Args:
         prepared: The prepared FD001 windows to train and validate on.
         config: Example configuration controlling model size and training;
             `config.seed` sets the model's initialization.
+        epochs: Number of training epochs.
         event_sinks: Sinks notified of the training events; pass none to
             train silently.
+        dropout_rate: The network's dropout rate, active during training;
+            0, the default, trains it without dropout.
 
     Returns:
         The trained `Cnn1DGaussianModel`.
@@ -103,6 +151,7 @@ def train_joint_model(
         prepared.validation_windows,
         prepared.validation_targets,
         config,
+        dropout_rate=dropout_rate,
     )
     loss = make_supervised_loss(NegativeLogLikelihoodLoss())
     run_supervised(
@@ -113,7 +162,7 @@ def train_joint_model(
         state=initialize_training_state(
             setup.model, setup.optimizer, rng_key=setup.rng_key
         ),
-        epochs=config.joint_epochs,
+        epochs=epochs,
         validation=HeldOutValidation(
             model=setup.model, loader=setup.validation_loader, loss=loss
         ),
@@ -121,6 +170,42 @@ def train_joint_model(
         stage=JOINT_STAGE,
     )
     return setup.model
+
+
+def score_on_test_split(
+    model: nnx.Module, prepared: PreparedCmapssData
+) -> dict[str, float]:
+    """Score a model on the FD001 test split with `COMPARISON_METRICS`.
+
+    The model must predict in RUL cycles, as `CyclesPredictive` does, since
+    the test RUL is in cycles.
+
+    The predictor is chosen by the model's output: `GaussianPredictor` for a
+    `Gaussian`, `PosteriorPredictivePredictor` for a `PosteriorPredictive`,
+    which scores the exact mixture (mixture log-density, mixture-quantile
+    coverage and the mixture's closed-form CRPS).
+
+    Args:
+        model: An eval-mode model mapping windows to a `Gaussian` or a
+            `PosteriorPredictive`.
+        prepared: The prepared FD001 windows whose test split is scored.
+
+    Returns:
+        The model's `COMPARISON_METRICS` on the test split, by metric name.
+    """
+    output = model(jnp.asarray(prepared.test_windows[:1], dtype=jnp.float32))
+    predictor = (
+        PosteriorPredictivePredictor()
+        if isinstance(output, PosteriorPredictive)
+        else GaussianPredictor()
+    )
+    return evaluate_test_metrics(
+        model,
+        prepared.test_windows,
+        prepared.test_rul,
+        epoch_metrics=COMPARISON_METRICS,
+        predictor=predictor,
+    )
 
 
 @dataclass(frozen=True)
@@ -131,7 +216,8 @@ class ModelResult:
         name: The model's name in the per-run lines and the table's column
             header, e.g. `"staged"`.
         label: The model's row label in the figure, e.g. `"Staged model"`.
-        model: The trained, eval-mode model.
+        model: The trained, eval-mode model, returning a `Gaussian` or a
+            `PosteriorPredictive` in RUL cycles.
         metrics: The model's `COMPARISON_METRICS` on the test split, by
             metric name.
     """
@@ -144,15 +230,17 @@ class ModelResult:
 
 @dataclass(frozen=True)
 class SeedComparison:
-    """Both models trained from one seed, and their test-split scores.
+    """The models trained from one seed, and their test-split scores.
 
     Attributes:
-        seed: The seed both models were initialized from.
-        models: The staged model's result, then the joint model's.
+        seed: The seed every model was initialized from.
+        models: One result per model, in the table's column order. Without `--posterior-stage`: `staged`, then
+            `joint`. With it: `joint`, `joint+mcd`, `staged`, then
+            `staged+mcd`, and `staged+mcd+proxy` with `--proxy-variance`.
     """
 
     seed: int
-    models: tuple[ModelResult, ModelResult]
+    models: tuple[ModelResult, ...]
 
 
 RunReporter = Callable[[str, int, dict[str, float]], None]
@@ -170,31 +258,27 @@ def _ignore_run(model: str, seed: int, metrics: dict[str, float]) -> None:
     del model, seed, metrics
 
 
-def _train_and_score_seed(
-    prepared: PreparedCmapssData, config: CmapssConfig, *, on_run: RunReporter
-) -> SeedComparison:
-    """Train and score the staged and then the joint model from `config.seed`.
+def _train_staged_networks(
+    prepared: PreparedCmapssData,
+    config: CmapssConfig,
+    *,
+    dropout_rate: float = 0.0,
+    objective: PredictionLoss | None = None,
+) -> tuple[Cnn1DMeanModel, Cnn1DGammaModel, TrainingState]:
+    """Silently train the staged model's mean and Gamma variance networks.
 
     Args:
-        prepared: The prepared FD001 windows to train, validate and score on.
-        config: Example configuration; its `seed` initializes both models.
-        on_run: Called with each model's name, the seed and its test metrics
-            as soon as that model is scored.
+        prepared: The prepared FD001 windows to train and validate on.
+        config: Example configuration; its `seed` initializes both networks.
+        dropout_rate: The mean network's dropout rate, active during
+            training; 0, the default, trains it without dropout.
+        objective: The mean stage's per-window objective; `None`, the
+            default, is the squared error.
 
     Returns:
-        The seed's `SeedComparison`.
+        The trained mean network, Gamma variance network, and the
+        `VARIANCE_READY` training state a posterior stage continues on.
     """
-
-    def score(name: str, label: str, model: nnx.Module) -> ModelResult:
-        metrics = evaluate_test_metrics(
-            model,
-            prepared.test_windows,
-            prepared.test_rul,
-            epoch_metrics=COMPARISON_METRICS,
-        )
-        on_run(name, config.seed, metrics)
-        return ModelResult(name=name, label=label, model=model, metrics=metrics)
-
     mean_model, state = train_mean_model(
         prepared.train_windows,
         prepared.train_targets,
@@ -202,6 +286,8 @@ def _train_and_score_seed(
         prepared.validation_targets,
         config,
         event_sinks=(),
+        dropout_rate=dropout_rate,
+        objective=objective,
     )
     variance_model = train_gamma_model(
         state,
@@ -210,15 +296,163 @@ def _train_and_score_seed(
         config,
         event_sinks=(),
     )
-    staged = score(
-        "staged", "Staged model", build_composite_model(mean_model, variance_model)
+    return mean_model, variance_model, state
+
+
+def _train_joint(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.Module:
+    """Silently train the joint model and return an eval-mode clone of it.
+
+    Args:
+        prepared: The prepared FD001 windows to train and validate on.
+        config: Example configuration; its `seed` initializes the model.
+
+    Returns:
+        An eval-mode clone of the trained `Cnn1DGaussianModel`.
+    """
+    joint_model = nnx.clone(
+        train_joint_model(prepared, config, epochs=config.joint_epochs, event_sinks=())
+    )
+    joint_model.eval()
+    return joint_model
+
+
+def _train_joint_mcd(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.Module:
+    """Silently train the joint MC-Dropout model and return its predictive.
+
+    Args:
+        prepared: The prepared FD001 windows to train and validate on.
+        config: Example configuration; its `seed` initializes the network and
+            sets its training masks and the predictive's draws.
+
+    Returns:
+        The joint model trained at `config.dropout_rate`, wrapped by
+        `build_mc_dropout_predictive`.
+    """
+    network = train_joint_model(
+        prepared,
+        config,
+        epochs=config.joint_epochs,
+        event_sinks=(),
+        dropout_rate=config.dropout_rate,
+    )
+    return build_mc_dropout_predictive(network, config)
+
+
+def _train_staged_mcd(
+    prepared: PreparedCmapssData,
+    config: CmapssConfig,
+    *,
+    objective: PredictionLoss | None = None,
+) -> nnx.Module:
+    """Silently train the staged MC-Dropout model and return its predictive.
+
+    Trains the mean stage at `config.dropout_rate` and the Gamma stage on its
+    residuals, runs the inference-only posterior stage, then re-fits the
+    Gamma network to the posterior predictive's mean.
+
+    Args:
+        prepared: The prepared FD001 windows to train and validate on.
+        config: Example configuration; its `seed` initializes the networks and
+            sets the mean network's training masks and the predictive's draws.
+        objective: The mean stage's per-window objective; `None`, the
+            default, is the squared error.
+
+    Returns:
+        The posterior's draws under the re-fitted Gamma variance.
+    """
+    _, _, state = _train_staged_networks(
+        prepared, config, dropout_rate=config.dropout_rate, objective=objective
+    )
+    predictive = build_staged_mcd_posterior(
+        state,
+        prepared.train_windows,
+        prepared.train_targets,
+        config,
+        event_sinks=(),
+    )
+    return refit_gamma_to_posterior_mean(
+        predictive,
+        prepared.train_windows,
+        prepared.train_targets,
+        config,
+        event_sinks=(),
     )
 
-    joint_model = nnx.clone(train_joint_model(prepared, config, event_sinks=()))
-    joint_model.eval()
-    joint = score("joint", "Joint model", joint_model)
 
-    return SeedComparison(seed=config.seed, models=(staged, joint))
+def _train_and_score_seed(
+    prepared: PreparedCmapssData,
+    config: CmapssConfig,
+    *,
+    posterior_stage: bool,
+    proxy_variance: bool,
+    on_run: RunReporter,
+) -> SeedComparison:
+    """Train and score every model of the comparison from `config.seed`.
+
+    Without a posterior stage the models are the staged and then the joint
+    model; with one, the joint, the joint MC-Dropout, the staged and the
+    staged MC-Dropout model, then, with a proxy variance, the staged
+    MC-Dropout proxy-variance model. Each model is trained from scratch on
+    the standardized targets, wrapped in `CyclesPredictive`, and scored in
+    that order.
+
+    Args:
+        prepared: The prepared FD001 windows to train, validate and score on.
+        config: Example configuration; its `seed` initializes every model.
+        posterior_stage: Whether to add the MC-Dropout models.
+        proxy_variance: Whether to add the staged MC-Dropout proxy-variance
+            model; only together with `posterior_stage`.
+        on_run: Called with each model's name, the seed and its test metrics
+            as soon as that model is scored.
+
+    Returns:
+        The seed's `SeedComparison`.
+    """
+
+    def score(name: str, label: str, model: nnx.Module) -> ModelResult:
+        model = CyclesPredictive(model, prepared.target_standardization)
+        metrics = score_on_test_split(model, prepared)
+        on_run(name, config.seed, metrics)
+        return ModelResult(name=name, label=label, model=model, metrics=metrics)
+
+    def train_and_score_staged() -> ModelResult:
+        mean_model, variance_model, _ = _train_staged_networks(prepared, config)
+        composite = build_composite_model(mean_model, variance_model)
+        return score("staged", "Staged model", composite)
+
+    def train_and_score_joint() -> ModelResult:
+        return score("joint", "Joint model", _train_joint(prepared, config))
+
+    if not posterior_stage:
+        staged_result = train_and_score_staged()
+        return SeedComparison(
+            seed=config.seed, models=(staged_result, train_and_score_joint())
+        )
+
+    joint_result = train_and_score_joint()
+    joint_mcd_result = score(
+        "joint+mcd", "Joint MC-Dropout model", _train_joint_mcd(prepared, config)
+    )
+    staged_result = train_and_score_staged()
+    staged_mcd_result = score(
+        "staged+mcd", "Staged MC-Dropout model", _train_staged_mcd(prepared, config)
+    )
+    models = (joint_result, joint_mcd_result, staged_result, staged_mcd_result)
+    if not proxy_variance:
+        return SeedComparison(seed=config.seed, models=models)
+
+    schedule = fit_proxy_variance_schedule(
+        unit_lifetimes(prepared.train_trajectories),
+        prepared.target_standardization,
+        floor_cycles=config.proxy_variance_floor_cycles,
+    )
+    proxy_model = _train_staged_mcd(
+        prepared, config, objective=ProxyVarianceNLL(schedule)
+    )
+    proxy_result = score(
+        "staged+mcd+proxy", "Staged MC-Dropout proxy-variance model", proxy_model
+    )
+    return SeedComparison(seed=config.seed, models=(*models, proxy_result))
 
 
 def compare_models(
@@ -226,30 +460,49 @@ def compare_models(
     config: CmapssConfig,
     *,
     seeds: int,
+    posterior_stage: bool = False,
+    proxy_variance: bool = False,
     on_run: RunReporter = _ignore_run,
 ) -> list[SeedComparison]:
-    """Train and score the staged and the joint model once per seed.
+    """Train and score the comparison's models once per seed.
 
     Every seed trains on the same `prepared` data, so only initialization
-    varies: seed index `i` initializes both models from `config.seed + i`.
-    Training is silent. Each `SeedComparison` keeps both trained models, so
-    a caller can plot, say, the first seed's models without retraining.
+    varies: seed index `i` initializes every model, and the MC-Dropout
+    models' masks, from `config.seed + i`. Training is silent. Each
+    `SeedComparison` keeps its trained models, so a caller can plot, say,
+    the first seed's models without retraining.
 
     Args:
         prepared: The prepared FD001 windows, shared by every seed.
         config: Example configuration; its `seed` is the first seed.
-        seeds: Number of seeds to train both models from.
-        on_run: Called with the model's name (`"staged"` or `"joint"`), the
-            seed and the test metrics as soon as each run is scored. Does
-            nothing by default.
+        seeds: Number of seeds to train the models from.
+        posterior_stage: Off, the default, compares the staged and the joint
+            model, in that order. On, it compares the joint, the joint
+            MC-Dropout (`"joint+mcd"`), the staged and the staged MC-Dropout
+            (`"staged+mcd"`) model, in that order; the joint and staged
+            models are the same as with it off.
+        proxy_variance: On, it appends the staged MC-Dropout proxy-variance
+            model (`"staged+mcd+proxy"`), whose mean stage trains on
+            `ProxyVarianceNLL` with a schedule fitted to the training units'
+            lifetimes; the other four models are unchanged. Off by default;
+            it needs `posterior_stage`.
+        on_run: Called with the model's name, the seed and the test metrics
+            as soon as each run is scored. Does nothing by default.
 
     Returns:
         One `SeedComparison` per seed, in seed order.
+
+    Raises:
+        ValueError: If `proxy_variance` is on without `posterior_stage`.
     """
+    if proxy_variance and not posterior_stage:
+        raise ValueError("proxy_variance requires posterior_stage.")
     return [
         _train_and_score_seed(
             prepared,
             dataclasses.replace(config, seed=config.seed + index),
+            posterior_stage=posterior_stage,
+            proxy_variance=proxy_variance,
             on_run=on_run,
         )
         for index in range(seeds)
@@ -280,7 +533,7 @@ def _mean_std(values: Sequence[float]) -> str:
 
 
 def format_comparison_table(results: Sequence[SeedComparison]) -> str:
-    """Tabulate both models' test metrics as `mean ± std` over seeds.
+    """Tabulate every model's test metrics as `mean ± std` over seeds.
 
     Args:
         results: The per-seed comparisons from `compare_models`; at least
@@ -288,8 +541,8 @@ def format_comparison_table(results: Sequence[SeedComparison]) -> str:
 
     Returns:
         A table with one row per metric (RMSE, 95% coverage, closed-form
-        CRPS, NLL) and one column per model, headed by its name, in the
-        comparisons' model order: `staged`, then `joint`.
+        CRPS, NLL) and one column per model result, headed by its name, in
+        the comparisons' model order.
     """
     names = [model.name for model in results[0].models]
     rows = [
@@ -317,7 +570,7 @@ def print_run(model: str, seed: int, metrics: dict[str, float]) -> None:
     """Print one finished (seed, model) run's test metrics on one line.
 
     Args:
-        model: The model's name, `"staged"` or `"joint"`.
+        model: The model's name, e.g. `"staged"` or `"joint+mcd"`.
         seed: The seed the model was initialized from.
         metrics: The model's test metrics by name.
     """
@@ -326,43 +579,83 @@ def print_run(model: str, seed: int, metrics: dict[str, float]) -> None:
 
 
 def main() -> None:
-    """Compare the staged and the joint model over seeds, print and plot the results.
+    """Compare the CMAPSS models over seeds, print and plot the results.
 
-    Pass `--seeds` to set the number of seeds (default 5), and `--plot-path` to save the
-    first seed's RUL-curves figure to that path instead of displaying it.
+    Compares `staged` and `joint`; with `--posterior-stage`, `joint`,
+    `joint+mcd`, `staged` and `staged+mcd`, in that order, then
+    `staged+mcd+proxy` with `--proxy-variance` too. The figure draws every
+    model without `--posterior-stage`, and only the MC-Dropout models with
+    it.
+
+    Pass `--seeds` to set the number of seeds (default 5), `--plot-path` to save the
+    first seed's RUL-curves figure to that path instead of displaying it,
+    `--posterior-stage` to add the joint and the staged MC-Dropout models, and
+    `--proxy-variance`, with `--posterior-stage` only, to add the staged
+    MC-Dropout proxy-variance model.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--seeds",
         type=int,
         default=5,
-        help="Number of seeds to train both models from (default: 5).",
+        help="Number of seeds to train the models from (default: 5).",
     )
     parser.add_argument(
         "--plot-path",
         type=Path,
         default=None,
         help=(
-            "Save the staged-vs-joint validation RUL-curves figure to this path "
-            "instead of displaying it."
+            "Save the first seed's validation RUL-curves figure, one row per "
+            "plotted model, to this path instead of displaying it."
+        ),
+    )
+    parser.add_argument(
+        "--posterior-stage",
+        action="store_true",
+        help=(
+            "Add the joint and staged MC-Dropout models (joint+mcd, "
+            "staged+mcd); the models are then joint, joint+mcd, staged and "
+            "staged+mcd."
+        ),
+    )
+    parser.add_argument(
+        "--proxy-variance",
+        action="store_true",
+        help=(
+            "With --posterior-stage, add the staged MC-Dropout model whose "
+            "mean stage trains on a proxy variance shrinking toward end of "
+            "life (staged+mcd+proxy)."
         ),
     )
     args = parser.parse_args()
     if args.seeds <= 0:
         parser.error("--seeds must be positive.")
+    if args.proxy_variance and not args.posterior_stage:
+        parser.error("--proxy-variance requires --posterior-stage.")
 
     config = CmapssConfig()
     prepared = prepare_cmapss_windows(config)
-    results = compare_models(prepared, config, seeds=args.seeds, on_run=print_run)
+    results = compare_models(
+        prepared,
+        config,
+        seeds=args.seeds,
+        posterior_stage=args.posterior_stage,
+        proxy_variance=args.proxy_variance,
+        on_run=print_run,
+    )
     print(f"\nFD001 test metrics over {args.seeds} seeds (mean ± std):")
     print(format_comparison_table(results))
 
-    first = results[0]
+    plotted = [
+        result
+        for result in results[0].models
+        if not args.posterior_stage or result.name in MCD_MODEL_NAMES
+    ]
     validation_trajectories = prepared.validation_trajectories
     plot_validation_rul_curves(
         validation_trajectories,
         prepared.standardization.feature_columns,
-        [LabelledModel(result.label, result.model) for result in first.models],
+        [LabelledModel(result.label, result.model) for result in plotted],
         units=select_lifetime_spanning_units(validation_trajectories),
         window_length=config.window_length,
         save_path=args.plot_path,

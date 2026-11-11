@@ -10,7 +10,16 @@ from stagereg.jax import Gamma, GammaHead, Gaussian, GaussianHead
 
 
 class Cnn1DBackbone(nnx.Module):
-    """Two 1D-convolutional layers over the time axis, sensors as channels."""
+    """Two 1D-convolutional layers over the time axis, sensors as channels.
+
+    Dropout follows every hidden layer, i.e. each convolutional layer, with
+    one mask per call shared across the batch axis (`broadcast_dims=(0,)`),
+    as [`MCDropout`][stagereg.jax.MCDropout] requires: a draw is then the
+    same function at every window. Dropout adds no parameters, so the
+    parameter tree does not depend on the rate. At rate 0 the dropout layers
+    are the identity and hold no random state, so the backbone, its state
+    and its outputs are those of a backbone without dropout.
+    """
 
     def __init__(
         self,
@@ -18,6 +27,7 @@ class Cnn1DBackbone(nnx.Module):
         *,
         hidden_channels: int = 16,
         kernel_size: int = 5,
+        dropout_rate: float = 0.0,
         rngs: nnx.Rngs,
     ) -> None:
         """Initialize the stacked 1D-convolutional feature extractor.
@@ -27,7 +37,10 @@ class Cnn1DBackbone(nnx.Module):
             hidden_channels: Number of output channels for both
                 convolutional layers.
             kernel_size: Convolution kernel width along the time axis.
-            rngs: NNX random-number generators used to initialize parameters.
+            dropout_rate: Dropout rate after every convolutional layer; 0
+                disables dropout.
+            rngs: NNX random-number generators used to initialize parameters
+                and, at a positive rate, the dropout masks' streams.
         """
         self.conv1 = nnx.Conv(
             in_features=n_sensors,
@@ -43,20 +56,40 @@ class Cnn1DBackbone(nnx.Module):
             padding="SAME",
             rngs=rngs,
         )
+        # Built after every parameter, and only at a positive rate, so that a
+        # rate of 0 draws nothing from `rngs` and leaves the state unchanged.
+        dropout_rngs = rngs if dropout_rate > 0.0 else None
+        self.dropouts = nnx.List(
+            [
+                nnx.Dropout(dropout_rate, broadcast_dims=(0,), rngs=dropout_rngs)
+                for _ in range(2)
+            ]
+        )
 
-    def __call__(self, inputs: jax.Array) -> jax.Array:
+    def __call__(
+        self, inputs: jax.Array, *, dropout_key: jax.Array | None = None
+    ) -> jax.Array:
         """Extract a fixed-size feature vector per windowed example.
 
         Args:
             inputs: Windowed sensor readings, shape ``(batch, window_length,
                 n_sensors)``.
+            dropout_key: Key the dropout masks are drawn from; `None` draws
+                them from the backbone's own streams.
 
         Returns:
             Time-averaged convolutional features, shape ``(batch,
             hidden_channels)``.
         """
-        hidden = nnx.relu(self.conv1(inputs))
-        hidden = nnx.relu(self.conv2(hidden))
+        hidden = inputs
+        for index, (conv, dropout) in enumerate(
+            zip((self.conv1, self.conv2), self.dropouts, strict=True)
+        ):
+            hidden = nnx.relu(conv(hidden))
+            key = (
+                None if dropout_key is None else jax.random.fold_in(dropout_key, index)
+            )
+            hidden = dropout(hidden, rngs=key)
         return jnp.mean(hidden, axis=1)
 
 
@@ -69,6 +102,7 @@ class Cnn1DMeanModel(nnx.Module):
         *,
         hidden_channels: int = 16,
         kernel_size: int = 5,
+        dropout_rate: float = 0.0,
         rngs: nnx.Rngs,
     ) -> None:
         """Initialize the convolutional backbone and the mean output head.
@@ -78,27 +112,34 @@ class Cnn1DMeanModel(nnx.Module):
             hidden_channels: Number of channels produced by the
                 convolutional backbone.
             kernel_size: Convolution kernel width along the time axis.
-            rngs: NNX random-number generators used to initialize parameters.
+            dropout_rate: The backbone's dropout rate; 0 disables dropout.
+            rngs: NNX random-number generators used to initialize parameters
+                and, at a positive rate, the dropout masks' streams.
         """
         self.backbone = Cnn1DBackbone(
             n_sensors,
             hidden_channels=hidden_channels,
             kernel_size=kernel_size,
+            dropout_rate=dropout_rate,
             rngs=rngs,
         )
         self.output = nnx.Linear(hidden_channels, 1, rngs=rngs)
 
-    def __call__(self, inputs: jax.Array) -> jax.Array:
+    def __call__(
+        self, inputs: jax.Array, *, dropout_key: jax.Array | None = None
+    ) -> jax.Array:
         """Predict a scalar RUL for each windowed example in the batch.
 
         Args:
             inputs: Windowed sensor readings, shape ``(batch, window_length,
                 n_sensors)``.
+            dropout_key: Key the backbone's dropout masks are drawn from;
+                `None` draws them from the backbone's own streams.
 
         Returns:
             Predicted RUL, shape ``(batch, 1)``.
         """
-        return self.output(self.backbone(inputs))
+        return self.output(self.backbone(inputs, dropout_key=dropout_key))
 
 
 class Cnn1DGammaModel(nnx.Module):
@@ -202,6 +243,7 @@ class Cnn1DGaussianModel(nnx.Module):
         *,
         hidden_channels: int = 16,
         kernel_size: int = 5,
+        dropout_rate: float = 0.0,
         rngs: nnx.Rngs,
     ) -> None:
         """Initialize the convolutional backbone and the Gaussian output head.
@@ -211,25 +253,32 @@ class Cnn1DGaussianModel(nnx.Module):
             hidden_channels: Number of channels produced by the
                 convolutional backbone.
             kernel_size: Convolution kernel width along the time axis.
-            rngs: NNX random-number generators used to initialize parameters.
+            dropout_rate: The backbone's dropout rate; 0 disables dropout.
+            rngs: NNX random-number generators used to initialize parameters
+                and, at a positive rate, the dropout masks' streams.
         """
         self.backbone = Cnn1DBackbone(
             n_sensors,
             hidden_channels=hidden_channels,
             kernel_size=kernel_size,
+            dropout_rate=dropout_rate,
             rngs=rngs,
         )
         self.head = GaussianHead(hidden_channels, 1, rngs=rngs)
 
-    def __call__(self, inputs: jax.Array) -> Gaussian:
+    def __call__(
+        self, inputs: jax.Array, *, dropout_key: jax.Array | None = None
+    ) -> Gaussian:
         """Predict a Gaussian RUL distribution for each windowed example.
 
         Args:
             inputs: Windowed sensor readings, shape ``(batch, window_length,
                 n_sensors)``.
+            dropout_key: Key the backbone's dropout masks are drawn from;
+                `None` draws them from the backbone's own streams.
 
         Returns:
             A [`Gaussian`][stagereg.jax.Gaussian] with ``loc`` and a strictly
             positive ``scale``, each shaped ``(batch, 1)``.
         """
-        return self.head(self.backbone(inputs))
+        return self.head(self.backbone(inputs, dropout_key=dropout_key))

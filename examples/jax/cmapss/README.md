@@ -301,9 +301,12 @@ mixture mean and two bands around it:
   draws' means at each window: how much the dropout draws disagree about
   the mean, i.e. the model's uncertainty about the function itself.
 
-The gap between the two is the aleatoric part. An epistemic band that is
-narrow next to the total band says that most of the uncertainty is noise
-in the data rather than lack of knowledge. Each curve comes from one
+The total band is wider because it also counts the aleatoric noise, but
+the gap between the two bands is not the aleatoric part: quantile widths
+do not add. The variances do: the predictive variance is the mean of the
+draws' aleatoric variances plus the variance of the draws' means. An
+epistemic band that is narrow next to the total band still says that most
+of the uncertainty is noise in the data rather than lack of knowledge. Each curve comes from one
 evaluation over the unit's windows, so every draw is the same function
 along the whole curve.
 

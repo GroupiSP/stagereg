@@ -76,6 +76,29 @@ def test_fit_standardization_guards_zero_variance_columns(
     assert stats.scale[0] == 1.0
 
 
+def test_fit_target_standardization_maps_training_targets_to_zero_mean_unit_std(
+    cmapss_preprocessing: ModuleType,
+) -> None:
+    targets = np.array([10.0, 40.0, 70.0, 100.0])
+
+    stats = cmapss_preprocessing.fit_target_standardization(targets)
+
+    assert stats.mean == pytest.approx(55.0)
+    assert stats.scale == pytest.approx(float(targets.std(ddof=0)))
+    standardized = stats.standardize(targets)
+    np.testing.assert_allclose(standardized.mean(), 0.0, atol=1e-12)
+    np.testing.assert_allclose(standardized.std(ddof=0), 1.0)
+
+
+def test_fit_target_standardization_guards_constant_targets(
+    cmapss_preprocessing: ModuleType,
+) -> None:
+    stats = cmapss_preprocessing.fit_target_standardization(np.full(3, 7.0))
+
+    assert stats.scale == 1.0
+    np.testing.assert_allclose(stats.standardize(np.array([7.0, 8.0])), [0.0, 1.0])
+
+
 def test_build_windows_shapes_and_targets_for_long_trajectory(
     cmapss_preprocessing: ModuleType,
 ) -> None:

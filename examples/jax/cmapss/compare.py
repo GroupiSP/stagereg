@@ -10,13 +10,14 @@ trains two models on it:
   hyperparameters, followed by a Gaussian head, trained with `run_supervised`
   on the Gaussian negative log-likelihood.
 
-Both train on the raw linear-RUL targets and are scored against the
-official FD001 test split on RMSE, 95% interval coverage, closed-form CRPS
-and NLL. The train/validation split stays fixed across seeds; only model
+Both train on the standardized linear-RUL targets, and their predictions
+are mapped back to RUL cycles to be scored against the official FD001 test
+split on RMSE, 95% interval coverage, closed-form CRPS and NLL. The train/validation split stays fixed across seeds; only model
 initialization changes.
 
-It then draws the first seed's validation RUL curves: the staged model's row
-above the joint model's, for the same lifetime-spanning validation units.
+It then draws the first seed's validation RUL curves, in cycles: the staged
+model's row above the joint model's, for the same lifetime-spanning
+validation units.
 
 With `--posterior-stage` it adds two MC-Dropout models. Each is its
 baseline trained once with dropout active, its only regularizer, and
@@ -30,7 +31,8 @@ its posterior is the trained mean network under dropout masks. A fresh Gamma
 network is then re-fitted to the squared residuals of the posterior
 predictive's mean, and the draws share that variance. The models are then
 `joint`, `joint+mcd`, `staged` and `staged+mcd`, in that order, in the
-per-run lines, the table and the figure.
+per-run lines and the table; the figure draws only `joint+mcd` and
+`staged+mcd`.
 
 Run it with:
 
@@ -65,6 +67,7 @@ from run import (
     TEST_METRICS,
     CmapssConfig,
     PreparedCmapssData,
+    CyclesPredictive,
     build_composite_model,
     build_mc_dropout_predictive,
     build_staged_mcd_posterior,
@@ -96,24 +99,28 @@ COMPARISON_METRICS: tuple[EpochMetric, ...] = (*TEST_METRICS, NegativeLogLikelih
 JOINT_STAGE = "joint"
 """The stage segment the joint model's training is reported under."""
 
+MCD_MODEL_NAMES = ("joint+mcd", "staged+mcd")
+"""The MC-Dropout models, the only ones `--posterior-stage`'s figure draws."""
+
 
 def train_joint_model(
     prepared: PreparedCmapssData,
     config: CmapssConfig,
     *,
+    epochs: int,
     event_sinks: Sequence[EventSink],
     dropout_rate: float = 0.0,
 ) -> Cnn1DGaussianModel:
     """Train a joint model with `run_supervised` on the Gaussian NLL.
 
     The model is validated on the held-out validation windows after every
-    epoch and trained for `config.joint_epochs` epochs on the raw RUL
-    targets.
+    epoch and trained on the standardized RUL targets.
 
     Args:
         prepared: The prepared FD001 windows to train and validate on.
         config: Example configuration controlling model size and training;
             `config.seed` sets the model's initialization.
+        epochs: Number of training epochs.
         event_sinks: Sinks notified of the training events; pass none to
             train silently.
         dropout_rate: The network's dropout rate, active during training;
@@ -140,7 +147,7 @@ def train_joint_model(
         state=initialize_training_state(
             setup.model, setup.optimizer, rng_key=setup.rng_key
         ),
-        epochs=config.joint_epochs,
+        epochs=epochs,
         validation=HeldOutValidation(
             model=setup.model, loader=setup.validation_loader, loss=loss
         ),
@@ -154,6 +161,9 @@ def score_on_test_split(
     model: nnx.Module, prepared: PreparedCmapssData
 ) -> dict[str, float]:
     """Score a model on the FD001 test split with `COMPARISON_METRICS`.
+
+    The model must predict in RUL cycles, as `CyclesPredictive` does, since
+    the test RUL is in cycles.
 
     The predictor is chosen by the model's output: `GaussianPredictor` for a
     `Gaussian`, `PosteriorPredictivePredictor` for a `PosteriorPredictive`,
@@ -192,7 +202,7 @@ class ModelResult:
             header, e.g. `"staged"`.
         label: The model's row label in the figure, e.g. `"Staged model"`.
         model: The trained, eval-mode model, returning a `Gaussian` or a
-            `PosteriorPredictive`.
+            `PosteriorPredictive` in RUL cycles.
         metrics: The model's `COMPARISON_METRICS` on the test split, by
             metric name.
     """
@@ -209,8 +219,7 @@ class SeedComparison:
 
     Attributes:
         seed: The seed every model was initialized from.
-        models: One result per model, in the table's column order and the
-            figure's row order. Without `--posterior-stage`: `staged`, then
+        models: One result per model, in the table's column order. Without `--posterior-stage`: `staged`, then
             `joint`. With it: `joint`, `joint+mcd`, `staged`, then
             `staged+mcd`.
     """
@@ -278,7 +287,9 @@ def _train_joint(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.Modu
     Returns:
         An eval-mode clone of the trained `Cnn1DGaussianModel`.
     """
-    joint_model = nnx.clone(train_joint_model(prepared, config, event_sinks=()))
+    joint_model = nnx.clone(
+        train_joint_model(prepared, config, epochs=config.joint_epochs, event_sinks=())
+    )
     joint_model.eval()
     return joint_model
 
@@ -296,7 +307,11 @@ def _train_joint_mcd(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.
         `build_mc_dropout_predictive`.
     """
     network = train_joint_model(
-        prepared, config, event_sinks=(), dropout_rate=config.dropout_rate
+        prepared,
+        config,
+        epochs=config.joint_epochs,
+        event_sinks=(),
+        dropout_rate=config.dropout_rate,
     )
     return build_mc_dropout_predictive(network, config)
 
@@ -346,8 +361,9 @@ def _train_and_score_seed(
 
     Without a posterior stage the models are the staged and then the joint
     model; with one, the joint, the joint MC-Dropout, the staged and the
-    staged MC-Dropout model. Each model is trained from scratch and scored in
-    that order.
+    staged MC-Dropout model. Each model is trained from scratch on the
+    standardized targets, wrapped in `CyclesPredictive`, and scored in that
+    order.
 
     Args:
         prepared: The prepared FD001 windows to train, validate and score on.
@@ -361,6 +377,7 @@ def _train_and_score_seed(
     """
 
     def score(name: str, label: str, model: nnx.Module) -> ModelResult:
+        model = CyclesPredictive(model, prepared.target_standardization)
         metrics = score_on_test_split(model, prepared)
         on_run(name, config.seed, metrics)
         return ModelResult(name=name, label=label, model=model, metrics=metrics)
@@ -508,7 +525,9 @@ def main() -> None:
     """Compare the CMAPSS models over seeds, print and plot the results.
 
     Compares `staged` and `joint`; with `--posterior-stage`, `joint`,
-    `joint+mcd`, `staged` and `staged+mcd`, in that order.
+    `joint+mcd`, `staged` and `staged+mcd`, in that order. The figure draws
+    every model without the flag, and only `joint+mcd` and `staged+mcd`
+    with it.
 
     Pass `--seeds` to set the number of seeds (default 5), `--plot-path` to save the
     first seed's RUL-curves figure to that path instead of displaying it, and
@@ -527,7 +546,7 @@ def main() -> None:
         default=None,
         help=(
             "Save the first seed's validation RUL-curves figure, one row per "
-            "model, to this path instead of displaying it."
+            "plotted model, to this path instead of displaying it."
         ),
     )
     parser.add_argument(
@@ -555,12 +574,16 @@ def main() -> None:
     print(f"\nFD001 test metrics over {args.seeds} seeds (mean ± std):")
     print(format_comparison_table(results))
 
-    first = results[0]
+    plotted = [
+        result
+        for result in results[0].models
+        if not args.posterior_stage or result.name in MCD_MODEL_NAMES
+    ]
     validation_trajectories = prepared.validation_trajectories
     plot_validation_rul_curves(
         validation_trajectories,
         prepared.standardization.feature_columns,
-        [LabelledModel(result.label, result.model) for result in first.models],
+        [LabelledModel(result.label, result.model) for result in plotted],
         units=select_lifetime_spanning_units(validation_trajectories),
         window_length=config.window_length,
         save_path=args.plot_path,

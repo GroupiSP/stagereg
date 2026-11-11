@@ -1,7 +1,7 @@
 """End-to-end CMAPSS FD001 two-stage probabilistic RUL training and evaluation.
 
 Loads the FD001 training and test splits, builds standardized sliding
-windows, and trains a two-stage probabilistic pipeline through `stagereg`'s
+windows and standardized RUL targets, and trains a two-stage probabilistic pipeline through `stagereg`'s
 explicit supervised stages:
 
 * Stage 1 trains a deterministic 1D-CNN mean model via `MeanStage`.
@@ -9,8 +9,8 @@ explicit supervised stages:
   frozen Stage-1 model's squared residuals via `GammaVarianceStage`.
 
 The frozen Stage-1 point prediction and the Stage-2 Gamma mean are then
-combined into a composite `Gaussian` predictive distribution, evaluated
-end to end against the official FD001 test split with `stagereg`'s
+combined into a composite `Gaussian` predictive distribution, mapped back
+to RUL cycles with `CyclesPredictive`, and evaluated end to end against the official FD001 test split with `stagereg`'s
 `MetricSuite`/`GaussianPredictor`/`evaluate_loader` machinery, reporting
 RMSE, 95% interval coverage, and the closed-form CRPS. The test split follows a
 single-window-per-trajectory protocol: one window per test unit, ending at
@@ -58,10 +58,12 @@ from model import (
 from plots import LabelledModel, plot_validation_rul_curves
 from preprocessing import (
     SensorStandardization,
+    TargetStandardization,
     apply_standardization,
     build_last_windows,
     build_windows,
     fit_standardization,
+    fit_target_standardization,
     select_lifetime_spanning_units,
     split_by_unit,
 )
@@ -78,6 +80,7 @@ from stagereg.core.tracking import EventSink, TrainingEvent
 from stagereg.core.types import Batch, ParameterRole, StageState, TrainingState
 from stagereg.jax import (
     GammaVarianceStage,
+    Gaussian,
     GaussianPredictor,
     HeldOutValidation,
     MCDropout,
@@ -124,7 +127,7 @@ class CmapssConfig:
         gamma_weight_decay: AdamW decoupled weight decay of the Gamma
             model's training, which shrinks it toward a constant variance.
         joint_epochs: Number of training epochs for the joint model of the
-            staged-vs-joint comparison.
+            staged-vs-joint comparison, with or without MC-Dropout.
         dropout_rate: Dropout rate, in `[0, 1)`, of the MC-Dropout models'
             backbones: the joint MC-Dropout network and the staged
             MC-Dropout model's mean network, both trained and predicted with
@@ -140,11 +143,11 @@ class CmapssConfig:
     hidden_channels: int = 16
     kernel_size: int = 5
     learning_rate: float = 1e-3
-    mean_epochs: int = 20
-    variance_epochs: int = 20
+    mean_epochs: int = 100
+    variance_epochs: int = 100
     gamma_hidden_channels: int = 4
     gamma_weight_decay: float = 0.1
-    joint_epochs: int = 20
+    joint_epochs: int = 100
     dropout_rate: float = 0.1
     num_draws: int = 100
     seed: int = 0
@@ -735,6 +738,52 @@ def build_composite_model(
     return composite
 
 
+class CyclesPredictive(nnx.Module, pytree=False):
+    """A model trained on standardized RUL targets, predicting in cycles.
+
+    Maps the wrapped model's standardized predictive back to RUL cycles: a
+    `Gaussian`'s location and scale, or a `PosteriorPredictive`'s draws and
+    aleatoric variance, through the affine inverse of the targets'
+    standardization. Test scoring and the figure compare against RUL in
+    cycles, so every model they see is wrapped.
+    """
+
+    def __init__(
+        self, model: nnx.Module, standardization: TargetStandardization
+    ) -> None:
+        """Wrap a model, without copying it.
+
+        Args:
+            model: A model mapping windows to a standardized `Gaussian` or
+                `PosteriorPredictive`.
+            standardization: The statistics its training targets were
+                standardized with.
+        """
+        self.model: nnx.Module = model
+        self.standardization: TargetStandardization = standardization
+
+    def __call__(self, inputs: jax.Array) -> Gaussian | PosteriorPredictive:
+        """Predict the wrapped model's distribution, in RUL cycles.
+
+        Args:
+            inputs: Windowed sensor readings, shape ``(batch, window_length,
+                n_sensors)``.
+
+        Returns:
+            The wrapped model's output, of the same type, in cycles.
+        """
+        mean = self.standardization.mean
+        scale = self.standardization.scale
+        output = self.model(inputs)
+        if isinstance(output, PosteriorPredictive):
+            return PosteriorPredictive(
+                draws=output.draws * scale + mean,
+                aleatoric_variance=output.aleatoric_variance * scale**2,
+                draw_mask=output.draw_mask,
+            )
+        return Gaussian(loc=output.loc * scale + mean, scale=output.scale * scale)
+
+
 def evaluate_test_metrics(
     model: nnx.Module,
     test_windows: np.ndarray,
@@ -791,6 +840,10 @@ def evaluate_test_metrics(
 class PreparedCmapssData:
     """The standardized FD001 arrays and trajectories one training run needs.
 
+    The sensor features and the training and validation RUL targets are
+    standardized with statistics fitted on the training subset only; the
+    test RUL stays in cycles, so a model is scored through `CyclesPredictive`.
+
     Carries both the windowed arrays the stages train and score on and the
     standardized trajectories they were windowed from, so that a downstream
     consumer — a per-cycle RUL curve, say — can re-window a unit under
@@ -800,19 +853,24 @@ class PreparedCmapssData:
     Attributes:
         train_windows: Training sliding windows, shape `(n_train,
             window_length, n_sensors)`.
-        train_targets: Training linear-RUL targets, shape `(n_train,)`.
+        train_targets: Standardized training linear-RUL targets, shape
+            `(n_train,)`.
         validation_windows: Held-out validation windows, same layout as
             `train_windows`.
-        validation_targets: Held-out validation linear-RUL targets.
+        validation_targets: Held-out validation linear-RUL targets,
+            standardized with the training statistics.
         test_windows: One trailing window per test unit, shape `(n_units,
             window_length, n_sensors)`.
-        test_rul: Ground-truth RUL per test unit, shape `(n_units,)`.
+        test_rul: Ground-truth RUL per test unit, in cycles, shape
+            `(n_units,)`.
         train_trajectories: The standardized training-subset trajectories
             `train_windows` was built from.
         validation_trajectories: The standardized validation-subset
             trajectories `validation_windows` was built from.
-        standardization: The statistics fitted on the training subset only
-            and applied to every subset.
+        standardization: The sensor statistics fitted on the training
+            subset only and applied to every subset.
+        target_standardization: The RUL-target statistics fitted on the
+            training targets only and applied to the validation targets.
     """
 
     train_windows: np.ndarray
@@ -824,6 +882,7 @@ class PreparedCmapssData:
     train_trajectories: pd.DataFrame
     validation_trajectories: pd.DataFrame
     standardization: SensorStandardization
+    target_standardization: TargetStandardization
 
 
 def prepare_cmapss_windows(config: CmapssConfig) -> PreparedCmapssData:
@@ -835,9 +894,10 @@ def prepare_cmapss_windows(config: CmapssConfig) -> PreparedCmapssData:
 
     Returns:
         A `PreparedCmapssData` holding the windowed arrays, the
-        standardized trajectories they came from, and the standardization
-        statistics. Those statistics are fit on the training subset only
-        and reused for the validation and test subsets.
+        standardized trajectories they came from, and the sensor and target
+        standardization statistics. Those statistics are fit on the
+        training subset only and reused for the other subsets; the test RUL
+        stays in cycles.
     """
     train_data = load_fd001_data()
     train_df, validation_df = split_by_unit(
@@ -859,17 +919,19 @@ def prepare_cmapss_windows(config: CmapssConfig) -> PreparedCmapssData:
         test_data, _SENSOR_NAMES, window_length=config.window_length
     )
     test_rul = load_fd001_test_rul()
+    target_stats = fit_target_standardization(train_targets)
 
     return PreparedCmapssData(
         train_windows=train_windows,
-        train_targets=train_targets,
+        train_targets=target_stats.standardize(train_targets),
         validation_windows=validation_windows,
-        validation_targets=validation_targets,
+        validation_targets=target_stats.standardize(validation_targets),
         test_windows=test_windows,
         test_rul=test_rul,
         train_trajectories=train_df,
         validation_trajectories=validation_df,
         standardization=stats,
+        target_standardization=target_stats,
     )
 
 
@@ -910,8 +972,12 @@ def main() -> None:
         event_sinks=[PrintingEventSink()],
     )
 
-    metrics = evaluate_test_metrics(
+    staged_model = CyclesPredictive(
         build_composite_model(mean_model, variance_model),
+        prepared.target_standardization,
+    )
+    metrics = evaluate_test_metrics(
+        staged_model,
         prepared.test_windows,
         prepared.test_rul,
     )
@@ -923,11 +989,7 @@ def main() -> None:
     plot_validation_rul_curves(
         validation_trajectories,
         _SENSOR_NAMES,
-        [
-            LabelledModel(
-                "Staged model", build_composite_model(mean_model, variance_model)
-            )
-        ],
+        [LabelledModel("Staged model", staged_model)],
         units=select_lifetime_spanning_units(validation_trajectories),
         window_length=config.window_length,
         save_path=args.plot_path,

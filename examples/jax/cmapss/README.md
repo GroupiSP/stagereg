@@ -129,7 +129,12 @@ cycle. `prepare_cmapss_windows` returns a frozen `PreparedCmapssData`
 carrying the windowed arrays together with the standardized trajectories
 they were built from and the standardization statistics fitted on the
 training subset, so a downstream consumer can re-window a unit under
-exactly the feature scaling the models were trained with.
+exactly the feature scaling the models were trained with. The training and
+validation RUL targets are standardized too, with the training targets'
+mean and standard deviation (`target_standardization`); the test RUL stays
+in cycles. Every model trains on the standardized targets and is scored and
+plotted through `CyclesPredictive`, which maps its Gaussian or posterior
+predictive back to cycles.
 `build_composite_model` is the one factory for the composite predictive
 model: it clones both trained stage models and returns the composite in
 eval mode, so every consumer scores the same model in the same mode.
@@ -174,10 +179,10 @@ prepared FD001 data. The joint model (`Cnn1DGaussianModel` in `model.py`) is
 one 1D-CNN backbone, with the same architecture and hyperparameters as each
 staged model's backbone, followed by `stagereg`'s `GaussianHead`. It is
 trained with `run_supervised` on the Gaussian negative log-likelihood for
-`joint_epochs` epochs (default 20, the same budget as each stage), and
+`joint_epochs` epochs (default 100, the same budget as each stage), and
 validated on the held-out validation windows after every epoch. Both models
-train on the raw linear-RUL targets, with no target standardization, so any
-instability of joint training on unscaled targets shows up in the results.
+train on the standardized linear-RUL targets and predict in cycles through
+`CyclesPredictive`.
 
 The data is prepared once, with the configured seed, so the train/validation
 split is the same for every seed; seed index `i` initializes both models
@@ -206,7 +211,9 @@ uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 10
 Finally it plots the first seed's RUL curves for the same shortest-,
 median-, and longest-lifetime held-out validation units as `run.py`: the
 staged model's row above the joint model's, with a shared time axis in each
-column. Using the first seed keeps the figure reproducible. Pass
+column. Using the first seed keeps the figure reproducible. With
+`--posterior-stage` the figure draws only the two MC-Dropout models (see
+below). Pass
 `--plot-path` to save that figure instead of displaying it:
 
 ```shell
@@ -223,8 +230,7 @@ the parameter count.
 Pass `--posterior-stage` to add the **joint MC-Dropout model** (`joint+mcd`)
 and the **staged MC-Dropout model** (`staged+mcd`). The comparison is then of
 a single training (joint) against separate trainings (staged), each with and
-without an MC-Dropout posterior. The four models per seed, in column and
-figure-row order:
+without an MC-Dropout posterior. The four models per seed, in column order:
 
 | Column | Model | How it is trained | Predictive distribution |
 | --- | --- | --- | --- |
@@ -248,7 +254,8 @@ uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5
 uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5 --posterior-stage
 ```
 
-`--seeds` and `--plot-path` work the same either way.
+`--seeds` and `--plot-path` work the same either way, but with the flag the
+figure has two rows only: `joint+mcd` above `staged+mcd`.
 
 ##### How the MC-Dropout models are trained
 
@@ -283,9 +290,9 @@ aleatoric variance.
 
 ##### Reading the total and epistemic bands
 
-In the figure the Gaussian rows (`joint`, `staged`) keep their single
-`loc ± 1.96 * scale` band. Each MC-Dropout row draws the mixture mean and
-two bands around it:
+Without the flag the figure's Gaussian rows (`joint`, `staged`) draw a
+single `loc ± 1.96 * scale` band. With it, each MC-Dropout row draws the
+mixture mean and two bands around it:
 
 - the **total band**, the posterior predictive's central 95% interval
   (from the mixture's quantiles): where the next observed RUL should fall,

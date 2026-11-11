@@ -205,7 +205,51 @@ def test_cmapss_config_gives_the_joint_model_the_same_default_budget_as_each_sta
 ) -> None:
     config = cmapss_run.CmapssConfig()
 
-    assert config.joint_epochs == 20
+    assert config.mean_epochs == config.variance_epochs == 100
+    assert config.joint_epochs == 100
+
+
+def test_cycles_predictive_maps_a_gaussian_back_to_cycles(
+    cmapss_run: ModuleType,
+) -> None:
+    from stagereg.jax import Gaussian
+
+    class FixedGaussian(nnx.Module):
+        def __call__(self, inputs: Any) -> Any:
+            return Gaussian(loc=jnp.array([[-1.0], [0.5]]), scale=jnp.array([[2.0]]))
+
+    standardization = cmapss_run.TargetStandardization(mean=50.0, scale=10.0)
+
+    output = cmapss_run.CyclesPredictive(FixedGaussian(), standardization)(None)
+
+    assert isinstance(output, Gaussian)
+    np.testing.assert_allclose(output.loc, [[40.0], [55.0]])
+    np.testing.assert_allclose(output.scale, [[20.0]])
+
+
+def test_cycles_predictive_maps_a_posterior_predictive_back_to_cycles(
+    cmapss_run: ModuleType,
+) -> None:
+    from stagereg.jax import PosteriorPredictive
+
+    mask = jnp.array([True, False])
+
+    class FixedPosterior(nnx.Module):
+        def __call__(self, inputs: Any) -> Any:
+            return PosteriorPredictive(
+                draws=jnp.array([[[0.0]], [[1.0]]]),
+                aleatoric_variance=jnp.array([[0.25]]),
+                draw_mask=mask,
+            )
+
+    standardization = cmapss_run.TargetStandardization(mean=50.0, scale=10.0)
+
+    output = cmapss_run.CyclesPredictive(FixedPosterior(), standardization)(None)
+
+    assert isinstance(output, PosteriorPredictive)
+    np.testing.assert_allclose(output.draws, [[[50.0]], [[60.0]]])
+    np.testing.assert_allclose(output.aleatoric_variance, [[25.0]])
+    np.testing.assert_array_equal(output.draw_mask, mask)
 
 
 def test_cmapss_config_accepts_the_mc_dropout_defaults(cmapss_run: ModuleType) -> None:
@@ -394,6 +438,24 @@ def test_prepared_data_windows_and_targets_are_aligned(
 
 
 @pytest.mark.usefixtures("offline_fd001")
+def test_prepared_data_standardizes_the_targets_with_training_statistics(
+    cmapss_run: ModuleType, short_window_config: Any
+) -> None:
+    prepared = cmapss_run.prepare_cmapss_windows(short_window_config)
+
+    stats = prepared.target_standardization
+    np.testing.assert_allclose(prepared.train_targets.mean(), 0.0, atol=1e-8)
+    np.testing.assert_allclose(prepared.train_targets.std(ddof=0), 1.0)
+    # Validation targets carry the training statistics: back in cycles they
+    # are a linear RUL, non-negative integers.
+    validation_cycles = prepared.validation_targets * stats.scale + stats.mean
+    np.testing.assert_allclose(validation_cycles, np.round(validation_cycles))
+    assert validation_cycles.min() == pytest.approx(0.0, abs=1e-8)
+    # The test RUL stays in cycles.
+    np.testing.assert_array_equal(prepared.test_rul, cmapss_run.load_fd001_test_rul())
+
+
+@pytest.mark.usefixtures("offline_fd001")
 def test_prepared_data_is_frozen(
     cmapss_run: ModuleType, short_window_config: Any
 ) -> None:
@@ -486,7 +548,9 @@ def test_main_plots_the_rul_curves_after_printing_metrics(
     # The staged-only run draws its one staged model as a single row.
     (labelled,) = call.models
     assert labelled.label == "Staged model"
-    assert isinstance(labelled.model, cmapss_run.CompositeGaussianModel)
+    # It is the composite model, predicting in cycles.
+    assert isinstance(labelled.model, cmapss_run.CyclesPredictive)
+    assert isinstance(labelled.model.model, cmapss_run.CompositeGaussianModel)
     expected_path = Path(plot_path_argv[1]) if plot_path_argv else None
     assert call.save_path == expected_path
     # The unit plotted is a held-out validation unit, and the metrics are

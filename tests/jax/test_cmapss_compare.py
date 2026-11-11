@@ -143,6 +143,55 @@ def test_compare_models_with_a_posterior_stage_scores_each_baseline_then_its_mcd
         )
 
 
+def test_both_joint_models_train_for_joint_epochs(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dataclasses
+
+    config = dataclasses.replace(
+        mcd_config, mean_epochs=2, variance_epochs=3, joint_epochs=4
+    )
+    trained_epochs: list[int] = []
+    run_supervised = cmapss_compare.run_supervised
+
+    def record_run_supervised(**kwargs: Any) -> Any:
+        trained_epochs.append(kwargs["epochs"])
+        return run_supervised(**kwargs)
+
+    monkeypatch.setattr(cmapss_compare, "run_supervised", record_run_supervised)
+
+    cmapss_compare.compare_models(
+        synthetic_prepared_data(), config, seeds=1, posterior_stage=True
+    )
+
+    # Joint, then joint+mcd, independently of the stages' epochs.
+    assert trained_epochs == [4, 4]
+
+
+def test_compare_models_predict_in_cycles(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    import numpy as np
+
+    # Targets are uniform in [1, 1000) cycles, so their mean is near 500: a
+    # model left predicting in standardized units would put its means near 0.
+    prepared = synthetic_prepared_data(max_rul=1000.0)
+
+    (result,) = cmapss_compare.compare_models(
+        prepared, mcd_config, seeds=1, posterior_stage=True
+    )
+
+    for model in result.models:
+        output = model.model(prepared.test_windows)
+        mean = output.mean() if hasattr(output, "draws") else output.loc
+        assert float(np.mean(mean)) > 100.0, model.name
+
+
 def test_mcd_models_without_dropout_are_their_baselines(
     cmapss_compare: ModuleType,
     mcd_config: Any,
@@ -441,7 +490,7 @@ def test_main_prints_one_line_per_run_and_a_mean_std_table_then_plots(
 
 
 @pytest.mark.usefixtures("offline_fd001")
-def test_main_with_a_posterior_stage_reports_tabulates_and_plots_four_models(
+def test_main_with_a_posterior_stage_reports_four_models_and_plots_the_mcd_ones(
     cmapss_compare: ModuleType,
     mcd_config: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -489,10 +538,5 @@ def test_main_with_a_posterior_stage_reports_tabulates_and_plots_four_models(
     for row in ("RMSE", "95% coverage", "closed-form CRPS", "NLL"):
         (line,) = [line for line in table if line.startswith(row)]
         assert re.fullmatch(rf"{re.escape(row)}(\s+{_CELL}){{4}}", line)
-    assert plotted_labels == [
-        "Joint model",
-        "Joint MC-Dropout model",
-        "Staged model",
-        "Staged MC-Dropout model",
-    ]
+    assert plotted_labels == ["Joint MC-Dropout model", "Staged MC-Dropout model"]
     assert plot_path.is_file()

@@ -116,6 +116,48 @@ def apply_standardization(
     return result
 
 
+@dataclass(frozen=True)
+class TargetStandardization:
+    """RUL-target standardization statistics fitted on a training subset.
+
+    Attributes:
+        mean: Mean of the training RUL targets, in cycles.
+        scale: Standard deviation of the training RUL targets, in cycles,
+            guarded to 1.0 when they are constant.
+    """
+
+    mean: float
+    scale: float
+
+    def standardize(self, targets: np.ndarray) -> np.ndarray:
+        """Map RUL targets in cycles to standardized units.
+
+        Args:
+            targets: RUL targets in cycles, any shape.
+
+        Returns:
+            `(targets - mean) / scale`, shaped like `targets`.
+        """
+        return (np.asarray(targets, dtype=float) - self.mean) / self.scale
+
+
+def fit_target_standardization(targets: np.ndarray) -> TargetStandardization:
+    """Fit RUL-target standardization statistics from training targets.
+
+    Args:
+        targets: Training RUL targets in cycles, any shape; at least one.
+
+    Returns:
+        The targets' mean and population standard deviation (`ddof=0`), the
+        latter guarded to 1.0 for constant targets.
+    """
+    values = np.asarray(targets, dtype=float)
+    scale = float(values.std(ddof=0))
+    return TargetStandardization(
+        mean=float(values.mean()), scale=scale if scale > 0.0 else 1.0
+    )
+
+
 def _pad_unit_features(
     unit_id: object, features: np.ndarray, window_length: int
 ) -> np.ndarray:

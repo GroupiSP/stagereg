@@ -1,9 +1,8 @@
-"""Benchmark harness for stagereg's two reference workloads.
+"""Benchmark harness for stagereg's reference workload.
 
 Runs the XSin posterior example under pSGLD (mean, variance and posterior
-stages, then final scoring) and the CMAPSS FD001 run (mean and variance
-stages, then final scoring) through their example entry points, and reports
-per stage:
+stages, then final scoring) through its example entry point, and reports per
+stage:
 
 * **time to first step**: from the stage's start (its construction and
   ``prepare``, e.g. the variance stage's residual pass, included) to the end
@@ -22,17 +21,13 @@ per stage:
 Final scoring is reported as its own row: its compiles and wall time.
 
 Measurement hooks into the epoch loop that every stage runs (it wraps the
-training loader and step that the stage hands to it); the workloads
-themselves run unchanged. It is a measuring tool, never a CI gate: timings
+training loader and step that the stage hands to it); the workload itself
+runs unchanged. It is a measuring tool, never a CI gate: timings
 are noisy and machine-dependent.
 
-Run both workloads at the examples' default configurations on CPU with:
+Run the workload at the example's default configuration on CPU with:
 
-    JAX_PLATFORMS=cpu uv run --extra jax --group example-cmapss \\
-        python benchmarks/harness.py
-
-Pass ``--workload xsin`` or ``--workload cmapss`` to run one. CMAPSS reads
-the FD001 archive the example downloads and caches.
+    JAX_PLATFORMS=cpu uv run --extra jax python benchmarks/harness.py
 """
 
 from __future__ import annotations
@@ -366,15 +361,6 @@ def load_xsin_posterior() -> ModuleType:
     )
 
 
-def load_cmapss() -> ModuleType:
-    """Load the CMAPSS run example module.
-
-    Returns:
-        ``examples/jax/cmapss/run.py``.
-    """
-    return _load_example_module("cmapss_run", _EXAMPLES_DIR / "cmapss" / "run.py")
-
-
 def run_xsin(config: Any = None) -> WorkloadReport:
     """Run the XSin posterior example under pSGLD and measure it.
 
@@ -415,62 +401,6 @@ def run_xsin(config: Any = None) -> WorkloadReport:
     )
 
 
-def run_cmapss(config: Any = None, *, prepared: Any = None) -> WorkloadReport:
-    """Run the CMAPSS FD001 example and measure it.
-
-    Trains the mean and Gamma variance stages and scores the composite
-    Gaussian on the test split, as the example does; it skips the plot.
-
-    Args:
-        config: A ``CmapssConfig``. Defaults to ``None``, the example's
-            default configuration.
-        prepared: The windowed data from ``prepare_cmapss_windows``. Defaults
-            to ``None``, which prepares it from the cached FD001 archive.
-
-    Returns:
-        The report of the mean and variance stages and final scoring.
-    """
-    cmapss = load_cmapss()
-    config = cmapss.CmapssConfig() if config is None else config
-    if prepared is None:
-        prepared = cmapss.prepare_cmapss_windows(config)
-    with _Probe().active() as probe, _quiet():
-        start = probe.mark()
-        mean_model, state = cmapss.train_mean_model(
-            prepared.train_windows,
-            prepared.train_targets,
-            prepared.validation_windows,
-            prepared.validation_targets,
-            config,
-            event_sinks=[cmapss.PrintingEventSink()],
-        )
-        probe.mark()
-        variance_model = cmapss.train_gamma_model(
-            state,
-            prepared.train_windows,
-            prepared.train_targets,
-            config,
-            event_sinks=[cmapss.PrintingEventSink()],
-        )
-        scoring_start = probe.mark()
-        cmapss.evaluate_test_metrics(
-            cmapss.build_composite_model(mean_model, variance_model),
-            prepared.test_windows,
-            prepared.test_rul,
-        )
-        end = time.perf_counter()
-    return WorkloadReport(
-        name="CMAPSS FD001",
-        stages=probe.stage_reports(),
-        scoring=PhaseReport(
-            name="final scoring",
-            compiles=probe.compiles_between(scoring_start, end),
-            wall_time=end - scoring_start,
-        ),
-        wall_time=end - start,
-    )
-
-
 @contextlib.contextmanager
 def _quiet() -> Iterator[None]:
     """Silence the examples' per-epoch printing."""
@@ -480,7 +410,6 @@ def _quiet() -> Iterator[None]:
 
 _WORKLOADS: dict[str, Callable[[], WorkloadReport]] = {
     "xsin": run_xsin,
-    "cmapss": run_cmapss,
 }
 
 

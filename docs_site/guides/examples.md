@@ -151,6 +151,12 @@ predictive, and their figure rows show a total and an epistemic 95% band.
 uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5 --posterior-stage
 ```
 
+Add `--proxy-variance` as well for a fifth model, `staged+mcd+proxy`: the
+staged MC-Dropout model with its mean stage trained on a Gaussian NLL under
+a fixed, fictitious scale that shrinks linearly with the true RUL to a few
+cycles at failure. End-of-life windows then weigh most, which should narrow
+the dropout spread near the end of life.
+
 The first run downloads the CMAPSS archive from NASA and caches it on disk, so
 it needs network access once. The README explains how to point the example at
 a copy you already have.

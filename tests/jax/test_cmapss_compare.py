@@ -540,3 +540,88 @@ def test_main_with_a_posterior_stage_reports_four_models_and_plots_the_mcd_ones(
         assert re.fullmatch(rf"{re.escape(row)}(\s+{_CELL}){{4}}", line)
     assert plotted_labels == ["Joint MC-Dropout model", "Staged MC-Dropout model"]
     assert plot_path.is_file()
+
+
+_PROXY_NAMES = ("joint", "joint+mcd", "staged", "staged+mcd", "staged+mcd+proxy")
+
+
+def test_compare_models_with_a_proxy_variance_adds_a_fifth_mcd_model(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    from stagereg.jax import PosteriorPredictive
+
+    prepared = synthetic_prepared_data()
+
+    (without,) = cmapss_compare.compare_models(
+        prepared, mcd_config, seeds=1, posterior_stage=True
+    )
+    (result,) = cmapss_compare.compare_models(
+        prepared, mcd_config, seeds=1, posterior_stage=True, proxy_variance=True
+    )
+
+    assert [model.name for model in result.models] == list(_PROXY_NAMES)
+    proxy = result.models[-1]
+    assert proxy.label == "Staged MC-Dropout proxy-variance model"
+    assert set(proxy.metrics) == _METRIC_NAMES
+    predictive = proxy.model(prepared.test_windows)
+    assert isinstance(predictive, PosteriorPredictive)
+    assert predictive.num_draws == mcd_config.num_draws
+    # The first four models are unchanged; the proxy objective changes the fifth.
+    for before, after in zip(without.models, result.models, strict=False):
+        assert before.metrics == after.metrics
+    assert proxy.metrics != without.models[-1].metrics
+
+
+def test_compare_models_refuses_a_proxy_variance_without_a_posterior_stage(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    synthetic_prepared_data: Callable[..., Any],
+) -> None:
+    with pytest.raises(ValueError, match="posterior_stage"):
+        cmapss_compare.compare_models(
+            synthetic_prepared_data(), mcd_config, seeds=1, proxy_variance=True
+        )
+
+
+@pytest.mark.usefixtures("offline_fd001")
+def test_main_with_a_proxy_variance_reports_five_models_and_plots_three_mcd_rows(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    plot_recorder: Any,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["compare.py", "--seeds", "1", "--posterior-stage", "--proxy-variance"],
+    )
+    monkeypatch.setattr(cmapss_compare, "CmapssConfig", lambda: mcd_config)
+    monkeypatch.setattr(cmapss_compare, "plot_validation_rul_curves", plot_recorder)
+
+    cmapss_compare.main()
+
+    (plot,) = plot_recorder.calls
+    run_lines = [line for line in plot.printed.splitlines() if line.startswith("[")]
+    assert [line.split()[0] for line in run_lines] == [
+        f"[{name}" for name in _PROXY_NAMES
+    ]
+    assert [model.label for model in plot.models] == [
+        "Joint MC-Dropout model",
+        "Staged MC-Dropout model",
+        "Staged MC-Dropout proxy-variance model",
+    ]
+
+
+@pytest.mark.usefixtures("offline_fd001")
+def test_main_refuses_a_proxy_variance_without_a_posterior_stage(
+    cmapss_compare: ModuleType,
+    mcd_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["compare.py", "--proxy-variance"])
+    monkeypatch.setattr(cmapss_compare, "CmapssConfig", lambda: mcd_config)
+
+    with pytest.raises(SystemExit):
+        cmapss_compare.main()

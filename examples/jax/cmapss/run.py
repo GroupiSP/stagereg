@@ -57,6 +57,7 @@ from model import (
 )
 from plots import LabelledModel, plot_validation_rul_curves
 from preprocessing import (
+    ProxyVarianceSchedule,
     SensorStandardization,
     TargetStandardization,
     apply_standardization,
@@ -68,13 +69,14 @@ from preprocessing import (
     split_by_unit,
 )
 
-from stagereg.core.losses import SquaredErrorLoss
+from stagereg.core.losses import NegativeLogLikelihoodLoss, SquaredErrorLoss
 from stagereg.core.metric_registry import (
     ClosedFormContinuousRankedProbabilityScore,
     EpochMetric,
     IntervalCoverage,
     RootMeanSquaredError,
 )
+from stagereg.core.distributions import PredictionLoss
 from stagereg.core.protocols import LoaderFactory
 from stagereg.core.tracking import EventSink, TrainingEvent
 from stagereg.core.types import Batch, ParameterRole, StageState, TrainingState
@@ -134,6 +136,9 @@ class CmapssConfig:
             dropout active. Dropout is their only regularizer.
         num_draws: Number of dropout-mask sets an MC-Dropout model's posterior
             predictive mixes.
+        proxy_variance_floor_cycles: End-of-life scale, in cycles, of the
+            proxy-variance schedule the staged MC-Dropout proxy model's mean
+            stage is trained under; see `ProxyVarianceNLL`.
         seed: Base JAX random seed for splitting, model init, and training.
     """
 
@@ -150,6 +155,7 @@ class CmapssConfig:
     joint_epochs: int = 100
     dropout_rate: float = 0.1
     num_draws: int = 100
+    proxy_variance_floor_cycles: float = 5.0
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -158,7 +164,8 @@ class CmapssConfig:
         Raises:
             ValueError: If sizes, epochs or draws are not positive, the
                 Gamma weight decay is negative, the validation fraction is
-                not in (0, 1), or the dropout rate is not in [0, 1).
+                not in (0, 1), the dropout rate is not in [0, 1), or the
+                proxy-variance floor is not positive.
         """
         if self.window_length <= 0 or self.batch_size <= 0:
             raise ValueError("window_length and batch_size must be positive.")
@@ -178,6 +185,8 @@ class CmapssConfig:
             raise ValueError("dropout_rate must be within [0, 1).")
         if self.num_draws <= 0:
             raise ValueError("num_draws must be positive.")
+        if not self.proxy_variance_floor_cycles > 0.0:
+            raise ValueError("proxy_variance_floor_cycles must be positive.")
 
 
 def make_window_loader(
@@ -305,6 +314,49 @@ def build_supervised_training_setup[ModelT: nnx.Module](
     )
 
 
+@dataclass(frozen=True)
+class ProxyVarianceNLL:
+    """Gaussian NLL of a point prediction under a fixed, RUL-dependent scale.
+
+    Scores each prediction as the location of a `Gaussian` whose scale is the
+    schedule's at the window's true RUL. The scale is fixed, so for the mean
+    it is the squared error weighted by `1 / scale**2`, plus a constant: end-
+    of-life windows weigh most. Trained with dropout, the weighted error
+    penalizes the spread dropout masks cause most where the weight is
+    largest, so the MC-Dropout spread is pushed down toward end of life.
+
+    The schedule tells an aleatoric story, a time to failure that grows more
+    certain as failure nears, but here it shapes the epistemic spread of the
+    dropout masks. The Gamma variance fitted afterwards models the aleatoric
+    part independently, so the two can overlap near end of life; this is a
+    deliberate modelling choice of the experiment.
+
+    Attributes:
+        schedule: The proxy-variance schedule giving the scale at each
+            standardized target.
+    """
+
+    schedule: ProxyVarianceSchedule
+
+    def per_example(self, prediction: jax.Array, batch: Batch) -> jax.Array:
+        """Compute the per-window NLL under the schedule's scale.
+
+        Args:
+            prediction: The mean network's standardized point predictions.
+            batch: Batch holding the standardized RUL targets.
+
+        Returns:
+            An array of per-window negative log-likelihood values.
+
+        Raises:
+            ValueError: If `batch.targets` is missing.
+        """
+        if batch.targets is None:
+            raise ValueError("batch.targets must be provided.")
+        gaussian = Gaussian(loc=prediction, scale=self.schedule.scale(batch.targets))
+        return NegativeLogLikelihoodLoss().per_example(gaussian, batch)
+
+
 def train_mean_model(
     train_windows: np.ndarray,
     train_targets: np.ndarray,
@@ -314,6 +366,7 @@ def train_mean_model(
     *,
     event_sinks: Sequence[EventSink],
     dropout_rate: float = 0.0,
+    objective: PredictionLoss | None = None,
 ) -> tuple[Cnn1DMeanModel, TrainingState]:
     """Train a 1D-CNN mean model through `MeanStage` on windowed RUL data.
 
@@ -329,6 +382,8 @@ def train_mean_model(
             none to train silently.
         dropout_rate: The mean network's dropout rate, active during
             training; 0, the default, trains it without dropout.
+        objective: The per-window objective the mean is trained and
+            validated on; `None`, the default, is `SquaredErrorLoss`.
 
     Returns:
         A tuple of the trained `Cnn1DMeanModel` and the shared staged
@@ -343,7 +398,7 @@ def train_mean_model(
         config,
         dropout_rate=dropout_rate,
     )
-    loss = make_supervised_loss(SquaredErrorLoss())
+    loss = make_supervised_loss(SquaredErrorLoss() if objective is None else objective)
     stage = MeanStage(
         model=setup.model,
         optimizer=setup.optimizer,

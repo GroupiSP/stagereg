@@ -479,3 +479,70 @@ def test_lifetime_spanning_units_rejects_empty_trajectories(
 
     with pytest.raises(ValueError, match="at least one unit"):
         cmapss_preprocessing.select_lifetime_spanning_units(empty)
+
+
+def test_proxy_variance_schedule_is_linear_in_rul_between_its_floor_and_cap(
+    cmapss_preprocessing: ModuleType,
+) -> None:
+    # Lifetimes 100 and 300 cycles: mean 200, population std 100. So sigma
+    # is 100 * rul / 200 cycles, floored at 5 and capped at 100.
+    standardization = cmapss_preprocessing.TargetStandardization(mean=50.0, scale=25.0)
+    schedule = cmapss_preprocessing.fit_proxy_variance_schedule(
+        np.array([100, 300]), standardization, floor_cycles=5.0
+    )
+    rul = np.array([0.0, 2.0, 100.0, 200.0, 400.0])
+
+    scale = schedule.scale(standardization.standardize(rul))
+
+    # In standardized units: cycles divided by the target scale, 25.
+    np.testing.assert_allclose(scale, [0.2, 0.2, 2.0, 4.0, 4.0])
+
+
+def test_proxy_variance_schedule_of_equal_lifetimes_is_its_floor(
+    cmapss_preprocessing: ModuleType,
+) -> None:
+    standardization = cmapss_preprocessing.TargetStandardization(mean=0.0, scale=10.0)
+    schedule = cmapss_preprocessing.fit_proxy_variance_schedule(
+        np.array([150, 150, 150]), standardization, floor_cycles=5.0
+    )
+
+    scale = schedule.scale(standardization.standardize(np.array([0.0, 75.0, 300.0])))
+
+    np.testing.assert_allclose(scale, [0.5, 0.5, 0.5])
+
+
+@given(
+    lifetimes=st.lists(st.integers(min_value=1, max_value=400), min_size=1),
+    rul=st.lists(st.floats(min_value=0.0, max_value=500.0), min_size=2, max_size=20),
+    floor_cycles=st.floats(min_value=0.1, max_value=20.0),
+)
+def test_proxy_variance_schedule_is_monotone_and_bounded(
+    cmapss_preprocessing: ModuleType,
+    lifetimes: list[int],
+    rul: list[float],
+    floor_cycles: float,
+) -> None:
+    standardization = cmapss_preprocessing.TargetStandardization(mean=80.0, scale=40.0)
+    schedule = cmapss_preprocessing.fit_proxy_variance_schedule(
+        np.array(lifetimes), standardization, floor_cycles=floor_cycles
+    )
+    ordered = np.sort(np.array(rul))
+
+    scale = schedule.scale(standardization.standardize(ordered)) * (
+        standardization.scale
+    )
+
+    assert np.all(np.diff(scale) >= -1e-9)
+    initial_scale = max(float(np.std(lifetimes)), floor_cycles)
+    assert np.all(scale >= floor_cycles - 1e-9)
+    assert np.all(scale <= initial_scale + 1e-9)
+
+
+def test_unit_lifetimes_are_each_units_last_cycle_in_unit_order(
+    cmapss_preprocessing: ModuleType,
+) -> None:
+    data = build_trajectories({3: 7, 1: 5, 2: 9}).sample(frac=1.0, random_state=0)
+
+    lifetimes = cmapss_preprocessing.unit_lifetimes(data)
+
+    np.testing.assert_array_equal(lifetimes, [5.0, 9.0, 7.0])

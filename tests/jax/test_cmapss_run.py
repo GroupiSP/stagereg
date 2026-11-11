@@ -571,3 +571,35 @@ def test_main_plots_the_rul_curves_after_printing_metrics(
     assert isinstance(printed, str)
     assert "FD001 test RMSE" in printed
     assert "FD001 test closed-form CRPS" in printed
+
+
+def test_proxy_variance_nll_scores_predictions_under_the_schedule_scale(
+    cmapss_run: ModuleType, cmapss_preprocessing: ModuleType
+) -> None:
+    from stagereg.core.types import Batch
+
+    standardization = cmapss_preprocessing.TargetStandardization(mean=50.0, scale=25.0)
+    schedule = cmapss_preprocessing.ProxyVarianceSchedule(
+        initial_scale=100.0,
+        reference_rul=200.0,
+        floor=5.0,
+        target_standardization=standardization,
+    )
+    # RUL 100 cycles: target 2.0, scale 50/25 = 2.0, residual 1.0.
+    # RUL 0 cycles: target -2.0, scale floor 5/25 = 0.2, residual 0.2.
+    targets = jnp.array([[2.0], [-2.0]])
+    prediction = jnp.array([[3.0], [-1.8]])
+
+    nll = cmapss_run.ProxyVarianceNLL(schedule).per_example(
+        prediction, Batch(inputs=prediction, targets=targets)
+    )
+
+    half_log_two_pi = 0.5 * math.log(2.0 * math.pi)
+    np.testing.assert_allclose(
+        nll,
+        [
+            [0.5 * 0.25 + math.log(2.0) + half_log_two_pi],
+            [0.5 * 1.0 + math.log(0.2) + half_log_two_pi],
+        ],
+        rtol=1e-5,
+    )

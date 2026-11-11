@@ -371,3 +371,52 @@ true RUL of 200 the mean levels off around 150, and the validation coverage
 there was 0.38 for that earlier `staged+mcd` (0.50 for a joint MC-Dropout
 model trained with dropout from scratch). That error is absent from the training residuals the variance is
 fitted to.
+
+#### `--proxy-variance`: a proxy-variance mean stage
+
+`staged+mcd` trains its mean on the squared error, which carries no
+information about how uncertain the RUL is. Dropout then drops the channels
+that track degradation as freely near the end of life as the healthy
+channels early in life, although the time to failure grows more certain as
+failure nears.
+
+Pass `--proxy-variance` together with `--posterior-stage` to add a fifth
+model, the **staged MC-Dropout proxy-variance model**
+(`staged+mcd+proxy`). It is `staged+mcd` with its mean stage trained and
+validated on `ProxyVarianceNLL` (`run.py`): the Gaussian NLL of the mean
+under a fixed, fictitious scale `ProxyVarianceSchedule` (`preprocessing.py`)
+that depends on the window's true RUL `r`:
+
+```text
+sigma(r) = clip(sigma_0 * r / r_ref, floor, sigma_0)
+```
+
+| Term | Value |
+| --- | --- |
+| `sigma_0` | population std of the training units' lifetimes (never below `floor`) |
+| `r_ref` | mean lifetime of the training units |
+| `floor` | `proxy_variance_floor_cycles`, 5 cycles by default |
+
+All three are computed in cycles from the training split and divided by the
+target scale. Since the scale is fixed, the NLL's gradient with respect to the mean is the
+squared error's weighted by `1 / sigma(r)**2`. End-of-life windows weigh up to
+`(sigma_0 / floor)**2`, about 85 times, more than early-life ones. Under
+dropout the expected weighted error includes the spread of the dropout
+masks, so that spread is penalized most near the end of life: the
+epistemic band should narrow there and stay wide early in life. No weight
+normalization is needed, since Adam is close to invariant to the loss
+scale.
+
+The schedule is an aleatoric story, a time to failure growing more certain,
+used to shape the epistemic spread of the dropout masks. The Gamma
+variance, fitted and re-fitted afterwards exactly as for `staged+mcd`,
+models the aleatoric part independently, so the two can overlap near the
+end of life. This is a deliberate choice of the experiment.
+
+```shell
+uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5 --posterior-stage --proxy-variance
+```
+
+The other four models are unchanged. The figure gains a third row,
+`staged+mcd+proxy`, below `staged+mcd`, so that their bands can be compared
+along each unit's life.

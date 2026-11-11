@@ -34,6 +34,15 @@ predictive's mean, and the draws share that variance. The models are then
 per-run lines and the table; the figure draws only `joint+mcd` and
 `staged+mcd`.
 
+With `--proxy-variance` as well it adds a fifth model, the **staged
+MC-Dropout proxy-variance model** (`staged+mcd+proxy`): the staged
+MC-Dropout model with its mean stage trained and validated on
+`ProxyVarianceNLL` instead of the squared error. That is a Gaussian NLL
+under a fictitious scale that shrinks linearly with the true RUL, from the
+spread of the training units' lifetimes to `proxy_variance_floor_cycles` at
+failure, so end-of-life windows weigh most and the dropout spread is pushed
+down there. The figure then draws it as a third row.
+
 Run it with:
 
     uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5
@@ -62,11 +71,16 @@ if str(_MODULE_DIR) not in sys.path:
 
 from model import Cnn1DGammaModel, Cnn1DGaussianModel, Cnn1DMeanModel
 from plots import LabelledModel, plot_validation_rul_curves
-from preprocessing import select_lifetime_spanning_units
+from preprocessing import (
+    fit_proxy_variance_schedule,
+    select_lifetime_spanning_units,
+    unit_lifetimes,
+)
 from run import (
     TEST_METRICS,
     CmapssConfig,
     PreparedCmapssData,
+    ProxyVarianceNLL,
     CyclesPredictive,
     build_composite_model,
     build_mc_dropout_predictive,
@@ -80,6 +94,7 @@ from run import (
 )
 
 from stagereg.core import NegativeLogLikelihood, NegativeLogLikelihoodLoss
+from stagereg.core.distributions import PredictionLoss
 from stagereg.core.metric_registry import EpochMetric
 from stagereg.core.tracking import EventSink
 from stagereg.core.types import TrainingState
@@ -99,7 +114,7 @@ COMPARISON_METRICS: tuple[EpochMetric, ...] = (*TEST_METRICS, NegativeLogLikelih
 JOINT_STAGE = "joint"
 """The stage segment the joint model's training is reported under."""
 
-MCD_MODEL_NAMES = ("joint+mcd", "staged+mcd")
+MCD_MODEL_NAMES = ("joint+mcd", "staged+mcd", "staged+mcd+proxy")
 """The MC-Dropout models, the only ones `--posterior-stage`'s figure draws."""
 
 
@@ -221,7 +236,7 @@ class SeedComparison:
         seed: The seed every model was initialized from.
         models: One result per model, in the table's column order. Without `--posterior-stage`: `staged`, then
             `joint`. With it: `joint`, `joint+mcd`, `staged`, then
-            `staged+mcd`.
+            `staged+mcd`, and `staged+mcd+proxy` with `--proxy-variance`.
     """
 
     seed: int
@@ -244,7 +259,11 @@ def _ignore_run(model: str, seed: int, metrics: dict[str, float]) -> None:
 
 
 def _train_staged_networks(
-    prepared: PreparedCmapssData, config: CmapssConfig, *, dropout_rate: float = 0.0
+    prepared: PreparedCmapssData,
+    config: CmapssConfig,
+    *,
+    dropout_rate: float = 0.0,
+    objective: PredictionLoss | None = None,
 ) -> tuple[Cnn1DMeanModel, Cnn1DGammaModel, TrainingState]:
     """Silently train the staged model's mean and Gamma variance networks.
 
@@ -253,6 +272,8 @@ def _train_staged_networks(
         config: Example configuration; its `seed` initializes both networks.
         dropout_rate: The mean network's dropout rate, active during
             training; 0, the default, trains it without dropout.
+        objective: The mean stage's per-window objective; `None`, the
+            default, is the squared error.
 
     Returns:
         The trained mean network, Gamma variance network, and the
@@ -266,6 +287,7 @@ def _train_staged_networks(
         config,
         event_sinks=(),
         dropout_rate=dropout_rate,
+        objective=objective,
     )
     variance_model = train_gamma_model(
         state,
@@ -316,7 +338,12 @@ def _train_joint_mcd(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.
     return build_mc_dropout_predictive(network, config)
 
 
-def _train_staged_mcd(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx.Module:
+def _train_staged_mcd(
+    prepared: PreparedCmapssData,
+    config: CmapssConfig,
+    *,
+    objective: PredictionLoss | None = None,
+) -> nnx.Module:
     """Silently train the staged MC-Dropout model and return its predictive.
 
     Trains the mean stage at `config.dropout_rate` and the Gamma stage on its
@@ -327,12 +354,14 @@ def _train_staged_mcd(prepared: PreparedCmapssData, config: CmapssConfig) -> nnx
         prepared: The prepared FD001 windows to train and validate on.
         config: Example configuration; its `seed` initializes the networks and
             sets the mean network's training masks and the predictive's draws.
+        objective: The mean stage's per-window objective; `None`, the
+            default, is the squared error.
 
     Returns:
         The posterior's draws under the re-fitted Gamma variance.
     """
     _, _, state = _train_staged_networks(
-        prepared, config, dropout_rate=config.dropout_rate
+        prepared, config, dropout_rate=config.dropout_rate, objective=objective
     )
     predictive = build_staged_mcd_posterior(
         state,
@@ -355,20 +384,24 @@ def _train_and_score_seed(
     config: CmapssConfig,
     *,
     posterior_stage: bool,
+    proxy_variance: bool,
     on_run: RunReporter,
 ) -> SeedComparison:
     """Train and score every model of the comparison from `config.seed`.
 
     Without a posterior stage the models are the staged and then the joint
     model; with one, the joint, the joint MC-Dropout, the staged and the
-    staged MC-Dropout model. Each model is trained from scratch on the
-    standardized targets, wrapped in `CyclesPredictive`, and scored in that
-    order.
+    staged MC-Dropout model, then, with a proxy variance, the staged
+    MC-Dropout proxy-variance model. Each model is trained from scratch on
+    the standardized targets, wrapped in `CyclesPredictive`, and scored in
+    that order.
 
     Args:
         prepared: The prepared FD001 windows to train, validate and score on.
         config: Example configuration; its `seed` initializes every model.
         posterior_stage: Whether to add the MC-Dropout models.
+        proxy_variance: Whether to add the staged MC-Dropout proxy-variance
+            model; only together with `posterior_stage`.
         on_run: Called with each model's name, the seed and its test metrics
             as soon as that model is scored.
 
@@ -404,10 +437,22 @@ def _train_and_score_seed(
     staged_mcd_result = score(
         "staged+mcd", "Staged MC-Dropout model", _train_staged_mcd(prepared, config)
     )
-    return SeedComparison(
-        seed=config.seed,
-        models=(joint_result, joint_mcd_result, staged_result, staged_mcd_result),
+    models = (joint_result, joint_mcd_result, staged_result, staged_mcd_result)
+    if not proxy_variance:
+        return SeedComparison(seed=config.seed, models=models)
+
+    schedule = fit_proxy_variance_schedule(
+        unit_lifetimes(prepared.train_trajectories),
+        prepared.target_standardization,
+        floor_cycles=config.proxy_variance_floor_cycles,
     )
+    proxy_model = _train_staged_mcd(
+        prepared, config, objective=ProxyVarianceNLL(schedule)
+    )
+    proxy_result = score(
+        "staged+mcd+proxy", "Staged MC-Dropout proxy-variance model", proxy_model
+    )
+    return SeedComparison(seed=config.seed, models=(*models, proxy_result))
 
 
 def compare_models(
@@ -416,6 +461,7 @@ def compare_models(
     *,
     seeds: int,
     posterior_stage: bool = False,
+    proxy_variance: bool = False,
     on_run: RunReporter = _ignore_run,
 ) -> list[SeedComparison]:
     """Train and score the comparison's models once per seed.
@@ -435,17 +481,28 @@ def compare_models(
             MC-Dropout (`"joint+mcd"`), the staged and the staged MC-Dropout
             (`"staged+mcd"`) model, in that order; the joint and staged
             models are the same as with it off.
+        proxy_variance: On, it appends the staged MC-Dropout proxy-variance
+            model (`"staged+mcd+proxy"`), whose mean stage trains on
+            `ProxyVarianceNLL` with a schedule fitted to the training units'
+            lifetimes; the other four models are unchanged. Off by default;
+            it needs `posterior_stage`.
         on_run: Called with the model's name, the seed and the test metrics
             as soon as each run is scored. Does nothing by default.
 
     Returns:
         One `SeedComparison` per seed, in seed order.
+
+    Raises:
+        ValueError: If `proxy_variance` is on without `posterior_stage`.
     """
+    if proxy_variance and not posterior_stage:
+        raise ValueError("proxy_variance requires posterior_stage.")
     return [
         _train_and_score_seed(
             prepared,
             dataclasses.replace(config, seed=config.seed + index),
             posterior_stage=posterior_stage,
+            proxy_variance=proxy_variance,
             on_run=on_run,
         )
         for index in range(seeds)
@@ -525,13 +582,16 @@ def main() -> None:
     """Compare the CMAPSS models over seeds, print and plot the results.
 
     Compares `staged` and `joint`; with `--posterior-stage`, `joint`,
-    `joint+mcd`, `staged` and `staged+mcd`, in that order. The figure draws
-    every model without the flag, and only `joint+mcd` and `staged+mcd`
-    with it.
+    `joint+mcd`, `staged` and `staged+mcd`, in that order, then
+    `staged+mcd+proxy` with `--proxy-variance` too. The figure draws every
+    model without `--posterior-stage`, and only the MC-Dropout models with
+    it.
 
     Pass `--seeds` to set the number of seeds (default 5), `--plot-path` to save the
-    first seed's RUL-curves figure to that path instead of displaying it, and
-    `--posterior-stage` to add the joint and the staged MC-Dropout models.
+    first seed's RUL-curves figure to that path instead of displaying it,
+    `--posterior-stage` to add the joint and the staged MC-Dropout models, and
+    `--proxy-variance`, with `--posterior-stage` only, to add the staged
+    MC-Dropout proxy-variance model.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -558,9 +618,20 @@ def main() -> None:
             "staged+mcd."
         ),
     )
+    parser.add_argument(
+        "--proxy-variance",
+        action="store_true",
+        help=(
+            "With --posterior-stage, add the staged MC-Dropout model whose "
+            "mean stage trains on a proxy variance shrinking toward end of "
+            "life (staged+mcd+proxy)."
+        ),
+    )
     args = parser.parse_args()
     if args.seeds <= 0:
         parser.error("--seeds must be positive.")
+    if args.proxy_variance and not args.posterior_stage:
+        parser.error("--proxy-variance requires --posterior-stage.")
 
     config = CmapssConfig()
     prepared = prepare_cmapss_windows(config)
@@ -569,6 +640,7 @@ def main() -> None:
         config,
         seeds=args.seeds,
         posterior_stage=args.posterior_stage,
+        proxy_variance=args.proxy_variance,
         on_run=print_run,
     )
     print(f"\nFD001 test metrics over {args.seeds} seeds (mean ± std):")

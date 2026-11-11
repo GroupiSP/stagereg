@@ -354,15 +354,9 @@ squared residual is 1.31 times the training one. In-sample residuals
 understate the held-out error, and a flexible Gamma network fits them
 closely, giving a spiky, overconfident variance.
 
-Shrinking it fixes most of that. Over 5 seeds, on the validation windows,
-for an earlier `staged+mcd` whose posterior stage fine-tuned a mean network
-trained without dropout (full-width Gamma network and no re-fit, against the
-current Gamma defaults):
-
-| Gamma network | val NLL | val 95% coverage | test NLL |
-| --- | --- | --- | --- |
-| 16 channels, Adam, no re-fit | 5.433 ± 0.182 | 0.851 | 4.569 ± 0.053 |
-| 4 channels, AdamW 0.1, re-fit | 4.939 ± 0.047 | 0.916 | 4.579 ± 0.021 |
+Shrinking it fixes most of that: the defaults narrow the Gamma network to 4
+channels, train it with AdamW, and re-fit it to the posterior predictive's
+mean for `staged+mcd`.
 
 With weight decay alone, at 16 channels, the validation NLL of the `staged`
 Gamma variance went from 5.62 (no decay) to 5.57, 5.35 and 5.04 at decays
@@ -372,9 +366,8 @@ coverage 0.99. The defaults narrow the network and keep the decay at 0.1.
 
 What no variance network fixes is the mean's bias on long lifetimes: past a
 true RUL of 200 the mean levels off around 150, and the validation coverage
-there was 0.38 for that earlier `staged+mcd` (0.50 for a joint MC-Dropout
-model trained with dropout from scratch). That error is absent from the training residuals the variance is
-fitted to.
+there is low. That error is absent from the training residuals the variance
+is fitted to.
 
 #### `--proxy-variance`: a proxy-variance mean stage
 

@@ -40,7 +40,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dev dependencies
-        run: uv sync --extra jax --group dev --group example-cmapss
+        run: uv sync --extra jax --extra plot --group dev
       - name: Run tests
         run: uv run pytest
 

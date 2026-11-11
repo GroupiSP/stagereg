@@ -284,8 +284,8 @@ print_xsin_metrics("mean plus Gamma variance", result)
 Run it with `uv run --extra jax --extra plot python examples/jax/xsin/two_steps.py`;
 the source is
 [`examples/jax/xsin/two_steps.py`](https://github.com/GroupiSP/stagereg/blob/main/examples/jax/xsin/two_steps.py).
-The [CMAPSS example](examples.md#cmapss-remaining-useful-life) uses the same
-stages with CNN models on real sensor data. Given a checkpoint store, each stage
+The [clustered-data example](examples.md#clustered-data) uses the same
+stages to compare a staged model with a joint one. Given a checkpoint store, each stage
 saves a finalized checkpoint after `train`: its best model when it also has an
 early stopper, which it leaves live, otherwise its last; to use those checkpoints, or to run the variance
 stage later from a saved mean model, see [Checkpoints](checkpoints.md).

@@ -466,8 +466,8 @@ assert metric(data) == 2.0
 
 - [Predictive distributions and losses](distributions-and-losses.md) covers
   the head and the distribution these metrics score.
-- The mean-variance regression and CMAPSS examples on the
-  [Examples](examples.md) page register epoch metrics in full training runs.
+- The mean-variance regression example on the
+  [Examples](examples.md) page registers epoch metrics in a full training run.
 - The [`stagereg.core.metric_registry`](../reference/core.md#stageregcoremetric_registry)
   and [`stagereg.jax.metrics`](../reference/jax.md#stageregjaxmetrics) reference
   sections list every signature.

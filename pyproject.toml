@@ -63,16 +63,6 @@ docs = [
     "mkdocstrings[python]>=1.0.6",
 ]
 
-example-cmapss = [
-    "flax>=0.11",
-    "jax>=0.6",
-    "optax>=0.2.4",
-    "pandas>=2.2",
-    "scikit-learn>=1.9.0",
-    "seaborn==0.13.2",
-    "matplotlib>=3.11.0"
-]
-
 example-tracking = [
     "flax>=0.11",
     "jax>=0.6",
@@ -96,7 +86,5 @@ typeCheckingMode = "basic"
 reportUnusedVariable = false
 
 [tool.ruff.lint.per-file-ignores]
-"examples/jax/cmapss/*.py" = ["E402"]
-"tests/jax/test_cmapss_*.py" = ["E402"]
 "examples/jax/tracking/*.py" = ["E402"]
 "examples/jax/clustered_data/compare.py" = ["E402"]

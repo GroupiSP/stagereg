@@ -8,8 +8,7 @@ of the library. Each one brings its own dependencies, either through a project
 extra (`jax`, `plot`) or through an example-only dependency group.
 
 Only the commands shown here are entry points. The other modules beside them,
-`xsin/benchmark.py`, `xsin/posterior_benchmark.py`, `cmapss/model.py`,
-`cmapss/preprocessing.py`, `cmapss/plots.py`,
+`xsin/benchmark.py`, `xsin/posterior_benchmark.py`,
 `tracking/tensorboard_tracker.py` and every `clustered_data/` module but
 `compare.py`, hold shared code the scripts import.
 
@@ -103,66 +102,6 @@ extrapolation, where the trained mean continues the oscillation poorly.
 
 Source:
 [`examples/jax/xsin/`](https://github.com/GroupiSP/stagereg/tree/main/examples/jax/xsin)
-
-## CMAPSS remaining useful life
-
-Two-step probabilistic remaining-useful-life estimation on NASA CMAPSS FD001: a
-CNN mean stage, a Gamma variance stage on its squared residuals, and a
-composite Gaussian scored against the official test split by RMSE, 95%
-interval coverage and closed-form CRPS.
-
-```bash
-uv run --group example-cmapss python examples/jax/cmapss/run.py
-```
-
-To fetch the archive ahead of time, or only to plot the raw sensor
-trajectories, run the data module on its own:
-
-```bash
-uv run --group example-cmapss python examples/jax/cmapss/data.py --fetch
-uv run --group example-cmapss python examples/jax/cmapss/data.py
-```
-
-To compare that staged model with a joint model (one CNN backbone with a
-Gaussian head, trained on the Gaussian negative log-likelihood) on the same
-prepared data, run the comparison. It trains both models from `--seeds` seeds
-(default 5) on a fixed train/validation split and prints a `staged` vs `joint`
-table of RMSE, 95% interval coverage, closed-form CRPS and NLL as
-`mean ± std` over seeds. It then plots the first seed's validation RUL curves,
-the staged model's row above the joint model's; pass `--plot-path` to save the
-figure instead of displaying it. The joint model has roughly half the staged
-model's parameters.
-
-```bash
-uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5
-```
-
-Add `--posterior-stage` to compare four models: `joint`, a joint MC-Dropout
-model (`joint+mcd`) that is the joint model trained with dropout active,
-`staged`, and a staged MC-Dropout model (`staged+mcd`) whose mean stage trains
-with dropout active and whose [posterior stage](posterior-stage.md) uses
-`MCDropout` for inference only, without further training, before its Gamma
-variance is re-fitted to the posterior predictive's mean. Dropout is the MC-Dropout
-networks' only regularizer. The staged models' Gamma network is narrower than
-the mean network and trained with weight decay. The MC-Dropout models are scored on their exact posterior
-predictive, and their figure rows show a total and an epistemic 95% band.
-
-```bash
-uv run --group example-cmapss python examples/jax/cmapss/compare.py --seeds 5 --posterior-stage
-```
-
-Add `--proxy-variance` as well for a fifth model, `staged+mcd+proxy`: the
-staged MC-Dropout model with its mean stage trained on a Gaussian NLL under
-a fixed, fictitious scale that shrinks linearly with the true RUL to a few
-cycles at failure. End-of-life windows then weigh most, which should narrow
-the dropout spread near the end of life.
-
-The first run downloads the CMAPSS archive from NASA and caches it on disk, so
-it needs network access once. The README explains how to point the example at
-a copy you already have.
-
-README:
-[`examples/jax/cmapss/README.md`](https://github.com/GroupiSP/stagereg/blob/main/examples/jax/cmapss/README.md)
 
 ## Clustered data
 
